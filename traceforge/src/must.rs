@@ -1,4 +1,5 @@
 use crate::cons::Consistency;
+use crate::debug::tikz_log;
 use crate::event::Event;
 use crate::exec_graph::ExecutionGraph;
 use crate::exec_pool::ExecutionPool;
@@ -877,6 +878,14 @@ impl Must {
             // after 1, 2, 3, .... 10, 20, 30, ... 100, 200, 300, etc.
             if Self::should_report(num_total) {
                 println!("{}", progress_desc);
+            }
+        }
+
+        if let Some(tikz_path) = &self.config.tikz_file {
+            let create_file = num_total == 1;
+            if let Err(e) = tikz_log::write_tikz_graph(&self.current.graph, tikz_path, create_file)
+            {
+                eprintln!("Could not write tikz graph to {}: {}", tikz_path, e);
             }
         }
 

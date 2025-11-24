@@ -4,6 +4,7 @@ mod cons;
 pub mod coverage;
 pub use coverage::{CoverageInfo, ExecutionId};
 
+mod debug;
 mod event;
 mod event_label;
 mod exec_graph;
@@ -195,6 +196,7 @@ pub struct Config {
     pub(crate) symmetry: bool,
     pub(crate) vr: bool,
     pub(crate) lossy_budget: usize,
+    pub(crate) tikz_file: Option<String>,
     pub(crate) dot_file: Option<String>,
     pub(crate) trace_file: Option<String>,
     pub(crate) error_trace_file: Option<String>,
@@ -211,6 +213,9 @@ impl Config {
     }
 
     pub(crate) fn rename_files(&mut self, suffix: String) {
+        if let Some(tikz) = &self.tikz_file {
+            self.tikz_file = Some(tikz.to_owned() + &suffix);
+        }
         if let Some(dot) = &self.dot_file {
             self.dot_file = Some(dot.to_owned() + &suffix);
         }
@@ -255,6 +260,7 @@ impl ConfigBuilder {
             symmetry: false,
             vr: false,
             lossy_budget: 0,
+            tikz_file: None,
             dot_file: None,
             trace_file: None,
             error_trace_file: None,
@@ -382,6 +388,13 @@ impl ConfigBuilder {
     /// Consider executions where up to `budget` lossy messages are dropped.
     pub fn with_lossy(mut self, budget: usize) -> Self {
         self.0.lossy_budget = budget;
+        self
+    }
+
+    /// Whenever the execution graph is printed, the same
+    /// information will be written to this file in TikZ format.
+    pub fn with_tikz_out(mut self, filename: &str) -> Self {
+        self.0.tikz_file = Some(filename.to_string());
         self
     }
 
