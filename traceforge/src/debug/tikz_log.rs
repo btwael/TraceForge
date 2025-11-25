@@ -10,8 +10,6 @@ use crate::BlockType;
 
 const GRAPH_NODE_MARKER: &str = "% GRAPH_NODE";
 const DOC_FOOTER: &str = "\\end{tikzpicture}\n\\end{document}\n";
-const ROW_SPACING_CM: f32 = 18.0;
-const COL_SPACING_CM: f32 = 2.0;
 const LANE_SPACING: f32 = 2.0;
 const LANE_OFFSET: f32 = 1.5;
 const STEP: f32 = 1.0;
@@ -291,70 +289,6 @@ fn graph_node_name(row: usize, col: usize) -> String {
     format!("graph_r{row}_c{col}")
 }
 
-fn row_anchor_name(row: usize) -> String {
-    format!("row_r{row}")
-}
-
-fn row_box_name(row: usize) -> String {
-    format!("rowbox_r{row}")
-}
-
-fn row_anchors(
-    rows: &[usize],
-    prev_row_fit: Option<(usize, usize)>,
-    base_anchor: Option<&str>,
-    below_anchor: Option<(usize, usize)>,
-) -> String {
-    if rows.is_empty() && prev_row_fit.is_none() {
-        return String::new();
-    }
-    let mut out = String::new();
-    if let Some((prow, last_col)) = prev_row_fit {
-        out.push_str(&format!(
-            "\\node[fit=({})({}), inner sep=0pt] ({}) {{}};\n",
-            graph_node_name(prow, 0),
-            graph_node_name(prow, last_col),
-            row_box_name(prow)
-        ));
-    }
-
-    let mut sorted = rows.to_vec();
-    sorted.sort_unstable();
-    for r in sorted {
-        if r == 0 {
-            if let Some(anchor) = base_anchor {
-                out.push_str(&format!(
-                    "\\node[anchor=north west, right={:.2}cm of {}] ({}) {{}};\n",
-                    COL_SPACING_CM,
-                    anchor,
-                    row_anchor_name(r)
-                ));
-            } else {
-                out.push_str(&format!(
-                    "\\node[anchor=north west] ({}) at (0,0) {{}};\n",
-                    row_anchor_name(r)
-                ));
-            }
-        } else if let Some((arow, acol)) = below_anchor {
-            out.push_str(&format!(
-                "\\node[anchor=north west, below={:.2}cm of {}] ({}) {{}};\n",
-                ROW_SPACING_CM,
-                graph_node_name(arow, acol),
-                row_anchor_name(r)
-            ));
-        } else {
-            let above = row_box_name(r - 1);
-            out.push_str(&format!(
-                "\\node[anchor=north west, below={:.2}cm of {}] ({}) {{}};\n",
-                ROW_SPACING_CM,
-                above,
-                row_anchor_name(r)
-            ));
-        }
-    }
-    out
-}
-
 fn write_single_graph(graph: &ExecutionGraph, base_path: &str, idx: usize) -> Result<()> {
     let Some(target) = single_graph_path(base_path, idx) else {
         return Ok(()); // Nothing to do if we cannot determine a path
@@ -373,7 +307,6 @@ fn write_single_graph(graph: &ExecutionGraph, base_path: &str, idx: usize) -> Re
         .open(target)?;
 
     file.write_all(preamble().as_bytes())?;
-    file.write_all(row_anchors(&[0], None, None, None).as_bytes())?;
     file.write_all(graph_node_standalone(graph, 0).as_bytes())?;
     file.write_all(DOC_FOOTER.as_bytes())?;
     Ok(())
