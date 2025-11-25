@@ -30,13 +30,14 @@ use crate::thread::{main_thread_id, ThreadId};
 
 use crate::monitor_types::{EndCondition, ExecutionEnd, Monitor, MonitorResult};
 use std::any::TypeId;
-use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs::File;
 use std::io::Write;
 
 const EXECS: &str = "execs";
 const BLOCKED: &str = "blocked";
 const EXECS_EST: &str = "execs_est";
+const MAX_TIKZ_COLS: usize = usize::MAX;
 
 macro_rules! cast {
     ($target: expr, $pat: path) => {{
@@ -114,6 +115,25 @@ pub(crate) struct Must {
     replay_info: REPLAY::ReplayInformation,
     checker: Consistency,
     pub config: Config,
+    tikz_file_initialized: bool,
+    tikz_row: usize,
+    tikz_col: usize,
+    tikz_rows_defined: HashSet<usize>,
+    tikz_last_cols: HashMap<usize, usize>,
+    tikz_row_boxes_defined: HashSet<usize>,
+    tikz_last_graph: Option<(usize, usize)>,
+    tikz_row_start: usize,
+    tikz_layout_stack: Vec<(
+        usize,
+        usize,
+        usize,
+        HashSet<usize>,
+        HashMap<usize, usize>,
+        HashSet<usize>,
+        Option<(usize, usize)>,
+        Option<(usize, usize)>,
+    )>,
+    tikz_next_anchor: Option<(usize, usize)>,
     monitors: BTreeMap<ThreadId, MonitorInfo>,
     rng: Pcg64Mcg,
     stop: bool,
@@ -143,6 +163,16 @@ impl Must {
             replay_info: REPLAY::ReplayInformation::new(conf.clone(), replay_mode),
             checker: Consistency {},
             config: conf,
+            tikz_file_initialized: false,
+            tikz_row: 0,
+            tikz_col: 0,
+            tikz_rows_defined: HashSet::new(),
+            tikz_last_cols: HashMap::new(),
+            tikz_row_boxes_defined: HashSet::new(),
+            tikz_last_graph: None,
+            tikz_row_start: 0,
+            tikz_layout_stack: Vec::new(),
+            tikz_next_anchor: None,
             monitors: BTreeMap::new(),
             rng: Pcg64Mcg::seed_from_u64(seed),
             stop: false,
@@ -881,13 +911,7 @@ impl Must {
             }
         }
 
-        if let Some(tikz_path) = &self.config.tikz_file {
-            let create_file = num_total == 1;
-            if let Err(e) = tikz_log::write_tikz_graph(&self.current.graph, tikz_path, create_file)
-            {
-                eprintln!("Could not write tikz graph to {}: {}", tikz_path, e);
-            }
-        }
+        self.log_tikz_graph(true);
 
         if let Some(n) = self.config.max_iterations {
             if n <= num_total {
@@ -897,6 +921,53 @@ impl Must {
         }
 
         false // not done
+    }
+
+    fn log_tikz_graph(&mut self, is_complete: bool) {
+        let Some(tikz_path) = self.config.tikz_file.clone() else {
+            return;
+        };
+
+        let (row, col) = (self.tikz_row, self.tikz_col);
+        if col == 0 && row > 0 {
+            if let Some(_) = self.tikz_last_cols.get(&(row - 1)) {
+                if !self.tikz_row_boxes_defined.contains(&(row - 1)) {
+                    self.tikz_row_boxes_defined.insert(row - 1);
+                }
+            }
+        }
+        let truncate = !self.tikz_file_initialized;
+        match tikz_log::write_tikz_graph(
+            &self.current.graph,
+            tikz_path.as_str(),
+            truncate,
+            row,
+            col,
+            self.tikz_row_start,
+            is_complete,
+        ) {
+            Ok(()) => {
+                self.tikz_file_initialized = true;
+                self.tikz_last_graph = Some((row, col));
+                self.tikz_next_anchor = None;
+            }
+            Err(e) => {
+                eprintln!("Could not write tikz graph to {}: {}", tikz_path, e);
+            }
+        }
+        self.advance_tikz_slot(row, col);
+    }
+
+    fn advance_tikz_slot(&mut self, row: usize, col: usize) {
+        let next_col = col + 1;
+        if next_col >= MAX_TIKZ_COLS {
+            self.tikz_last_cols.insert(row, col);
+            self.tikz_col = 0;
+            self.tikz_row = row + 1;
+        } else {
+            self.tikz_col = next_col;
+            self.tikz_row = row;
+        }
     }
 
     pub(crate) fn should_report(n: u64) -> bool {
@@ -1244,6 +1315,7 @@ impl Must {
         }
         let pos = self.current.graph.add_label(lab);
         self.checker.calc_views(&mut self.current.graph, pos);
+        self.log_tikz_graph(false);
         pos
     }
 
@@ -1475,11 +1547,43 @@ impl Must {
         }
         let state = self.states.pop().unwrap();
         self.current = state;
+        if let Some((row, col, row_start, rows_def, last_cols, row_boxes, last_graph, next_anchor)) =
+            self.tikz_layout_stack.pop()
+        {
+            self.tikz_row = row;
+            self.tikz_col = col;
+            self.tikz_row_start = row_start;
+            self.tikz_rows_defined = rows_def;
+            self.tikz_last_cols = last_cols;
+            self.tikz_row_boxes_defined = row_boxes;
+            self.tikz_last_graph = last_graph;
+            self.tikz_next_anchor = next_anchor;
+        }
         true
     }
 
     fn push_state(&mut self) {
         self.states.push(std::mem::take(&mut self.current));
+        self.tikz_layout_stack.push((
+            self.tikz_row,
+            self.tikz_col,
+            self.tikz_row_start,
+            self.tikz_rows_defined.clone(),
+            self.tikz_last_cols.clone(),
+            self.tikz_row_boxes_defined.clone(),
+            self.tikz_last_graph,
+            self.tikz_next_anchor,
+        ));
+        if let Some((r, c)) = self.tikz_last_graph {
+            self.tikz_last_cols.insert(r, c);
+        }
+        let anchor = self.tikz_last_graph;
+        let next_row = self.tikz_row.saturating_add(1);
+        let next_col = 0;
+        self.tikz_row = next_row;
+        self.tikz_col = next_col;
+        self.tikz_row_start = anchor.map(|(_, c)| c).unwrap_or(0);
+        self.tikz_next_anchor = anchor;
     }
 
     fn is_replay(&self, pos: Event) -> bool {

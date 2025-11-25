@@ -1,62 +1,53 @@
-use std::collections::HashMap;
-use std::fs::{self, OpenOptions};
-use std::io::{Result, Write};
-use std::path::Path;
+use std::collections::{BTreeMap, HashMap};
+use std::fs::OpenOptions;
+use std::io::{BufRead, BufReader, Result, Write};
+use std::fs::File;
+use std::path::PathBuf;
 use crate::event::Event;
 use crate::event_label::{AsEventLabel, LabelEnum};
 use crate::exec_graph::ExecutionGraph;
+use crate::BlockType;
 
 const GRAPH_NODE_MARKER: &str = "% GRAPH_NODE";
-const LEGEND_NODE_MARKER: &str = "% LEGEND_NODE";
 const DOC_FOOTER: &str = "\\end{tikzpicture}\n\\end{document}\n";
-const H_SPACING_CM: f32 = 10.0;
+const ROW_SPACING_CM: f32 = 18.0;
+const COL_SPACING_CM: f32 = 2.0;
 const LANE_SPACING: f32 = 2.0;
 const LANE_OFFSET: f32 = 1.5;
-const STEP: f32 = 1.5;
+const STEP: f32 = 1.0;
 const BEGIN_SHIFT_STEP: f32 = 0.5;
 
 /// Write a TikZ representation of the supplied execution graph to `path`.
 /// The output is a standalone document with one outer tikzpicture containing
 /// a legend node and one node per graph (each node contains its own tikzpicture).
-pub(crate) fn write_tikz_graph(graph: &ExecutionGraph, path: &str, truncate: bool) -> Result<()> {
-    if let Some(parent) = Path::new(path).parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)?;
-        }
-    }
+pub(crate) fn write_tikz_graph(
+    graph: &ExecutionGraph,
+    path: &str,
+    truncate: bool,
+    row: usize,
+    col: usize,
+    row_start: usize,
+    is_complete: bool,
+) -> Result<()> {
+    let graph_idx = next_graph_index(path, truncate)?;
 
-    if truncate || !Path::new(path).exists() {
-        let mut file = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(path)?;
-        file.write_all(preamble().as_bytes())?;
-        file.write_all(legend_node().as_bytes())?;
-        file.write_all(graph_node(graph, 0).as_bytes())?;
-        file.write_all(DOC_FOOTER.as_bytes())?;
-        return Ok(());
-    }
+    let mut manifest = if truncate && graph_idx == 0 {
+        Manifest::default()
+    } else {
+        load_manifest(path)?
+    };
+    manifest.graphs.insert(graph_idx, (row, col, is_complete));
+    manifest
+        .row_starts
+        .entry(row)
+        .or_insert(row_start);
+    save_manifest(path, &manifest)?;
 
-    let mut existing = fs::read_to_string(path)?;
-    let trimmed = existing.trim_end();
-    if trimmed.ends_with(DOC_FOOTER) {
-        let new_len = trimmed.len() - DOC_FOOTER.len();
-        existing.truncate(new_len);
-    } else if let Some(idx) = trimmed.rfind("\\end{tikzpicture}") {
-        existing.truncate(idx);
-    }
+    write_single_graph(graph, path, graph_idx)?;
+    write_build_script(path)?;
+    write_gallery_html(path)?;
 
-    let graph_count = existing.matches(GRAPH_NODE_MARKER).count();
-    let mut file = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open(path)?;
-    file.write_all(existing.trim_end().as_bytes())?;
-    file.write_all(b"\n")?;
-    file.write_all(graph_node(graph, graph_count).as_bytes())?;
-    file.write_all(DOC_FOOTER.as_bytes())
+    Ok(())
 }
 
 fn preamble() -> String {
@@ -64,38 +55,24 @@ fn preamble() -> String {
         "\\documentclass[tikz]{standalone}",
         "\\usepackage{xcolor}",
         "\\usepackage{tikz}",
+        "\\usetikzlibrary{positioning,fit}",
         "\\begin{document}",
-        "\\begin{tikzpicture}",
+        "\\begin{tikzpicture}[node distance=1.5cm]",
     ]
     .join("\n")
         + "\n"
 }
 
-fn legend_node() -> String {
-    let mut out = String::new();
-    out.push_str(&format!("{LEGEND_NODE_MARKER}\n"));
-    out.push_str("\\node[anchor=north west] at (0,0) {\n");
-    out.push_str(&legend_picture());
-    out.push_str("\n};\n");
-    out
-}
-
-fn graph_node(graph: &ExecutionGraph, idx: usize) -> String {
-    let x = (idx as f32 + 1.0) * H_SPACING_CM;
+fn graph_node_standalone(graph: &ExecutionGraph, idx: usize) -> String {
+    let node_name = graph_node_name(0, idx);
     let mut out = String::new();
     out.push_str(&format!("{GRAPH_NODE_MARKER} {}\n", idx));
-    out.push_str(&format!("\\node[anchor=north west] at ({:.2}cm,0) {{\n", x));
+    out.push_str(&format!(
+        "\\node[anchor=north west] ({}) at (0,0) {{\n",
+        node_name
+    ));
     out.push_str(&graph_picture(graph));
     out.push_str("\n};\n");
-    out
-}
-
-fn legend_picture() -> String {
-    let mut out = String::new();
-    out.push_str("\\begin{tikzpicture}\n");
-    out.push_str(legend_styles());
-    out.push_str(&legend_tikz());
-    out.push_str("\\end{tikzpicture}\n");
     out
 }
 
@@ -238,19 +215,27 @@ fn format_label(lab: &LabelEnum) -> String {
             let pos = r.pos();
             format!("({}, {}): R()", pos.thread, pos.index)
         }
+        LabelEnum::Block(b) => match b.btype() {
+            BlockType::Join(tid) => format!("!TJOIN({})", tid),
+            BlockType::Value(_) => "!R()".to_string(),
+            other => format!("!{:?}", other),
+        },
         _ => format!("{}", lab),
     }
 }
 
 fn format_node_label(lab: &LabelEnum) -> String {
     let label = format_label(lab);
+    if matches!(lab, LabelEnum::Block(_)) {
+        return format!("\\textcolor{{gray}}{{{}}}", tex_escape(&label));
+    }
     let (prefix, rest) = split_label_prefix(&label);
 
     if prefix.is_empty() {
         return tex_escape(&label);
     }
 
-    let escaped_prefix = tex_escape(prefix);
+    let _escaped_prefix = tex_escape(prefix);
     let escaped_rest = tex_escape(rest);
     /*format!(
         "\\textcolor{{gray}}{{\\tiny {}}}\\;{}",
@@ -273,36 +258,6 @@ fn split_label_prefix(label: &str) -> (&str, &str) {
 
 fn style_defs() -> &'static str {
     "\\tikzstyle{threadnode}=[inner sep=1.2pt, align=center];\\tikzstyle{po}=[->, thin];\\tikzstyle{rf}=[->, thick, green!60!black];\\tikzstyle{spawn}=[->, dashed, blue!60!black];\\tikzstyle{joinedge}=[->, dotted, red!70!black];\n"
-}
-
-fn legend_styles() -> &'static str {
-    "\\tikzstyle{po}=[->, thin];\\tikzstyle{rf}=[->, thick, green!60!black];\\tikzstyle{spawn}=[->, dashed, blue!60!black];\\tikzstyle{joinedge}=[->, dotted, red!70!black];\n"
-}
-
-fn legend_tikz() -> String {
-    let mut out = String::new();
-    out.push_str("\\begin{scope}[yshift=0cm, every node/.style={font=\\scriptsize}]\n");
-    out.push_str("\\node[draw, rounded corners, inner sep=2pt] (a1) at (0,0) {event};\n");
-    out.push_str("\\node[draw, rounded corners, inner sep=2pt] (a2) at (2,0) {event};\n");
-    out.push_str("\\draw[po] (a1) -- (a2);\n");
-    out.push_str("\\node at (1,0.3) {po};\n");
-
-    out.push_str("\\node[draw, rounded corners, inner sep=2pt] (b1) at (0,-1) {recv};\n");
-    out.push_str("\\node[draw, rounded corners, inner sep=2pt] (b2) at (2,-1) {send};\n");
-    out.push_str("\\draw[rf] (b2) -> (b1);\n");
-    out.push_str("\\node at (1,-0.7) {rf};\n");
-
-    out.push_str("\\node[draw, rounded corners, inner sep=2pt] (c1) at (0,-2) {parent};\n");
-    out.push_str("\\node[draw, rounded corners, inner sep=2pt] (c2) at (2,-2) {begin};\n");
-    out.push_str("\\draw[spawn] (c1) -> (c2);\n");
-    out.push_str("\\node at (1,-1.7) {spawn};\n");
-
-    out.push_str("\\node[draw, rounded corners, inner sep=2pt] (d1) at (0,-3) {end};\n");
-    out.push_str("\\node[draw, rounded corners, inner sep=2pt] (d2) at (2,-3) {join};\n");
-    out.push_str("\\draw[joinedge] (d1) -> (d2);\n");
-    out.push_str("\\node at (1,-2.7) {join};\n");
-    out.push_str("\\end{scope}\n");
-    out
 }
 
 fn node_id(pos: &Event) -> String {
@@ -330,4 +285,437 @@ fn tex_escape(s: &str) -> String {
         }
     }
     escaped
+}
+
+fn graph_node_name(row: usize, col: usize) -> String {
+    format!("graph_r{row}_c{col}")
+}
+
+fn row_anchor_name(row: usize) -> String {
+    format!("row_r{row}")
+}
+
+fn row_box_name(row: usize) -> String {
+    format!("rowbox_r{row}")
+}
+
+fn row_anchors(
+    rows: &[usize],
+    prev_row_fit: Option<(usize, usize)>,
+    base_anchor: Option<&str>,
+    below_anchor: Option<(usize, usize)>,
+) -> String {
+    if rows.is_empty() && prev_row_fit.is_none() {
+        return String::new();
+    }
+    let mut out = String::new();
+    if let Some((prow, last_col)) = prev_row_fit {
+        out.push_str(&format!(
+            "\\node[fit=({})({}), inner sep=0pt] ({}) {{}};\n",
+            graph_node_name(prow, 0),
+            graph_node_name(prow, last_col),
+            row_box_name(prow)
+        ));
+    }
+
+    let mut sorted = rows.to_vec();
+    sorted.sort_unstable();
+    for r in sorted {
+        if r == 0 {
+            if let Some(anchor) = base_anchor {
+                out.push_str(&format!(
+                    "\\node[anchor=north west, right={:.2}cm of {}] ({}) {{}};\n",
+                    COL_SPACING_CM,
+                    anchor,
+                    row_anchor_name(r)
+                ));
+            } else {
+                out.push_str(&format!(
+                    "\\node[anchor=north west] ({}) at (0,0) {{}};\n",
+                    row_anchor_name(r)
+                ));
+            }
+        } else if let Some((arow, acol)) = below_anchor {
+            out.push_str(&format!(
+                "\\node[anchor=north west, below={:.2}cm of {}] ({}) {{}};\n",
+                ROW_SPACING_CM,
+                graph_node_name(arow, acol),
+                row_anchor_name(r)
+            ));
+        } else {
+            let above = row_box_name(r - 1);
+            out.push_str(&format!(
+                "\\node[anchor=north west, below={:.2}cm of {}] ({}) {{}};\n",
+                ROW_SPACING_CM,
+                above,
+                row_anchor_name(r)
+            ));
+        }
+    }
+    out
+}
+
+fn write_single_graph(graph: &ExecutionGraph, base_path: &str, idx: usize) -> Result<()> {
+    let Some(target) = single_graph_path(base_path, idx) else {
+        return Ok(()); // Nothing to do if we cannot determine a path
+    };
+
+    if let Some(parent) = target.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+
+    let mut file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(target)?;
+
+    file.write_all(preamble().as_bytes())?;
+    file.write_all(row_anchors(&[0], None, None, None).as_bytes())?;
+    file.write_all(graph_node_standalone(graph, 0).as_bytes())?;
+    file.write_all(DOC_FOOTER.as_bytes())?;
+    Ok(())
+}
+
+fn single_graph_path(base_path: &str, idx: usize) -> Option<std::path::PathBuf> {
+    let (dir, stem) = base_dir_and_stem(base_path);
+    let dir = dir.join("graphs");
+    let fname = format!("{}_g{:04}.tex", stem, idx);
+    Some(dir.join(fname))
+}
+
+fn next_graph_index(base_path: &str, truncate: bool) -> Result<usize> {
+    let manifest = if truncate {
+        Manifest::default()
+    } else {
+        load_manifest(base_path)?
+    };
+    Ok(manifest.graphs.keys().max().map(|v| v + 1).unwrap_or(0))
+}
+
+fn build_script_path(base_path: &str) -> Option<PathBuf> {
+    let (dir, _) = base_dir_and_stem(base_path);
+    Some(dir.join("build_graphs.sh"))
+}
+
+fn write_build_script(base_path: &str) -> Result<()> {
+    let Some(path) = build_script_path(base_path) else {
+        return Ok(());
+    };
+
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+
+    if path.exists() {
+        return Ok(()); // don't overwrite user script
+    }
+
+    let script = r#"#!/usr/bin/env bash
+set -euo pipefail
+
+if ! command -v pdflatex >/dev/null 2>&1; then
+  echo "pdflatex not found; please install a LaTeX distribution." >&2
+  exit 1
+fi
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+GRAPH_DIR="${SCRIPT_DIR}/graphs"
+
+if [[ ! -d "${GRAPH_DIR}" ]]; then
+  echo "Graph directory '${GRAPH_DIR}' not found." >&2
+  exit 1
+fi
+
+shopt -s nullglob
+cd "${GRAPH_DIR}"
+for tex in *.tex; do
+  [[ -e "${tex}" ]] || continue
+  pdf="${tex%.tex}.pdf"
+  png="${tex%.tex}.png"
+  pdflatex -interaction=nonstopmode -halt-on-error "${tex}" >/dev/null
+  if command -v pdftoppm >/dev/null 2>&1; then
+    pdftoppm -png -singlefile "${pdf}" "${tex%.tex}" >/dev/null
+  elif command -v convert >/dev/null 2>&1; then
+    convert -density 300 "${pdf}" "${png}" >/dev/null
+  else
+    echo "Neither pdftoppm nor convert found; produced PDF at ${pdf}." >&2
+  fi
+done
+"#;
+
+    let mut file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(path.clone())?;
+    file.write_all(script.as_bytes())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = std::fs::Permissions::from_mode(0o755);
+        std::fs::set_permissions(path, perms)?;
+    }
+    Ok(())
+}
+
+fn gallery_html_path(base_path: &str) -> Option<PathBuf> {
+    let (dir, _) = base_dir_and_stem(base_path);
+    Some(dir.join("gallery.html"))
+}
+
+fn manifest_path(base_path: &str) -> Option<PathBuf> {
+    let (dir, stem) = base_dir_and_stem(base_path);
+    Some(dir.join("graphs").join(format!("{}_manifest.txt", stem)))
+}
+
+#[derive(Default)]
+struct Manifest {
+    graphs: HashMap<usize, (usize, usize, bool)>,
+    row_starts: HashMap<usize, usize>,
+}
+
+fn load_manifest(base_path: &str) -> Result<Manifest> {
+    let Some(path) = manifest_path(base_path) else {
+        return Ok(Manifest::default());
+    };
+    if !path.exists() {
+        return Ok(Manifest::default());
+    }
+    let file = File::open(path)?;
+    let reader = BufReader::new(file);
+    let mut out = Manifest::default();
+    for line in reader.lines() {
+        if let Ok(l) = line {
+            let parts: Vec<_> = l.split_whitespace().collect();
+            match parts.as_slice() {
+                ["G", idx, row, col, flag] => {
+                    if let (Ok(i), Ok(r), Ok(c), Ok(f)) = (
+                        idx.parse::<usize>(),
+                        row.parse::<usize>(),
+                        col.parse::<usize>(),
+                        flag.parse::<u8>(),
+                    ) {
+                        out.graphs.insert(i, (r, c, f != 0));
+                    }
+                }
+                ["G", idx, row, col] => {
+                    if let (Ok(i), Ok(r), Ok(c)) =
+                        (idx.parse::<usize>(), row.parse::<usize>(), col.parse::<usize>())
+                    {
+                        out.graphs.insert(i, (r, c, false));
+                    }
+                }
+                ["R", row, start] => {
+                    if let (Ok(r), Ok(s)) = (row.parse::<usize>(), start.parse::<usize>()) {
+                        out.row_starts.insert(r, s);
+                    }
+                }
+                [idx, row, col] => {
+                    if let (Ok(i), Ok(r), Ok(c)) =
+                        (idx.parse::<usize>(), row.parse::<usize>(), col.parse::<usize>())
+                    {
+                        out.graphs.insert(i, (r, c, false));
+                    }
+                }
+                [idx, row] => {
+                    if let (Ok(i), Ok(r)) = (idx.parse::<usize>(), row.parse::<usize>()) {
+                        out.graphs.insert(i, (r, i, false));
+                    }
+                }
+                _ => {}
+            };
+        }
+    }
+    Ok(out)
+}
+
+fn save_manifest(base_path: &str, manifest: &Manifest) -> Result<()> {
+    let Some(path) = manifest_path(base_path) else {
+        return Ok(());
+    };
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    let mut graph_entries: Vec<_> = manifest.graphs.iter().collect();
+    graph_entries.sort_by_key(|(&idx, _)| idx);
+    let mut row_entries: Vec<_> = manifest.row_starts.iter().collect();
+    row_entries.sort_by_key(|(&row, _)| row);
+
+    let mut file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(path)?;
+    for (row, start) in row_entries {
+        writeln!(&mut file, "R {} {}", row, start)?;
+    }
+    for (idx, (row, col, complete)) in graph_entries {
+        writeln!(&mut file, "G {} {} {} {}", idx, row, col, if *complete { 1 } else { 0 })?;
+    }
+    Ok(())
+}
+
+fn write_gallery_html(base_path: &str) -> Result<()> {
+    let Some(path) = gallery_html_path(base_path) else {
+        return Ok(());
+    };
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    let manifest = load_manifest(base_path)?;
+    let (_, stem) = base_dir_and_stem(base_path);
+    let mut out = String::new();
+    out.push_str(r#"<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+  <style>
+    table.graph-table { width: max-content; border-collapse: separate; border-spacing: 8px; }
+    table.graph-table td { padding: 8px; border: 1px solid #dee2e6; background: #ffffff; vertical-align: top; }
+    table.graph-table img { display: block; width: 100%; height: auto; }
+  </style>
+  <title>TraceForge Graphs</title>
+</head>
+<body>
+  <div class="container-fluid py-3">
+    <div class="mb-3 d-flex align-items-center gap-3">
+      <label for="scaleRange" class="form-label mb-0">Scale</label>
+      <input type="range" class="form-range w-auto" id="scaleRange" min="10" max="150" value="100" step="10" style="max-width: 240px;">
+      <span id="scaleValue" class="small text-muted">100%</span>
+    </div>
+    <h1 class="h4 mb-3">Execution Graphs</h1>
+    <div class="table-responsive">
+      <table class="graph-table">
+        <tbody>"#);
+
+    let mut rows: BTreeMap<usize, Vec<(usize, usize, bool)>> = BTreeMap::new();
+    for (&idx, &(row, col, complete)) in manifest.graphs.iter() {
+        let row_start = *manifest.row_starts.get(&row).unwrap_or(&0);
+        let abs_col = row_start + col;
+        rows.entry(row).or_default().push((abs_col, idx, complete));
+    }
+    // Compute max cols per row to keep row-local padding only
+    let mut row_max: BTreeMap<usize, usize> = BTreeMap::new();
+    for (r, cols) in &rows {
+        let mx = cols.iter().map(|(c, _, _)| *c).max().unwrap_or(0);
+        row_max.insert(*r, mx);
+    }
+
+    for (row_idx, mut cells) in rows {
+        cells.sort_by_key(|(col, _, _)| *col);
+        out.push_str("<tr>");
+        let mut current_col = 0usize;
+        for (col, idx, complete) in cells {
+            while current_col < col {
+                out.push_str(r#"<td></td>"#);
+                current_col += 1;
+            }
+            let img = format!("graphs/{}_g{:04}.png", stem, idx);
+            out.push_str(&format!(
+                r#"
+          <td class="{complete_class}">
+            <img src="{img}" alt="Graph {idx}">
+          </td>"#,
+                complete_class = if complete {
+                    "border border-danger border-2 border-dashed"
+                } else {
+                    ""
+                }
+            ));
+            current_col += 1;
+        }
+        let max_col = *row_max.get(&row_idx).unwrap_or(&current_col);
+        while current_col <= max_col {
+            out.push_str(r#"<td></td>"#);
+            current_col += 1;
+        }
+        out.push_str("</tr>");
+    }
+
+    out.push_str(
+        r#"
+        </tbody>
+      </table>
+    </div>
+    <script>
+      (function() {
+        const range = document.getElementById('scaleRange');
+        const value = document.getElementById('scaleValue');
+        const imgs = Array.from(document.querySelectorAll('table.graph-table img'));
+        // Capture base widths once images have loaded
+        imgs.forEach(img => {
+          const setBase = () => {
+            const base = img.naturalWidth || img.clientWidth || 240;
+            img.dataset.baseWidth = base.toString();
+            img.dataset.baseHeight = (img.naturalHeight || img.clientHeight || 180).toString();
+          };
+          if (img.complete) {
+            setBase();
+          } else {
+            img.addEventListener('load', setBase, { once: true });
+          }
+        });
+        function apply() {
+          const scale = parseInt(range.value, 10) / 100;
+          value.textContent = `${scale * 100}%`;
+          imgs.forEach(img => {
+            const baseW = parseFloat(img.dataset.baseWidth || '240');
+            const baseH = parseFloat(img.dataset.baseHeight || '180');
+            const w = baseW * scale;
+            const h = baseH * scale;
+            img.style.width = `${w}px`;
+            img.style.height = `${h}px`;
+            const td = img.closest('td');
+            if (td) {
+              td.style.width = `${w + 16}px`; // include padding/border slack
+            }
+          });
+        }
+        range.addEventListener('input', apply);
+        apply();
+      })();
+    </script>
+  </div>
+</body>
+</html>
+"#,
+    );
+
+    let mut file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(path)?;
+    file.write_all(out.as_bytes())
+}
+fn base_dir_and_stem(base_path: &str) -> (PathBuf, String) {
+    let mut p = PathBuf::from(base_path);
+    if p.extension().is_some() {
+        let stem = p
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "graphs".to_string());
+        let dir = p.parent().map(|d| d.to_path_buf()).unwrap_or_else(|| PathBuf::from("."));
+        (dir, stem)
+    } else {
+        if p.as_os_str().is_empty() {
+            p = PathBuf::from(".");
+        }
+        let stem = p
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "graphs".to_string());
+        (p, stem)
+    }
 }

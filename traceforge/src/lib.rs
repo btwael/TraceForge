@@ -214,7 +214,7 @@ impl Config {
 
     pub(crate) fn rename_files(&mut self, suffix: String) {
         if let Some(tikz) = &self.tikz_file {
-            self.tikz_file = Some(tikz.to_owned() + &suffix);
+            self.tikz_file = Some(format!("{}{}", tikz.to_owned(), suffix));
         }
         if let Some(dot) = &self.dot_file {
             self.dot_file = Some(dot.to_owned() + &suffix);
@@ -391,10 +391,10 @@ impl ConfigBuilder {
         self
     }
 
-    /// Whenever the execution graph is printed, the same
-    /// information will be written to this file in TikZ format.
-    pub fn with_tikz_out(mut self, filename: &str) -> Self {
-        self.0.tikz_file = Some(filename.to_string());
+    /// Enables execution graph printing. `folder` is the directory where the HTML,
+    /// build script, and per-graph outputs will be written (graphs/ subfolder is created).
+    pub fn with_graph_printing(mut self, folder: &str) -> Self {
+        self.0.tikz_file = Some(folder.to_string());
         self
     }
 
