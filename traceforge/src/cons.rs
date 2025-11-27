@@ -1,5 +1,5 @@
 use crate::event::Event;
-use crate::event_label::{AsEventLabel, LabelEnum, RecvMsg, SendMsg};
+use crate::event_label::{AsEventLabel, Inbox, LabelEnum, RecvMsg, SendMsg};
 use crate::exec_graph::ExecutionGraph;
 use crate::loc::CommunicationModel;
 use crate::revisit::Revisit;
@@ -152,6 +152,51 @@ impl Consistency {
         })
     }
 
+    fn filter_available_sends_in_view_for_inbox<'a>(
+        g: &'a ExecutionGraph,
+        ilab: &'a Inbox,
+        sends: impl Iterator<Item = &'a SendMsg>,
+        view: Option<(&'a VectorClock, Event)>,
+        check_concurrent: bool,
+    ) -> impl Iterator<Item = &'a SendMsg> {
+        let rpos = ilab.pos();
+        sends.filter(move |&slab| {
+            let spos = slab.pos();
+
+            // exclude one event
+            if view.is_some_and(|(_, excl)| excl == spos) {
+                return false;
+            }
+
+            // send must be in the view, if it exists
+            if view.is_some_and(|view| !view.0.contains(slab.pos())) {
+                return false;
+            }
+
+            match slab.reader() {
+                None => true,
+                Some(reader) => {
+                    // Check for concurrent receives.
+                    // We shouldn't include the receive's rf, i.e. use cached_porf.
+
+                    // N.B. it should suffice to check only when we add rlab
+                    // (it's the last event in its thread).
+                    // Otherwise, we should also check whether
+                    // rlab is before reader OR reader is bofore rlab
+                    if check_concurrent && !ilab.cached_porf().contains(reader) {
+                        println!("{}", g);
+                        panic!(
+                            "Detected concurrent receives: {} and {}",
+                            reader,
+                            ilab.pos()
+                        );
+                    }
+                    reader == rpos || view.is_some_and(|view| !view.0.contains(reader))
+                }
+            }
+        })
+    }
+
     /// Returns whether the send has no sb-predecessor (porf-predecessors if flag is set) among the rest sends
     fn is_sb_miminal(send: &SendMsg, sends: &[&SendMsg], porf_override: bool) -> bool {
         let view = if porf_override {
@@ -221,6 +266,24 @@ impl Consistency {
         // ordering on ThreadId's from the execution graph:
         // consider the restriction to Create/Begin events, and use
         // e.g. a dfs pre-order for ordering TheadIds (and by extension, Events).
+        rfs.sort();
+        rfs
+    }
+
+    fn coherent_inbox_rfs_in_view(
+        &self,
+        g: &ExecutionGraph,
+        view: Option<(&VectorClock, Event)>,
+        inbox: &Inbox,
+        check_concurrent: bool,
+    ) -> Vec<Event> {
+        let sends = g.matching_stores(inbox.recv_loc());
+
+        let rfs =
+            Self::filter_available_sends_in_view_for_inbox(g, inbox, sends, view, check_concurrent);
+
+        let mut rfs: Vec<Event> = rfs.map(|lab| lab.pos()).collect();
+
         rfs.sort();
         rfs
     }
@@ -353,7 +416,11 @@ impl Consistency {
         porf_override: bool,
     ) -> bool {
         // rlab is not in the prefix of the revisitor
-        assert!(!g.send_label(rev.rev).unwrap().porf().contains(rlab.pos()));
+        assert!(!g
+            .send_label(rev.rev_event())
+            .unwrap()
+            .porf()
+            .contains(rlab.pos()));
         // rlab is stamp greater or equal that revisitee's stamp
         assert!(rlab.stamp() >= g.label(rev.pos).stamp());
 
@@ -364,11 +431,30 @@ impl Consistency {
 
         // rlab should be maximal wrt the view of a
         // hypothetical [rev.rev -> rlab] revisit
-        let view = g.revisit_view(&Revisit::new(rlab.pos(), rev.rev));
+        let view = g.revisit_view(&Revisit::new(rlab.pos(), rev.rev_event()));
 
         // First (non-revisit) is the maximal one.
         rlab.rf().unwrap()
-            == self.coherent_rfs_in_view(g, Some((&view, rev.rev)), rlab, porf_override, false)[0]
+            == self.coherent_rfs_in_view(
+                g,
+                Some((&view, rev.rev_event())),
+                rlab,
+                porf_override,
+                false,
+            )[0]
+    }
+
+    pub(crate) fn inbox_reads_tiebreaker(
+        &self,
+        g: &ExecutionGraph,
+        ilab: &Inbox,
+        rev: &Revisit,
+    ) -> bool {
+        // Non-blocking inboxes are maximal only when they currently time out / have no reads.
+        match ilab.rfs() {
+            None => true,
+            Some(rfs) => rfs.is_empty(),
+        }
     }
 
     /// Returns the rf options for rlab, with the first being the non-revisit rf step
@@ -379,6 +465,10 @@ impl Consistency {
         porf_override: bool,
     ) -> Vec<Event> {
         self.coherent_rfs_in_view(g, None, rlab, porf_override, true)
+    }
+
+    pub(crate) fn inbox_rfs(&self, g: &ExecutionGraph, ilab: &Inbox) -> Vec<Event> {
+        self.coherent_inbox_rfs_in_view(g, None, ilab, true)
     }
 
     /// Returns whether the resulting execution would be consistent
@@ -415,12 +505,12 @@ impl Consistency {
             slab.sb()
         };
 
+        let view = g.revisit_view(&Revisit::new(rpos, spos));
+
         let sends = g.matching_stores(rlab.recv_loc()).filter(|&lab| {
             let pos = lab.pos();
             pos != spos && send_sb.contains(pos)
         });
-
-        let view = g.revisit_view(&Revisit::new(rpos, spos));
 
         // if any of them, apart from slab, could be read by rlab after the revisit, then the execution is inconsistent
         let overwritten =
@@ -429,4 +519,28 @@ impl Consistency {
                 .is_none();
         overwritten
     }
+
+      /// Inbox consistency: order doesn’t matter. True iff all chosen sends are valid/available.
+  pub(crate) fn is_revisit_consistent_inbox(
+          &self,
+          g: &ExecutionGraph,
+          inbox: &Inbox,
+          sends: &Vec<Event>,
+      ) -> bool {
+          sends.iter().all(|&s| {
+              if let Some(slab) = g.send_label(s) {
+                  // Must match and not be dropped
+                  if slab.is_dropped() || !inbox.matches(slab) {
+                      return false;
+                  }
+                  // Do not reuse a send that already has a different reader
+                  match slab.reader() {
+                      None => true,
+                      Some(reader) => reader == inbox.pos(),
+                  }
+              } else {
+                  false
+              }
+          })
+      }
 }

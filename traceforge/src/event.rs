@@ -1,6 +1,7 @@
 //! An event in an execution graph
 use crate::thread::{main_thread_id, ThreadId};
 use serde::{Deserialize, Serialize};
+use crate::event_label::{Inbox, RecvMsg};
 
 /// Models a single event in an execution graph.
 #[derive(PartialEq, Copy, Clone, Debug, Hash, Eq, PartialOrd, Ord, Serialize, Deserialize)]

@@ -25,6 +25,8 @@ pub(crate) enum LabelEnum {
     Choice(Choice),
     Sample(Sample),
     Block(Block),
+
+    Inbox(Inbox),
 }
 
 macro_rules! match_and_run {
@@ -41,6 +43,8 @@ macro_rules! match_and_run {
             LabelEnum::Choice(l) => l.as_event_label().$name($($arg),*),
             LabelEnum::Sample(l) => l.as_event_label().$name($($arg),*),
             LabelEnum::Block(l) => l.as_event_label().$name($($arg),*),
+
+            LabelEnum::Inbox(l) => l.as_event_label().$name($($arg),*),
         }
     };
 }
@@ -59,6 +63,8 @@ macro_rules! match_and_run_mut {
             LabelEnum::Choice(l) => l.as_event_label_mut().$name($($arg),*),
             LabelEnum::Sample(l) => l.as_event_label_mut().$name($($arg),*),
             LabelEnum::Block(l) => l.as_event_label_mut().$name($($arg),*),
+
+            LabelEnum::Inbox(l) => l.as_event_label_mut().$name($($arg),*),
         }
     };
 }
@@ -241,6 +247,28 @@ impl LabelEnum {
                     return Ok(());
                 }
             }
+
+            // TODO(btwael): how precise is this?
+            LabelEnum::Inbox(s) => {
+                if let LabelEnum::Inbox(o) = other {
+                    if s.senders() != o.senders() {
+                        return Err(format!(
+                            "Expected inbox to accept from {:?} but got {:?}",
+                            s.senders(),
+                            o.senders()
+                        ));
+                    }
+                    // If you store the chosen read(s), compare them too:
+                    if s.rfs() != o.rfs() {
+                        return Err(format!(
+                            "Expected inbox to read from {:?} but read from {:?}",
+                            s.rfs(),
+                            o.rfs()
+                        ));
+                    }
+                    return Ok(());
+                }
+            }
         }
 
         if let (LabelEnum::Block(_), LabelEnum::End(_)) = (self, other) {
@@ -288,6 +316,8 @@ impl LabelEnum {
             LabelEnum::Choice(s) => format!("called Range({:?})::nondet", s.range()),
             LabelEnum::Sample(_) => "called sample()".to_string(),
             LabelEnum::Block(_) => "became blocked".to_string(),
+
+            LabelEnum::Inbox(_) => "requested an inbox collection".to_string(),
         }
     }
 }
@@ -306,6 +336,8 @@ impl fmt::Display for LabelEnum {
             LabelEnum::Choice(lab) => write!(f, "{}", lab),
             LabelEnum::Sample(lab) => write!(f, "{}", lab),
             LabelEnum::Block(lab) => write!(f, "{}", lab),
+
+            LabelEnum::Inbox(lab) => write!(f, "{}", lab),
         }
     }
 }
@@ -324,6 +356,8 @@ impl fmt::Debug for LabelEnum {
             LabelEnum::Choice(lab) => write!(f, "{}", lab),
             LabelEnum::Sample(lab) => write!(f, "{}", lab),
             LabelEnum::Block(lab) => write!(f, "{}", lab),
+
+            LabelEnum::Inbox(lab) => write!(f, "{}", lab),
         }
     }
 }
@@ -1148,5 +1182,106 @@ as_label!(Block);
 impl fmt::Display for Block {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}: BLK {:?}", self.as_event_label(), self.btype())
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub(crate) struct Inbox {
+    label: EventLabel,
+    loc: RecvLoc,
+    rfs: Option<Vec<Event>>,
+    revisitable: bool,
+}
+
+impl Inbox {
+    pub(crate) fn new(pos: Event, loc: RecvLoc, rfs: Option<Vec<Event>>) -> Self {
+        Self {
+            label: EventLabel::new(pos),
+            loc,
+            rfs,
+            revisitable: true,
+        }
+    }
+
+    pub(crate) fn rfs(&self) -> Option<Vec<Event>> {
+        self.rfs.clone()
+    }
+
+    pub(crate) fn set_rf(&mut self, rfs: Option<Vec<Event>>) {
+        self.rfs = rfs
+    }
+
+    pub(crate) fn is_non_blocking(&self) -> bool {
+        true
+    }
+
+    pub(crate) fn is_revisitable(&self) -> bool {
+        self.revisitable
+    }
+
+    pub(crate) fn set_revisitable(&mut self, status: bool) {
+        self.revisitable = status
+    }
+
+    // TODO(btwael): from RecvMsg, do we need this
+    pub(crate) fn recover_lost(&mut self, other: Self) {
+        self.loc = other.loc;
+    }
+
+    pub(crate) fn recv_loc(&self) -> &RecvLoc {
+        &self.loc
+    }
+
+    pub(crate) fn receiver(&self) -> ThreadId {
+        self.label.pos.thread
+    }
+
+    pub(crate) fn senders(&self) -> Option<Vec<ThreadId>> {
+        match self.rfs() {
+            Some(rfs) => {
+                let mut tids = Vec::with_capacity(rfs.len());
+                for rf in rfs {
+                    tids.push(rf.thread);
+                }
+                Some(tids)
+            }
+            None => None,
+        }
+    }
+
+    pub(crate) fn matches(&self, send: &SendMsg) -> bool {
+        self.recv_loc().matches(send)
+    }
+
+    pub(crate) fn cached_porf(&self) -> &VectorClock {
+        &self.as_event_label().cached_porf
+    }
+}
+
+as_label!(Inbox);
+
+impl fmt::Display for Inbox {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{}: INBOX() [{}]",
+            self.label,
+            match self.rfs() {
+                None => "{}".to_string(),
+                Some(rfs) if rfs.is_empty() => "{}".to_string(),
+                Some(rfs) => {
+                    let mut r = String::new();
+                    r.push_str("{");
+                    for (idx, rf) in rfs.iter().enumerate() {
+                        if idx > 0 {
+                            r.push_str(", ");
+                        }
+                        r.push_str(format!("{}", rf).as_str())
+                    }
+                    r.push_str("}");
+                    r
+                }
+            }
+        )
     }
 }

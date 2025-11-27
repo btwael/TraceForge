@@ -1,10 +1,10 @@
 use crate::cons::Consistency;
-use crate::debug::tikz_log;
+use crate::debug::tikz_log::{self, GraphKind};
 use crate::event::Event;
-use crate::exec_graph::ExecutionGraph;
+use crate::exec_graph::{ExecutionGraph, RecvLike};
 use crate::exec_pool::ExecutionPool;
 use crate::loc::Loc;
-use crate::revisit::{Revisit, RevisitEnum};
+use crate::revisit::{Revisit, RevisitEnum, RevisitPlacement};
 use crate::runtime::failure::init_panic_hook;
 use crate::runtime::task::TaskId;
 use crate::telemetry::{Recorder, Telemetry};
@@ -116,7 +116,7 @@ pub(crate) struct Must {
     checker: Consistency,
     pub config: Config,
     tikz_file_initialized: bool,
-    tikz_row: usize,
+    tikz_exec: usize,
     tikz_col: usize,
     tikz_rows_defined: HashSet<usize>,
     tikz_last_cols: HashMap<usize, usize>,
@@ -164,7 +164,7 @@ impl Must {
             checker: Consistency {},
             config: conf,
             tikz_file_initialized: false,
-            tikz_row: 0,
+            tikz_exec: 0,
             tikz_col: 0,
             tikz_rows_defined: HashSet::new(),
             tikz_last_cols: HashMap::new(),
@@ -424,6 +424,45 @@ impl Must {
         // stuck is only used during replay
         assert!(stuck.is_empty());
         stuck
+    }
+
+    pub(crate) fn handle_inbox(&mut self, ilab: Inbox) -> (Vec<Option<Val>>, Vec<Option<usize>>) {
+        if self.is_replay(ilab.pos()) {
+            info!("| Replay Mode for receive {}", ilab);
+            let mut ilab = ilab;
+            // Restore the chosen rf set from the saved execution so determinism checks
+            // compare like for like.
+            if let Some(saved) = self.current.graph.inbox_label(ilab.pos()) {
+                ilab.set_rf(saved.rfs());
+            }
+            // Try to see if the `current_event` matches `ilab`
+            let pos = ilab.pos();
+            let lab = LabelEnum::Inbox(ilab);
+            self.current.graph.validate_replay_event(&lab);
+            self.process_event(lab);
+
+            let g = &self.current.graph;
+            // Fetch it again, it might have been updated
+            let ilab = g.inbox_label(pos).unwrap();
+            let vals = match g.vals_copy(pos) {
+                Some(vs) => vs.into_iter().map(Some).collect(),
+                None => Vec::new(),
+            };
+            return (vals, g.get_receiving_indexes(ilab));
+        }
+        info!("| Handle Mode for {}", ilab);
+
+        let pos = self.add_to_graph(LabelEnum::Inbox(ilab));
+        let vals = self.visit_inbox_rfs(pos);
+        self.current.graph.register_inbox(&pos);
+        let g = &self.current.graph;
+        (
+            vals,
+            match g.inbox_label(pos) {
+                Some(il) => g.get_receiving_indexes(il),
+                None => Vec::new(),
+            },
+        )
     }
 
     /// Returns the next thread id to use in thread creation.
@@ -855,6 +894,16 @@ impl Must {
             return true; // no more executions.
         }
 
+        // Prepare layout for a fresh execution log row.
+        {
+            let mut m = must.borrow_mut();
+            m.tikz_exec = m.tikz_exec.saturating_add(1);
+            m.tikz_col = 0;
+            m.tikz_row_start = 0;
+            m.tikz_last_graph = None;
+            m.tikz_next_anchor = None;
+        }
+
         must.borrow_mut().unstop();
         !must.borrow_mut().try_revisit()
     }
@@ -911,7 +960,12 @@ impl Must {
             }
         }
 
-        self.log_tikz_graph(true);
+        let final_kind = if maybe_block.is_some() {
+            GraphKind::Blocked
+        } else {
+            GraphKind::Complete
+        };
+        self.log_tikz_graph(final_kind);
 
         if let Some(n) = self.config.max_iterations {
             if n <= num_total {
@@ -923,12 +977,12 @@ impl Must {
         false // not done
     }
 
-    fn log_tikz_graph(&mut self, is_complete: bool) {
+    fn log_tikz_graph(&mut self, kind: GraphKind) {
         let Some(tikz_path) = self.config.tikz_file.clone() else {
             return;
         };
 
-        let (row, col) = (self.tikz_row, self.tikz_col);
+        let (row, col) = (self.tikz_exec, self.tikz_col);
         if col == 0 && row > 0 {
             if let Some(_) = self.tikz_last_cols.get(&(row - 1)) {
                 if !self.tikz_row_boxes_defined.contains(&(row - 1)) {
@@ -944,7 +998,7 @@ impl Must {
             row,
             col,
             self.tikz_row_start,
-            is_complete,
+            kind,
         ) {
             Ok(()) => {
                 self.tikz_file_initialized = true;
@@ -955,18 +1009,28 @@ impl Must {
                 eprintln!("Could not write tikz graph to {}: {}", tikz_path, e);
             }
         }
-        self.advance_tikz_slot(row, col);
+        self.advance_tikz_slot(col, matches!(kind, GraphKind::Complete | GraphKind::Blocked));
     }
 
-    fn advance_tikz_slot(&mut self, row: usize, col: usize) {
+    fn advance_tikz_slot(&mut self, col: usize, is_final: bool) {
+        let row = self.tikz_exec;
+        if is_final {
+            // Completed execution: start a fresh row so different executions never share one.
+            self.tikz_last_cols.insert(row, col);
+            self.tikz_col = 0;
+            self.tikz_exec = row + 1;
+            self.tikz_row_start = 0;
+            return;
+        }
+
+        // Intermediate snapshot: advance within the same row.
         let next_col = col + 1;
         if next_col >= MAX_TIKZ_COLS {
             self.tikz_last_cols.insert(row, col);
             self.tikz_col = 0;
-            self.tikz_row = row + 1;
+            self.tikz_exec = row + 1;
         } else {
             self.tikz_col = next_col;
-            self.tikz_row = row;
         }
     }
 
@@ -1132,24 +1196,80 @@ impl Must {
         }
     }
 
+    // TODO(btwael)
+    fn visit_inbox_rfs(&mut self, pos: Event) -> Vec<Option<Val>> {
+        let mut rfs = self.checker.inbox_rfs(
+            &self.current.graph,
+            self.current.graph.inbox_label(pos).unwrap(),
+        );
+
+        //self.filter_symmetric_rfs(&mut rfs, pos); // TODO(btwael): check consistency with inbox semantic
+
+        // TODO(btwael): estimation mode implementation ignored for now, do we need it
+
+        if !rfs.is_empty() {
+            let mut combinations = compute_inbox_possible_subsets_from_rfs(&rfs);
+
+            // Pick a deterministic subset for this execution: prefer a non-empty subset
+            // if one exists, otherwise fall back to the empty subset.
+            let chosen = combinations
+                .iter()
+                .find(|subset| !subset.is_empty())
+                .cloned()
+                .or_else(|| combinations.first().cloned());
+
+            // Enqueue revisits for all other non-empty subsets.
+            for subset in combinations.drain(..) {
+                if Some(&subset) == chosen.as_ref() || subset.is_empty() {
+                    continue;
+                }
+                push_worklist(
+                    &mut self.current.rqueue,
+                    self.current.graph.label(pos).stamp(),
+                    RevisitEnum::new_forward_inbox(pos, subset),
+                );
+            }
+
+            // Apply the chosen subset to the current execution.
+            match chosen {
+                Some(subset) if !subset.is_empty() => {
+                    self.current
+                        .graph
+                        .change_inbox_rfs(pos, Some(subset));
+                }
+                _ => self.current.graph.change_inbox_rfs(pos, None),
+            }
+        } else {
+            self.current.graph.change_inbox_rfs(pos, None);
+        }
+        match self.current.graph.vals_copy(pos) {
+            Some(vs) => vs.into_iter().map(Some).collect(),
+            None => Vec::new(),
+        }
+    }
+
     fn is_maximal_extension(&self, rev: &Revisit) -> bool {
         let g = &self.current.graph;
-        let rlab = g.recv_label(rev.pos).unwrap();
-        let slab = g.send_label(rev.rev).unwrap();
-        let porf = slab.porf();
-        let stamp = rlab.stamp();
+        let recv_stamp = g.label(rev.pos).stamp();
+
+        // Union of PORF prefixes for the chosen send(s)
+        let mut prefix = VectorClock::new();
+        match &rev.rev {
+            RevisitPlacement::Default(s) => prefix.update(g.send_label(*s).unwrap().porf()),
+            RevisitPlacement::Inbox(sends) => {
+                for &s in sends {
+                    prefix.update(g.send_label(s).unwrap().porf());
+                }
+            }
+        }
+
         for thread in g.threads.iter() {
-            // Binary seach to find the first event that would be deleted
-            // (the predicate is monotonic over po-ordered events)
             let i = thread
                 .labels
-                .partition_point(|lab| lab.stamp() <= stamp || porf.contains(lab.pos()));
-            // Starting from there, see if there's any non-maximal
-            // Note: slice[slice.len()..] is indeed valid and produces an empty slice
+                .partition_point(|lab| lab.stamp() <= recv_stamp || prefix.contains(lab.pos()));
             if thread.labels[i..]
                 .iter()
-                .find(|&lab| !self.is_maximal(lab, rev))
-                .is_some()
+                .any(|lab| !self.is_maximal(lab, rev))
             {
                 return false;
             }
@@ -1159,51 +1279,116 @@ impl Must {
 
     // computing the set of backward revisits for the send at position "pos"
     fn calc_revisits(&mut self, pos: Event) {
-        // pos = (thread,index)
-        let slab = self.current.graph.send_label(pos).unwrap(); // the send label at the input position
-        let stamp = slab.stamp(); // the position in the interleaving order
-        if self.config.symmetry {
-            let flab = self.current.graph.thread_first(slab.pos().thread).unwrap();
-            if flab.sym_id().is_some() && self.is_prefix_symmetric(flab.sym_id(), pos) {
-                return;
-            }
-        }
+      let slab = self.current.graph.send_label(pos).unwrap();
+      let stamp = slab.stamp();
+      let g = &self.current.graph;
 
-        let g = &self.current.graph;
-        let send_porf = slab.porf();
+      // Respect symmetry for plain receives, but keep symmetric sends if any inbox could read them.
+      if self.config.symmetry {
+          let flab = self.current.graph.thread_first(slab.pos().thread).unwrap();
+          if flab.sym_id().is_some() && self.is_prefix_symmetric(flab.sym_id(), pos) {
+              let has_inbox = g
+                  .rev_matching_recvs(slab)
+                  .any(|rl| matches!(rl, RecvLike::Inbox(_)));
+              if !has_inbox {
+                  return;
+              }
+          }
+      }
 
-        // Take the matching receives, in reverse stamp order
-        let revs = g
-            .rev_matching_recvs(slab)
-            // Filter out the ones that are porf-before the send
-            .filter(|&rlab| !send_porf.contains(rlab.pos()))
-            // Take them while they pass the maximality check,
-            // stopping at the first receive that fails:
-            // it cannot be removed and thus any deeper (stamp-earlier) revisit is futile.
-            .take_while(|recv| self.is_maximal_recv(recv, &Revisit::new(recv.pos(), pos)))
-            // Finally, filter out the receives that cannot consistently read from the send.
-            .filter(|rlab| {
-                self.checker
-                    .is_revisit_consistent(g, rlab, slab, self.is_monitor(&rlab.pos()))
-            })
-            // And again, take while the revisit is maximal (deeper revisits are futile if this fails)
-            .take_while(|&rlab| self.is_maximal_extension(&Revisit::new(rlab.pos(), pos)))
-            .map(|recv| recv.pos())
-            .collect::<Vec<_>>();
+      let send_porf = slab.porf();
 
-        if self.config.mode == ExplorationMode::Estimation {
-            self.pick_revisit(revs, pos);
-            return;
-        }
+      // Helper: generate all subsets of `cands` that contain `must`.
+      fn subsets_containing(cands: &[Event], must: Event) -> Vec<Vec<Event>> {
+          let mut out = Vec::new();
+          let mut cur = Vec::new();
+          fn backtrack(
+              out: &mut Vec<Vec<Event>>,
+              cur: &mut Vec<Event>,
+              cands: &[Event],
+              idx: usize,
+              must: Event,
+              has_must: bool,
+          ) {
+              if idx == cands.len() {
+                  if has_must {
+                      out.push(cur.clone());
+                  }
+                  return;
+              }
+              // skip
+              backtrack(out, cur, cands, idx + 1, must, has_must);
+              // take
+              cur.push(cands[idx]);
+              let now_has_must = has_must || cands[idx] == must;
+              backtrack(out, cur, cands, idx + 1, must, now_has_must);
+              cur.pop();
+          }
+          backtrack(&mut out, &mut cur, cands, 0, must, false);
+          out
+      }
 
-        revs.iter().for_each(|&r| {
-            push_worklist(
-                &mut self.current.rqueue,
-                stamp,
-                RevisitEnum::new_backward(r, pos),
-            );
-        });
-    }
+      let mut revs: Vec<RevisitEnum> = Vec::new();
+
+      for rl in g.rev_matching_recvs(slab) {
+          if send_porf.contains(rl.pos()) {
+              continue;
+          }
+
+          match rl {
+              RecvLike::RecvMsg(r) => {
+                  let rev = Revisit::new(r.pos(), pos);
+                  if !self.is_maximal_recv(r, &rev) {
+                      break;
+                  }
+                  if self
+                      .checker
+                      .is_revisit_consistent(g, r, slab, self.is_monitor(&r.pos()))
+                      && self.is_maximal_extension(&rev)
+                  {
+                      revs.push(RevisitEnum::BackwardRevisit(Revisit::new(r.pos(), pos)));
+                  }
+              }
+              RecvLike::Inbox(i) => {
+                  let rev = Revisit::new_inbox(i.pos(), vec![pos]);
+                  if !self.is_maximal_inbox(i, &rev) {
+                      break;
+                  }
+
+                  // collect candidate sends (including this new send), dedup
+                  let mut cands: Vec<Event> = g
+                      .matching_stores(i.recv_loc())
+                      .map(|s| s.pos())
+                      .filter(|&e| !g.send_label(e).unwrap().is_dropped())
+                      .collect();
+                  if !cands.contains(&pos) {
+                      cands.push(pos);
+                  }
+                  // enumerate subsets that include `pos`
+                  for subset in subsets_containing(&cands, pos) {
+                      let rev_inbox = Revisit::new_inbox(i.pos(), subset.clone());
+                      if self
+                          .checker
+                          .is_revisit_consistent_inbox(g, i, &subset)
+                          && self.is_maximal_inbox(i, &rev_inbox)
+                          && self.is_maximal_extension(&rev_inbox)
+                      {
+                          revs.push(RevisitEnum::BackwardRevisit(Revisit::new_inbox(
+                              i.pos(),
+                              subset,
+                          )));
+                      }
+                  }
+              }
+          }
+      }
+
+      // TODO: estimation mode picker that understands placements
+      for rev in revs {
+          push_worklist(&mut self.current.rqueue, stamp, rev);
+      }
+  }
+
 
     // Return whether lab reads from a stamp-later send that would
     // be deleted from the revisit.
@@ -1217,13 +1402,37 @@ impl Must {
                 // stamp-after rev.pos
                 stamp > g.label(rev.pos).stamp() &&
                 // and not porf-before rev.rev
-                !g.send_label(rev.rev).unwrap().porf().contains(rf)
+                !g.send_label(rev.rev_event()).unwrap().porf().contains(rf)
         })
+    }
+
+    fn inbox_revisited_by_deleted(&self, lab: &Inbox, rev: &Revisit) -> bool {
+        let g = &self.current.graph;
+        // Union of PORF prefixes of the chosen sends for this revisit
+        let mut target_prefix = VectorClock::new();
+        for &s in rev.rev_inbox() {
+            target_prefix.update(g.send_label(s).unwrap().porf());
+        }
+
+        match lab.rfs() {
+            None => false, // nothing to delete
+            Some(rfs) => rfs.iter().any(|&rf| {
+                let rf_stamp = g.label(rf).stamp();
+                rf_stamp > lab.stamp()
+                    && rf_stamp > g.label(rev.pos).stamp()
+                    && !target_prefix.contains(rf)
+            }),
+        }
     }
 
     fn reads_tiebreaker(&self, rlab: &RecvMsg, rev: &Revisit) -> bool {
         self.checker
             .reads_tiebreaker(&self.current.graph, rlab, rev, self.is_monitor(&rlab.pos()))
+    }
+
+    fn inbox_reads_tiebreaker(&self, ilab: &Inbox, rev: &Revisit) -> bool {
+        self.checker
+            .inbox_reads_tiebreaker(&self.current.graph, ilab, rev)
     }
 
     fn is_monitor(&self, recv: &Event) -> bool {
@@ -1238,6 +1447,12 @@ impl Must {
             && self.reads_tiebreaker(rlab, rev)
     }
 
+    fn is_maximal_inbox(&self, ilab: &Inbox, rev: &Revisit) -> bool {
+        !self.inbox_revisited_by_deleted(ilab, rev)
+            && ilab.is_revisitable()
+            && self.inbox_reads_tiebreaker(ilab, rev)
+    }
+
     fn is_maximal(&self, lab: &LabelEnum, rev: &Revisit) -> bool {
         match lab {
             LabelEnum::RecvMsg(rlab) => self.is_maximal_recv(rlab, rev),
@@ -1246,12 +1461,13 @@ impl Must {
             // we handle this via the revisitable flag on the corresponding receive.
             LabelEnum::SendMsg(slab) => !slab.is_dropped(),
             LabelEnum::Choice(chlab) => chlab.result() == *chlab.range().end(),
+            LabelEnum::Inbox(ilab) => self.is_maximal_inbox(ilab, rev),
             _ => true,
         }
     }
 
     fn filter_symmetric_rfs(&self, rfs: &mut Vec<Event>, pos: Event) {
-        assert!(self.current.graph.is_recv(pos));
+        assert!(self.current.graph.is_recv(pos) || self.current.graph.is_inbox(pos));
 
         let mut sym_rfs = HashSet::new();
         for rf in rfs.iter() {
@@ -1315,7 +1531,7 @@ impl Must {
         }
         let pos = self.current.graph.add_label(lab);
         self.checker.calc_views(&mut self.current.graph, pos);
-        self.log_tikz_graph(false);
+        self.log_tikz_graph(GraphKind::Snapshot);
         pos
     }
 
@@ -1423,6 +1639,7 @@ impl Must {
                 }
             }
             LabelEnum::RecvMsg(_rlab) => self.change_rf(rev),
+            LabelEnum::Inbox(_ilab) => self.change_rf(rev),
             LabelEnum::SendMsg(slab) => {
                 slab.set_dropped();
                 self.current.graph.incr_dropped_sends();
@@ -1434,17 +1651,37 @@ impl Must {
     }
 
     // Mark events in the porf-prefix as non revisitable
-    fn mark_prefix_non_revisitable(&mut self, send: Event) {
-        let prefix = self.current.graph.send_label(send).unwrap().porf().clone();
+    fn mark_prefix_non_revisitable(&mut self, revisit_placement: RevisitPlacement) {
+        match revisit_placement {
+            RevisitPlacement::Default(send) => {
+                let prefix = self.current.graph.send_label(send).unwrap().porf().clone();
 
-        // Iterate on the prefix's labs
-        for thread in self.current.graph.threads.iter_mut() {
-            let j = thread
-                .labels
-                .partition_point(|lab| prefix.contains(lab.pos()));
-            for lab in &mut thread.labels[..j] {
-                if let LabelEnum::RecvMsg(rlab) = lab {
-                    rlab.set_revisitable(false)
+                // Iterate on the prefix's labs
+                for thread in self.current.graph.threads.iter_mut() {
+                    let j = thread
+                        .labels
+                        .partition_point(|lab| prefix.contains(lab.pos()));
+                    for lab in &mut thread.labels[..j] {
+                        if let LabelEnum::RecvMsg(rlab) = lab {
+                            rlab.set_revisitable(false)
+                        }
+                    }
+                }
+            }
+            RevisitPlacement::Inbox(sends) => {
+                let mut prefix = VectorClock::new();
+                for s in sends {
+                    prefix.update(self.current.graph.send_label(s).unwrap().porf());
+                }
+                for thread in self.current.graph.threads.iter_mut() {
+                    let j = thread
+                        .labels
+                        .partition_point(|lab| prefix.contains(lab.pos()));
+                    for lab in &mut thread.labels[..j] {
+                        if let LabelEnum::RecvMsg(rlab) = lab {
+                            rlab.set_revisitable(false);
+                        }
+                    }
                 }
             }
         }
@@ -1461,7 +1698,7 @@ impl Must {
         self.push_state();
         self.current.graph = ng;
 
-        self.mark_prefix_non_revisitable(rev.rev);
+        self.mark_prefix_non_revisitable(rev.rev.clone());
 
         self.change_rf(rev);
 
@@ -1513,7 +1750,16 @@ impl Must {
 
     /// Change an rf according to the revisit
     fn change_rf(&mut self, rev: &Revisit) {
-        self.current.graph.change_rf(rev.pos, Some(rev.rev));
+        match &rev.rev {
+            RevisitPlacement::Default(vv) => {
+                self.current.graph.change_rf(rev.pos, Some(*vv));
+            }
+            RevisitPlacement::Inbox(vv) => {
+                self.current
+                    .graph
+                    .change_inbox_rfs(rev.pos, Some(vv.clone()));
+            }
+        }
     }
 
     fn pick_revisit(&mut self, revs: Vec<Event>, pos: Event) {
@@ -1547,12 +1793,19 @@ impl Must {
         }
         let state = self.states.pop().unwrap();
         self.current = state;
-        if let Some((row, col, row_start, rows_def, last_cols, row_boxes, last_graph, next_anchor)) =
-            self.tikz_layout_stack.pop()
+        if let Some((
+            _row,
+            _col,
+            _row_start,
+            rows_def,
+            last_cols,
+            row_boxes,
+            last_graph,
+            next_anchor,
+        )) = self.tikz_layout_stack.pop()
         {
-            self.tikz_row = row;
-            self.tikz_col = col;
-            self.tikz_row_start = row_start;
+            self.tikz_col = 0;
+            self.tikz_row_start = 0;
             self.tikz_rows_defined = rows_def;
             self.tikz_last_cols = last_cols;
             self.tikz_row_boxes_defined = row_boxes;
@@ -1565,7 +1818,7 @@ impl Must {
     fn push_state(&mut self) {
         self.states.push(std::mem::take(&mut self.current));
         self.tikz_layout_stack.push((
-            self.tikz_row,
+            0, // unused row placeholder to keep tuple shape
             self.tikz_col,
             self.tikz_row_start,
             self.tikz_rows_defined.clone(),
@@ -1578,9 +1831,9 @@ impl Must {
             self.tikz_last_cols.insert(r, c);
         }
         let anchor = self.tikz_last_graph;
-        let next_row = self.tikz_row.saturating_add(1);
+        let next_row = self.tikz_exec.saturating_add(1);
         let next_col = 0;
-        self.tikz_row = next_row;
+        self.tikz_exec = next_row;
         self.tikz_col = next_col;
         self.tikz_row_start = anchor.map(|(_, c)| c).unwrap_or(0);
         self.tikz_next_anchor = anchor;
@@ -1871,6 +2124,25 @@ fn pop_worklist(worklist: &mut RQueue) -> RevisitEnum {
         worklist.remove(&stamp);
     }
     rev
+}
+
+fn compute_inbox_possible_subsets_from_rfs(events: &Vec<Event>) -> Vec<Vec<Event>> {
+    let total = 1usize << events.len();
+    let mut subsets: Vec<Vec<Event>> = Vec::with_capacity(total);
+
+    for mask in 0..total {
+        let mut subset = Vec::new();
+
+        for i in 0..events.len() {
+            if (mask & (1usize << i)) != 0 {
+                subset.push(events[i].clone());
+            }
+        }
+
+        subsets.push(subset);
+    }
+
+    subsets
 }
 
 #[cfg(test)]

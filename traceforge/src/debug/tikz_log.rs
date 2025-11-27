@@ -25,7 +25,7 @@ pub(crate) fn write_tikz_graph(
     row: usize,
     col: usize,
     row_start: usize,
-    is_complete: bool,
+    kind: GraphKind,
 ) -> Result<()> {
     let graph_idx = next_graph_index(path, truncate)?;
 
@@ -34,7 +34,7 @@ pub(crate) fn write_tikz_graph(
     } else {
         load_manifest(path)?
     };
-    manifest.graphs.insert(graph_idx, (row, col, is_complete));
+    manifest.graphs.insert(graph_idx, (row, col, kind));
     manifest
         .row_starts
         .entry(row)
@@ -165,10 +165,21 @@ fn graph_picture(graph: &ExecutionGraph) -> String {
                 LabelEnum::RecvMsg(rlab) => {
                     if let Some(rf) = rlab.rf() {
                         out.push_str(&format!(
-                            "\\draw[rf] ({}) -> ({});\n",
+                            "\\draw[rf, bend left=8] ({}) -> ({});\n",
                             node_id(&rf),
                             node_id(&current)
                         ));
+                    }
+                }
+                LabelEnum::Inbox(ilab) => {
+                    if let Some(rfs) = ilab.rfs() {
+                        for rf in rfs {
+                            out.push_str(&format!(
+                                "\\draw[rf,bend left=10] ({}) to ({});\n",
+                                node_id(&rf),
+                                node_id(&current)
+                            ));
+                        }
                     }
                 }
                 LabelEnum::Begin(blab) => {
@@ -408,7 +419,7 @@ fn manifest_path(base_path: &str) -> Option<PathBuf> {
 
 #[derive(Default)]
 struct Manifest {
-    graphs: HashMap<usize, (usize, usize, bool)>,
+    graphs: HashMap<usize, (usize, usize, GraphKind)>,
     row_starts: HashMap<usize, usize>,
 }
 
@@ -433,14 +444,19 @@ fn load_manifest(base_path: &str) -> Result<Manifest> {
                         col.parse::<usize>(),
                         flag.parse::<u8>(),
                     ) {
-                        out.graphs.insert(i, (r, c, f != 0));
+                        let kind = match f {
+                            1 => GraphKind::Complete,
+                            2 => GraphKind::Blocked,
+                            _ => GraphKind::Snapshot,
+                        };
+                        out.graphs.insert(i, (r, c, kind));
                     }
                 }
                 ["G", idx, row, col] => {
                     if let (Ok(i), Ok(r), Ok(c)) =
                         (idx.parse::<usize>(), row.parse::<usize>(), col.parse::<usize>())
                     {
-                        out.graphs.insert(i, (r, c, false));
+                        out.graphs.insert(i, (r, c, GraphKind::Snapshot));
                     }
                 }
                 ["R", row, start] => {
@@ -452,12 +468,12 @@ fn load_manifest(base_path: &str) -> Result<Manifest> {
                     if let (Ok(i), Ok(r), Ok(c)) =
                         (idx.parse::<usize>(), row.parse::<usize>(), col.parse::<usize>())
                     {
-                        out.graphs.insert(i, (r, c, false));
+                        out.graphs.insert(i, (r, c, GraphKind::Snapshot));
                     }
                 }
                 [idx, row] => {
                     if let (Ok(i), Ok(r)) = (idx.parse::<usize>(), row.parse::<usize>()) {
-                        out.graphs.insert(i, (r, i, false));
+                        out.graphs.insert(i, (r, i, GraphKind::Snapshot));
                     }
                 }
                 _ => {}
@@ -489,8 +505,13 @@ fn save_manifest(base_path: &str, manifest: &Manifest) -> Result<()> {
     for (row, start) in row_entries {
         writeln!(&mut file, "R {} {}", row, start)?;
     }
-    for (idx, (row, col, complete)) in graph_entries {
-        writeln!(&mut file, "G {} {} {} {}", idx, row, col, if *complete { 1 } else { 0 })?;
+    for (idx, (row, col, kind)) in graph_entries {
+        let flag = match kind {
+            GraphKind::Snapshot => 0,
+            GraphKind::Complete => 1,
+            GraphKind::Blocked => 2,
+        };
+        writeln!(&mut file, "G {} {} {} {}", idx, row, col, flag)?;
     }
     Ok(())
 }
@@ -532,11 +553,11 @@ fn write_gallery_html(base_path: &str) -> Result<()> {
       <table class="graph-table">
         <tbody>"#);
 
-    let mut rows: BTreeMap<usize, Vec<(usize, usize, bool)>> = BTreeMap::new();
-    for (&idx, &(row, col, complete)) in manifest.graphs.iter() {
+    let mut rows: BTreeMap<usize, Vec<(usize, usize, GraphKind)>> = BTreeMap::new();
+    for (&idx, &(row, col, kind)) in manifest.graphs.iter() {
         let row_start = *manifest.row_starts.get(&row).unwrap_or(&0);
         let abs_col = row_start + col;
-        rows.entry(row).or_default().push((abs_col, idx, complete));
+        rows.entry(row).or_default().push((abs_col, idx, kind));
     }
     // Compute max cols per row to keep row-local padding only
     let mut row_max: BTreeMap<usize, usize> = BTreeMap::new();
@@ -549,22 +570,23 @@ fn write_gallery_html(base_path: &str) -> Result<()> {
         cells.sort_by_key(|(col, _, _)| *col);
         out.push_str("<tr>");
         let mut current_col = 0usize;
-        for (col, idx, complete) in cells {
+        for (col, idx, kind) in cells {
             while current_col < col {
                 out.push_str(r#"<td></td>"#);
                 current_col += 1;
             }
             let img = format!("graphs/{}_g{:04}.png", stem, idx);
+            let complete_class = match kind {
+                GraphKind::Complete => "border border-danger border-2 border-dashed",
+                GraphKind::Blocked => "border border-primary border-2 border-dashed",
+                GraphKind::Snapshot => "",
+            };
             out.push_str(&format!(
                 r#"
           <td class="{complete_class}">
             <img src="{img}" alt="Graph {idx}">
           </td>"#,
-                complete_class = if complete {
-                    "border border-danger border-2 border-dashed"
-                } else {
-                    ""
-                }
+                complete_class = complete_class
             ));
             current_col += 1;
         }
@@ -651,4 +673,11 @@ fn base_dir_and_stem(base_path: &str) -> (PathBuf, String) {
             .unwrap_or_else(|| "graphs".to_string());
         (p, stem)
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum GraphKind {
+    Snapshot,
+    Complete,
+    Blocked,
 }
