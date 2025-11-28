@@ -450,10 +450,9 @@ impl Consistency {
         ilab: &Inbox,
         rev: &Revisit,
     ) -> bool {
-        // Non-blocking inboxes are maximal only when they currently time out / have no reads.
         match ilab.rfs() {
             None => true,
-            Some(rfs) => rfs.is_empty(),
+            Some(rfs) => true,
         }
     }
 

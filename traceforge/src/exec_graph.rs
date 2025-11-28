@@ -585,6 +585,20 @@ impl ExecutionGraph {
         }
     }
 
+    pub(crate) fn sends_with_readers(&self) -> Vec<Event> {
+        let mut events = Vec::new();
+        for thr in self.threads.iter() {
+            for (idx, label) in thr.labels.iter().enumerate() {
+                if let LabelEnum::SendMsg(slab) = label {
+                    if slab.reader().is_some() {
+                        events.push(Event::new(thr.tid, idx as u32));
+                    }
+                }
+            }
+        }
+        events
+    }
+
     /// Returns whether this is a send that is not read by *anyone*
     pub(crate) fn is_rf_maximal_send(&self, e: Event) -> bool {
         self.send_label(e)

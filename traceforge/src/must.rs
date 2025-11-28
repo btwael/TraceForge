@@ -142,6 +142,22 @@ pub(crate) struct Must {
     pub telemetry: Telemetry,
     published_values: BTreeMap<(ThreadId, TypeId), Val>,
     pub started_at: Instant,
+    inbox_empty_revisits: HashSet<InboxEmptyKey>,
+    inbox_subset_revisits: HashSet<InboxSubsetKey>,
+}
+
+#[derive(Hash, Eq, PartialEq, Clone, Debug)]
+struct InboxEmptyKey {
+    pos: Event,
+    rfs: Vec<Event>,
+    consumed_sends: Vec<Event>,
+}
+
+#[derive(Hash, Eq, PartialEq, Clone, Debug)]
+struct InboxSubsetKey {
+    pos: Event,
+    subset: Vec<Event>,
+    consumed_sends: Vec<Event>,
 }
 
 impl Must {
@@ -181,6 +197,8 @@ impl Must {
             telemetry,
             published_values: BTreeMap::new(),
             started_at: Instant::now(),
+            inbox_empty_revisits: HashSet::new(),
+            inbox_subset_revisits: HashSet::new(),
         }
     }
 
@@ -395,6 +413,18 @@ impl Must {
 
         trace!("[must.rs] Handling send at position {}", slab.pos());
 
+        let target = slab
+            .send_loc()
+            .receiver_tid()
+            .map(|tid| tid.to_string())
+            .unwrap_or_else(|| format!("{}", slab.send_loc().loc()));
+        info!(
+            "[event:add] send {} -> {} (pos {})",
+            slab.pos().thread,
+            target,
+            slab.pos()
+        );
+
         let pos = self.add_to_graph(LabelEnum::SendMsg(slab));
         trace!("[must.rs] Adding the system send {}", pos);
 
@@ -451,6 +481,12 @@ impl Must {
             return (vals, g.get_receiving_indexes(ilab));
         }
         info!("| Handle Mode for {}", ilab);
+
+        info!(
+            "[event:add] inbox on thread {} (pos {})",
+            ilab.receiver(),
+            ilab.pos()
+        );
 
         let pos = self.add_to_graph(LabelEnum::Inbox(ilab));
         let vals = self.visit_inbox_rfs(pos);
@@ -1198,7 +1234,7 @@ impl Must {
 
     // TODO(btwael)
     fn visit_inbox_rfs(&mut self, pos: Event) -> Vec<Option<Val>> {
-        let mut rfs = self.checker.inbox_rfs(
+        let rfs = self.checker.inbox_rfs(
             &self.current.graph,
             self.current.graph.inbox_label(pos).unwrap(),
         );
@@ -1208,7 +1244,17 @@ impl Must {
         // TODO(btwael): estimation mode implementation ignored for now, do we need it
 
         if !rfs.is_empty() {
+            info!(
+                "[inbox:{}] available sends: [{}]",
+                pos,
+                self.fmt_events(&rfs)
+            );
             let mut combinations = compute_inbox_possible_subsets_from_rfs(&rfs);
+            info!(
+                "[inbox:{}] computed subsets: {}",
+                pos,
+                self.fmt_event_sets(&combinations)
+            );
 
             // Pick a deterministic subset for this execution: prefer a non-empty subset
             // if one exists, otherwise fall back to the empty subset.
@@ -1218,28 +1264,66 @@ impl Must {
                 .cloned()
                 .or_else(|| combinations.first().cloned());
 
-            // Enqueue revisits for all other non-empty subsets.
+            // Enqueue revisits for all other subsets (including empty), except the one chosen now.
+            let empty_key = self.inbox_empty_key(pos, &rfs);
             for subset in combinations.drain(..) {
-                if Some(&subset) == chosen.as_ref() || subset.is_empty() {
+                if Some(&subset) == chosen.as_ref() {
                     continue;
                 }
-                push_worklist(
-                    &mut self.current.rqueue,
-                    self.current.graph.label(pos).stamp(),
-                    RevisitEnum::new_forward_inbox(pos, subset),
-                );
+                if subset.is_empty() {
+                    let subset_desc = "empty subset (timeout)".to_string();
+                    info!("  [inbox:{}] enqueue forward revisit for {}", pos, subset_desc);
+                    if !self.inbox_empty_revisits.insert(empty_key.clone()) {
+                        info!("  [inbox:{}] skip duplicate empty revisit for current rfs set", pos);
+                        continue;
+                    }
+                    push_worklist(
+                        &mut self.current.rqueue,
+                        self.current.graph.label(pos).stamp(),
+                        RevisitEnum::new_forward_inbox(pos, subset.clone()),
+                    );
+                } else {
+                    let subset_desc = format!("subset {}", self.fmt_event_set(&subset));
+                    info!("  [inbox:{}] enqueue forward revisit for {}", pos, subset_desc);
+                    if !self.inbox_subset_revisits.insert(self.inbox_subset_key(pos, &rfs, &subset)) {
+                        info!(
+                            "  [inbox:{}] skip duplicate revisit for subset {}",
+                            pos,
+                            self.fmt_event_set(&subset)
+                        );
+                        continue;
+                    }
+                    push_worklist(
+                        &mut self.current.rqueue,
+                        self.current.graph.label(pos).stamp(),
+                        RevisitEnum::new_forward_inbox(pos, subset.clone()),
+                    );
+                }
             }
 
             // Apply the chosen subset to the current execution.
             match chosen {
                 Some(subset) if !subset.is_empty() => {
+                    // Mark this subset as explored so future revisits with the same choice can be skipped.
+                    self.inbox_subset_revisits
+                        .insert(self.inbox_subset_key(pos, &rfs, &subset));
+                    info!(
+                        "[inbox:{}] choosing subset {}",
+                        pos,
+                        self.fmt_event_set(&subset)
+                    );
                     self.current
                         .graph
                         .change_inbox_rfs(pos, Some(subset));
                 }
-                _ => self.current.graph.change_inbox_rfs(pos, None),
+                _ => {
+                    info!("[inbox:{}] choosing empty subset (timeout)", pos);
+                    self.inbox_empty_revisits.insert(empty_key.clone());
+                    self.current.graph.change_inbox_rfs(pos, None);
+                }
             }
         } else {
+            info!("[inbox:{}] no matching sends, choosing empty subset", pos);
             self.current.graph.change_inbox_rfs(pos, None);
         }
         match self.current.graph.vals_copy(pos) {
@@ -1282,6 +1366,12 @@ impl Must {
       let slab = self.current.graph.send_label(pos).unwrap();
       let stamp = slab.stamp();
       let g = &self.current.graph;
+
+      info!(
+          "[revisit/backward] computing revisits for send {} (thread {})",
+          pos,
+          slab.pos().thread
+      );
 
       // Respect symmetry for plain receives, but keep symmetric sends if any inbox could read them.
       if self.config.symmetry {
@@ -1366,6 +1456,11 @@ impl Must {
                   }
                   // enumerate subsets that include `pos`
                   for subset in subsets_containing(&cands, pos) {
+                      info!(
+                          "  [revisit/backward] inbox {} subset {}",
+                          i.pos(),
+                          self.fmt_event_set(&subset)
+                      );
                       let rev_inbox = Revisit::new_inbox(i.pos(), subset.clone());
                       if self
                           .checker
@@ -1385,6 +1480,10 @@ impl Must {
 
       // TODO: estimation mode picker that understands placements
       for rev in revs {
+          info!(
+              "  [revisit/backward] enqueue {}",
+              self.describe_revisit_item(&rev)
+          );
           push_worklist(&mut self.current.rqueue, stamp, rev);
       }
   }
@@ -1591,6 +1690,10 @@ impl Must {
                 return false;
             }
             let rev = { pop_worklist(&mut self.current.rqueue) };
+            info!(
+                "[revisit] checking {}",
+                self.describe_revisit_item(&rev)
+            );
             if self.config.verbose >= 3 {
                 println!("Revisit {} <= {}", rev.pos(), rev.rev());
                 println!("Before graph:");
@@ -1606,7 +1709,11 @@ impl Must {
     }
 
     fn forward_revisit(&mut self, rev: &Revisit) -> bool {
-        info!("================ begin forward_revisit ===================");
+        let placement = self.fmt_revisit_placement(&rev.rev);
+        info!(
+            "[revisit/forward] start {} <= {}",
+            rev.pos, placement
+        );
         let lab = self.current.graph.label_mut(rev.pos);
         let pos = lab.pos();
         let stamp = lab.stamp();
@@ -1639,7 +1746,31 @@ impl Must {
                 }
             }
             LabelEnum::RecvMsg(_rlab) => self.change_rf(rev),
-            LabelEnum::Inbox(_ilab) => self.change_rf(rev),
+            LabelEnum::Inbox(_ilab) => {
+                if let RevisitPlacement::Inbox(vv) = &rev.rev {
+                    if vv.is_empty() {
+                        let key = self.inbox_empty_key_from_graph(pos);
+                        if !self.inbox_empty_revisits.insert(key) {
+                            info!(
+                                "  [revisit] skip duplicate empty inbox revisit for {}",
+                                pos
+                            );
+                            return false;
+                        }
+                    } else if !self
+                        .inbox_subset_revisits
+                        .insert(self.inbox_subset_key(pos, &vv, &vv))
+                    {
+                        info!(
+                            "  [revisit] skip duplicate inbox subset revisit for {}: {}",
+                            pos,
+                            self.fmt_event_set(vv)
+                        );
+                        return false;
+                    }
+                }
+                self.change_rf(rev)
+            }
             LabelEnum::SendMsg(slab) => {
                 slab.set_dropped();
                 self.current.graph.incr_dropped_sends();
@@ -1688,9 +1819,10 @@ impl Must {
     }
 
     fn backward_revisit(&mut self, rev: &Revisit) -> bool {
+        let placement = self.fmt_revisit_placement(&rev.rev);
         info!(
-            "================ begin backward_revisit for {:?} ===================",
-            rev
+            "[revisit/backward] start {} <= {}",
+            rev.pos, placement
         );
         let v = self.current.graph.revisit_view(rev);
         let ng = self.current.graph.copy_to_view(&v);
@@ -1752,12 +1884,121 @@ impl Must {
     fn change_rf(&mut self, rev: &Revisit) {
         match &rev.rev {
             RevisitPlacement::Default(vv) => {
+                let before = self
+                    .current
+                    .graph
+                    .recv_label(rev.pos)
+                    .and_then(|r| r.rf())
+                    .map(|ev| ev.to_string())
+                    .unwrap_or_else(|| "none".to_string());
+                info!(
+                    "  [revisit] apply rf for {} from {} to {}",
+                    rev.pos, before, vv
+                );
                 self.current.graph.change_rf(rev.pos, Some(*vv));
             }
             RevisitPlacement::Inbox(vv) => {
-                self.current
-                    .graph
-                    .change_inbox_rfs(rev.pos, Some(vv.clone()));
+                if vv.is_empty() {
+                    info!(
+                        "  [revisit] apply inbox rf for {} to empty set",
+                        rev.pos
+                    );
+                    let key = self.inbox_empty_key_from_graph(rev.pos);
+                    self.inbox_empty_revisits.insert(key);
+                    self.current.graph.change_inbox_rfs(rev.pos, None);
+                } else {
+                    self
+                        .inbox_subset_revisits
+                        .insert(self.inbox_subset_key(rev.pos, &vv, &vv));
+                    info!(
+                        "  [revisit] apply inbox rf for {} to {}",
+                        rev.pos,
+                        self.fmt_event_set(vv)
+                    );
+                    self.current
+                        .graph
+                        .change_inbox_rfs(rev.pos, Some(vv.clone()));
+                }
+            }
+        }
+    }
+
+    fn fmt_events(&self, events: &[Event]) -> String {
+        events
+            .iter()
+            .map(|e| e.to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    fn inbox_empty_key(&self, pos: Event, rfs: &[Event]) -> InboxEmptyKey {
+        let mut sorted_rfs = rfs.to_vec();
+        sorted_rfs.sort();
+        InboxEmptyKey {
+            pos,
+            rfs: sorted_rfs,
+            consumed_sends: self.send_events_with_readers(),
+        }
+    }
+
+    fn inbox_subset_key(&self, pos: Event, _rfs: &[Event], subset: &[Event]) -> InboxSubsetKey {
+        let mut sorted_subset = subset.to_vec();
+        sorted_subset.sort();
+        let subset_set: HashSet<Event> = sorted_subset.iter().copied().collect();
+        let mut consumed = self
+            .send_events_with_readers()
+            .into_iter()
+            .filter(|e| !subset_set.contains(e))
+            .collect::<Vec<_>>();
+        consumed.sort();
+        InboxSubsetKey {
+            pos,
+            subset: sorted_subset,
+            consumed_sends: consumed,
+        }
+    }
+
+    fn inbox_empty_key_from_graph(&self, pos: Event) -> InboxEmptyKey {
+        let rfs = self
+            .current
+            .graph
+            .inbox_label(pos)
+            .and_then(|il| il.rfs())
+            .unwrap_or_else(Vec::new);
+        self.inbox_empty_key(pos, &rfs)
+    }
+
+    fn send_events_with_readers(&self) -> Vec<Event> {
+        let mut events = self.current.graph.sends_with_readers();
+        events.sort();
+        events
+    }
+
+    fn fmt_event_set(&self, events: &[Event]) -> String {
+        format!("{{{}}}", self.fmt_events(events))
+    }
+
+    fn fmt_event_sets(&self, sets: &[Vec<Event>]) -> String {
+        sets.iter()
+            .map(|s| self.fmt_event_set(s))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    fn fmt_revisit_placement(&self, placement: &RevisitPlacement) -> String {
+        match placement {
+            RevisitPlacement::Default(ev) => ev.to_string(),
+            RevisitPlacement::Inbox(v) => self.fmt_event_set(v),
+        }
+    }
+
+    fn describe_revisit_item(&self, rev: &RevisitEnum) -> String {
+        match rev {
+            RevisitEnum::ForwardRevisit(r) => {
+                format!("forward {} <= {}", r.pos, self.fmt_revisit_placement(&r.rev))
+            }
+            RevisitEnum::BackwardRevisit(r) => {
+                format!("backward {} <= {}", r.pos, self.fmt_revisit_placement(&r.rev))
             }
         }
     }
@@ -2127,21 +2368,28 @@ fn pop_worklist(worklist: &mut RQueue) -> RevisitEnum {
 }
 
 fn compute_inbox_possible_subsets_from_rfs(events: &Vec<Event>) -> Vec<Vec<Event>> {
-    let total = 1usize << events.len();
-    let mut subsets: Vec<Vec<Event>> = Vec::with_capacity(total);
-
-    for mask in 0..total {
-        let mut subset = Vec::new();
-
-        for i in 0..events.len() {
-            if (mask & (1usize << i)) != 0 {
-                subset.push(events[i].clone());
-            }
+    fn build(
+        idx: usize,
+        events: &[Event],
+        current: &mut Vec<Event>,
+        out: &mut Vec<Vec<Event>>,
+    ) {
+        if idx == events.len() {
+            out.push(current.clone());
+            return;
         }
 
-        subsets.push(subset);
+        // Exclude current event
+        build(idx + 1, events, current, out);
+
+        // Include current event
+        current.push(events[idx]);
+        build(idx + 1, events, current, out);
+        current.pop();
     }
 
+    let mut subsets: Vec<Vec<Event>> = Vec::with_capacity(1usize << events.len());
+    build(0, events, &mut Vec::new(), &mut subsets);
     subsets
 }
 

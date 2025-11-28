@@ -1,7 +1,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    event_label::SendMsg, identifier::Identifier, predicate::PredicateType, thread::ThreadId,
+    channel::Thread, event_label::SendMsg, identifier::Identifier, predicate::PredicateType,
+    thread::ThreadId,
 };
 
 use std::fmt::{Debug, Display};
@@ -25,6 +26,14 @@ pub(crate) struct Loc(Box<dyn Identifier>);
 impl Loc {
     pub(crate) fn new<T: crate::identifier::Identifier>(id: T) -> Self {
         Loc(Box::new(id))
+    }
+
+    /// Try to extract a thread id when the identifier represents a thread channel.
+    pub(crate) fn as_thread_id(&self) -> Option<ThreadId> {
+        self.0
+            .as_any()
+            .downcast_ref::<Thread>()
+            .map(|t| t.0)
     }
 }
 
@@ -107,6 +116,11 @@ impl SendLoc {
 
     pub(crate) fn loc(&self) -> &Loc {
         self.loc.as_ref().unwrap()
+    }
+
+    /// Return the receiving thread id when the destination is a thread channel.
+    pub(crate) fn receiver_tid(&self) -> Option<ThreadId> {
+        self.loc.as_ref().and_then(|l| l.as_thread_id())
     }
 }
 
