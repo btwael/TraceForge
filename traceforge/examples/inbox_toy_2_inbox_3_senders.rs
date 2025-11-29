@@ -1,5 +1,6 @@
 //extern crate traceforge;
 
+use simplelog::{ColorChoice, ConfigBuilder, LevelFilter, TermLogger, TerminalMode};
 use traceforge::thread;
 use traceforge::thread::ThreadId;
 
@@ -15,9 +16,29 @@ struct Msg {
     sender: i32,
 }
 
+// Expected executions: 27
 fn example() {
+    fn senders(vals: &[Option<traceforge::Val>]) -> Vec<i32> {
+        vals.iter()
+            .filter_map(|v| {
+                v.as_ref().map(|val| {
+                    val.as_any_ref()
+                        .downcast_ref::<Msg>()
+                        .expect("inbox message should be Msg")
+                        .sender
+                })
+            })
+            .collect()
+    }
+
     let inbx_thread = thread::spawn(move || {
-        let m = traceforge::inbox();
+        let first = traceforge::inbox();
+        let second = traceforge::inbox();
+        println!(
+            "[inbox summary] first={:?} second={:?}",
+            senders(&first),
+            senders(&second)
+        );
     });
 
     let inb_tid = inbx_thread.thread().id();
@@ -74,6 +95,16 @@ fn forge() {
 }
 
 fn main() {
+    // Enable info-level logs so the structured algorithm tracing is visible.
+    let _ = TermLogger::init(
+        LevelFilter::Info,
+        ConfigBuilder::new()
+            .set_time_level(LevelFilter::Off)
+            .build(),
+        TerminalMode::Mixed,
+        ColorChoice::Auto,
+    );
+
     // Get command line arguments
     let args: Vec<String> = std::env::args().collect();
 

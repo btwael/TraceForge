@@ -37,22 +37,14 @@ fn example() {
 
 fn random() {
     println!("Running the example in random mode");
-    let num = traceforge::test(
-        traceforge::Config::builder().build(),
-        example,
-        1
-    );
+    let num = traceforge::test(traceforge::Config::builder().build(), example, 1);
     println!("Ran {num} tests");
 }
 
 fn forge() {
     println!("Running the example in systematic mode");
-    let stats = traceforge::verify(
-        traceforge::Config::builder().build(),
-        example,
-    );
+    let stats = traceforge::verify(traceforge::Config::builder().build(), example);
     println!("Stats = {}, {}", stats.execs, stats.block);
-
 }
 
 fn main() {

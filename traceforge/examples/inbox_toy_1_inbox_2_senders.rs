@@ -15,6 +15,7 @@ struct Msg {
     sender: i32,
 }
 
+// Expected executions: 4
 fn example() {
     let inbx_thread = thread::spawn(move || {
         let m = traceforge::inbox();
@@ -40,19 +41,9 @@ fn example() {
             },
         );
     });
-    let s3 = thread::spawn(move || {
-        traceforge::send_msg(
-            inb_tid,
-            Msg {
-                action: Action::Work,
-                sender: 2,
-            },
-        );
-    });
 
     let _ = s1.join();
     let _ = s2.join();
-    let _ = s3.join();
     let _ = inbx_thread.join();
 }
 

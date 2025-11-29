@@ -694,7 +694,7 @@ pub(crate) fn select_val_block<'a, T: Message + 'static, U: Message + 'static>(
 /// Message API
 ///
 /// Async API, unstable
-pub fn async_recv_msg<T>(recv: &Receiver<T>) -> impl Future<Output=T>
+pub fn async_recv_msg<T>(recv: &Receiver<T>) -> impl Future<Output = T>
 where
     T: Message + Clone + 'static,
 {
@@ -710,7 +710,7 @@ where
 // consider a macro that would allow heterogenous receives
 // (select on Receivers of different types).
 pub fn select_msg<'a, T: Message + 'static>(
-    recvs: impl Iterator<Item=&'a &'a Receiver<T>>,
+    recvs: impl Iterator<Item = &'a &'a Receiver<T>>,
     comm: CommunicationModel,
 ) -> Option<(T, usize)> {
     let locs = recvs.map(|r| &r.inner);
@@ -718,7 +718,7 @@ pub fn select_msg<'a, T: Message + 'static>(
 }
 
 pub fn select_tagged_msg<'a, F, T>(
-    recvs: impl Iterator<Item=&'a &'a Receiver<T>>,
+    recvs: impl Iterator<Item = &'a &'a Receiver<T>>,
     comm: CommunicationModel,
     f: F,
 ) -> Option<(T, usize)>
@@ -731,7 +731,7 @@ where
 }
 
 pub fn select_msg_block<'a, T: Message + 'static>(
-    recvs: impl Iterator<Item=&'a &'a Receiver<T>>,
+    recvs: impl Iterator<Item = &'a &'a Receiver<T>>,
     comm: CommunicationModel,
 ) -> (T, usize) {
     let locs = recvs.map(|r| &r.inner);
@@ -739,7 +739,7 @@ pub fn select_msg_block<'a, T: Message + 'static>(
 }
 
 pub fn select_tagged_msg_block<'a, F, T>(
-    recvs: impl Iterator<Item=&'a &'a Receiver<T>>,
+    recvs: impl Iterator<Item = &'a &'a Receiver<T>>,
     comm: CommunicationModel,
     f: F,
 ) -> (T, usize)
@@ -858,7 +858,7 @@ where
 }
 
 fn recv_msg_with_tag<'a, T: Message + 'static>(
-    locs: impl Iterator<Item=&'a Loc>,
+    locs: impl Iterator<Item = &'a Loc>,
     comm: CommunicationModel,
     tag: Option<PredicateType>,
 ) -> Option<(T, usize)> {
@@ -866,7 +866,7 @@ fn recv_msg_with_tag<'a, T: Message + 'static>(
 }
 
 fn recv_val_with_tag<'a>(
-    locs: impl Iterator<Item=&'a Loc>,
+    locs: impl Iterator<Item = &'a Loc>,
     comm: CommunicationModel,
     tag: Option<PredicateType>,
 ) -> Option<(Val, usize)> {
@@ -914,7 +914,7 @@ where
 
 /// Helper function for [`recv_msg_block`] and [`recv_tagged_msg_block`]
 fn recv_msg_block_with_tag<'a, T: Message + 'static>(
-    locs: impl Iterator<Item=&'a Loc>,
+    locs: impl Iterator<Item = &'a Loc>,
     comm: CommunicationModel,
     tag: Option<PredicateType>,
 ) -> (T, usize) {
@@ -923,7 +923,7 @@ fn recv_msg_block_with_tag<'a, T: Message + 'static>(
 }
 
 fn recv_val_block_with_tag<'a>(
-    locs: impl Iterator<Item=&'a Loc>,
+    locs: impl Iterator<Item = &'a Loc>,
     comm: CommunicationModel,
     tag: Option<PredicateType>,
 ) -> (Val, usize) {
@@ -978,7 +978,7 @@ pub fn inbox() -> Vec<Option<Val>> {
         let mut stuck = false;
         for val in vals.clone() {
             if let Some(s) = val {
-                if(s.is_pending()) {
+                if (s.is_pending()) {
                     stuck = true;
                     break;
                 }

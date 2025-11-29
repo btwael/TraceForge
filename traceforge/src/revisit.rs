@@ -1,7 +1,7 @@
 //! Revisiting utilities
 
-use std::fmt;
 use serde::{Deserialize, Serialize};
+use std::fmt;
 
 use crate::event::Event;
 use crate::revisit::RevisitEnum::ForwardRevisit;
@@ -89,11 +89,17 @@ pub(crate) struct Revisit {
 
 impl Revisit {
     pub(crate) fn new(pos: Event, rev: Event) -> Self {
-        Self { pos, rev: RevisitPlacement::Default(rev) }
+        Self {
+            pos,
+            rev: RevisitPlacement::Default(rev),
+        }
     }
 
     pub(crate) fn new_inbox(pos: Event, rev: Vec<Event>) -> Self {
-        Self { pos, rev: RevisitPlacement::Inbox(rev) }
+        Self {
+            pos,
+            rev: RevisitPlacement::Inbox(rev),
+        }
     }
 
     /// Return the event for a default revisit placement.

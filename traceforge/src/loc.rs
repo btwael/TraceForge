@@ -30,10 +30,7 @@ impl Loc {
 
     /// Try to extract a thread id when the identifier represents a thread channel.
     pub(crate) fn as_thread_id(&self) -> Option<ThreadId> {
-        self.0
-            .as_any()
-            .downcast_ref::<Thread>()
-            .map(|t| t.0)
+        self.0.as_any().downcast_ref::<Thread>().map(|t| t.0)
     }
 }
 

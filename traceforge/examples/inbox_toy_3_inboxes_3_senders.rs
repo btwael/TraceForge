@@ -33,23 +33,43 @@ fn example() {
     let inbx_thread = thread::spawn(move || {
         let first = traceforge::inbox();
         let second = traceforge::inbox();
+        let third = traceforge::inbox();
         println!(
-            "[inbox summary] first={:?} second={:?}",
+            "[inbox summary] first={:?} second={:?} third={:?}",
             senders(&first),
-            senders(&second)
+            senders(&second),
+            senders(&third)
         );
     });
 
     let inb_tid = inbx_thread.thread().id();
 
     let s1 = thread::spawn(move || {
-        traceforge::send_msg(inb_tid, Msg { action: Action::Work, sender: 0 });
+        traceforge::send_msg(
+            inb_tid,
+            Msg {
+                action: Action::Work,
+                sender: 0,
+            },
+        );
     });
     let s2 = thread::spawn(move || {
-        traceforge::send_msg(inb_tid, Msg { action: Action::Work, sender: 1 });
+        traceforge::send_msg(
+            inb_tid,
+            Msg {
+                action: Action::Work,
+                sender: 1,
+            },
+        );
     });
     let s3 = thread::spawn(move || {
-        traceforge::send_msg(inb_tid, Msg { action: Action::Work, sender: 2 });
+        traceforge::send_msg(
+            inb_tid,
+            Msg {
+                action: Action::Work,
+                sender: 2,
+            },
+        );
     });
 
     let _ = s1.join();

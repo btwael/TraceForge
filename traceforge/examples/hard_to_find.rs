@@ -14,8 +14,8 @@ fn example() {
         loop {
             let m = traceforge::recv_msg_block();
             match m {
-                Msg::Work => i = i + 1, 
-                Msg::Terminate => assert!(i < 10), 
+                Msg::Work => i = i + 1,
+                Msg::Terminate => assert!(i < 10),
             }
         }
     });
@@ -42,21 +42,13 @@ fn example() {
 fn random() {
     let ntests = 10;
     println!("Running the example in random mode {ntests} times");
-    let _ = traceforge::test(
-        traceforge::Config::builder().build(),
-        example,
-        ntests
-    );
+    let _ = traceforge::test(traceforge::Config::builder().build(), example, ntests);
 }
 
 fn forge() {
     println!("Running the example in systematic mode");
-    let stats = traceforge::verify(
-        traceforge::Config::builder().build(),
-        example,
-    );
+    let stats = traceforge::verify(traceforge::Config::builder().build(), example);
     println!("Stats = {}, {}", stats.execs, stats.block);
-
 }
 
 fn main() {

@@ -1,12 +1,12 @@
-use std::collections::{BTreeMap, HashMap};
-use std::fs::OpenOptions;
-use std::io::{BufRead, BufReader, Result, Write};
-use std::fs::File;
-use std::path::PathBuf;
 use crate::event::Event;
 use crate::event_label::{AsEventLabel, LabelEnum};
 use crate::exec_graph::ExecutionGraph;
 use crate::BlockType;
+use std::collections::{BTreeMap, HashMap};
+use std::fs::File;
+use std::fs::OpenOptions;
+use std::io::{BufRead, BufReader, Result, Write};
+use std::path::PathBuf;
 
 const GRAPH_NODE_MARKER: &str = "% GRAPH_NODE";
 const DOC_FOOTER: &str = "\\end{tikzpicture}\n\\end{document}\n";
@@ -35,10 +35,7 @@ pub(crate) fn write_tikz_graph(
         load_manifest(path)?
     };
     manifest.graphs.insert(graph_idx, (row, col, kind));
-    manifest
-        .row_starts
-        .entry(row)
-        .or_insert(row_start);
+    manifest.row_starts.entry(row).or_insert(row_start);
     save_manifest(path, &manifest)?;
 
     write_single_graph(graph, path, graph_idx)?;
@@ -250,10 +247,7 @@ fn format_node_label(lab: &LabelEnum) -> String {
         "\\textcolor{{gray}}{{\\tiny {}}}\\;{}",
         escaped_prefix, escaped_rest
     )*/
-    format!(
-        "{}",
-        escaped_rest
-    )
+    format!("{}", escaped_rest)
 }
 
 fn split_label_prefix(label: &str) -> (&str, &str) {
@@ -453,9 +447,11 @@ fn load_manifest(base_path: &str) -> Result<Manifest> {
                     }
                 }
                 ["G", idx, row, col] => {
-                    if let (Ok(i), Ok(r), Ok(c)) =
-                        (idx.parse::<usize>(), row.parse::<usize>(), col.parse::<usize>())
-                    {
+                    if let (Ok(i), Ok(r), Ok(c)) = (
+                        idx.parse::<usize>(),
+                        row.parse::<usize>(),
+                        col.parse::<usize>(),
+                    ) {
                         out.graphs.insert(i, (r, c, GraphKind::Snapshot));
                     }
                 }
@@ -465,9 +461,11 @@ fn load_manifest(base_path: &str) -> Result<Manifest> {
                     }
                 }
                 [idx, row, col] => {
-                    if let (Ok(i), Ok(r), Ok(c)) =
-                        (idx.parse::<usize>(), row.parse::<usize>(), col.parse::<usize>())
-                    {
+                    if let (Ok(i), Ok(r), Ok(c)) = (
+                        idx.parse::<usize>(),
+                        row.parse::<usize>(),
+                        col.parse::<usize>(),
+                    ) {
                         out.graphs.insert(i, (r, c, GraphKind::Snapshot));
                     }
                 }
@@ -661,7 +659,10 @@ fn base_dir_and_stem(base_path: &str) -> (PathBuf, String) {
             .file_stem()
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_else(|| "graphs".to_string());
-        let dir = p.parent().map(|d| d.to_path_buf()).unwrap_or_else(|| PathBuf::from("."));
+        let dir = p
+            .parent()
+            .map(|d| d.to_path_buf())
+            .unwrap_or_else(|| PathBuf::from("."));
         (dir, stem)
     } else {
         if p.as_os_str().is_empty() {

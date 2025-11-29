@@ -446,14 +446,12 @@ impl Consistency {
 
     pub(crate) fn inbox_reads_tiebreaker(
         &self,
-        g: &ExecutionGraph,
+        _g: &ExecutionGraph,
         ilab: &Inbox,
-        rev: &Revisit,
+        _rev: &Revisit,
     ) -> bool {
-        match ilab.rfs() {
-            None => true,
-            Some(rfs) => true,
-        }
+        // Non-blocking inbox is maximal when it currently takes the empty subset.
+        ilab.rfs().map_or(true, |rfs| rfs.is_empty())
     }
 
     /// Returns the rf options for rlab, with the first being the non-revisit rf step
@@ -519,27 +517,25 @@ impl Consistency {
         overwritten
     }
 
-      /// Inbox consistency: order doesn’t matter. True iff all chosen sends are valid/available.
-  pub(crate) fn is_revisit_consistent_inbox(
-          &self,
-          g: &ExecutionGraph,
-          inbox: &Inbox,
-          sends: &Vec<Event>,
-      ) -> bool {
-          sends.iter().all(|&s| {
-              if let Some(slab) = g.send_label(s) {
-                  // Must match and not be dropped
-                  if slab.is_dropped() || !inbox.matches(slab) {
-                      return false;
-                  }
-                  // Do not reuse a send that already has a different reader
-                  match slab.reader() {
-                      None => true,
-                      Some(reader) => reader == inbox.pos(),
-                  }
-              } else {
-                  false
-              }
-          })
-      }
+    /// Inbox consistency: order doesn’t matter. True iff all chosen sends are valid/available.
+    pub(crate) fn is_revisit_consistent_inbox(
+        &self,
+        g: &ExecutionGraph,
+        inbox: &Inbox,
+        sends: &Vec<Event>,
+    ) -> bool {
+        // Each chosen send must exist, match, be undropped, and not already read by another receiver.
+        for &s in sends {
+            let Some(slab) = g.send_label(s) else {
+                return false;
+            };
+            if slab.is_dropped() || !inbox.matches(slab) {
+                return false;
+            }
+            if slab.reader().is_some_and(|r| r != inbox.pos()) {
+                return false;
+            }
+        }
+        true
+    }
 }
