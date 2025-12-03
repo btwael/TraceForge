@@ -1,5 +1,4 @@
 //! An event in an execution graph
-use crate::event_label::{Inbox, RecvMsg};
 use crate::thread::{main_thread_id, ThreadId};
 use serde::{Deserialize, Serialize};
 

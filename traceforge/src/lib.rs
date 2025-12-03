@@ -958,7 +958,6 @@ fn recv_val_block_with_tag<'a>(
 }
 
 pub fn inbox() -> Vec<Option<Val>> {
-    // TODO(btwael):
     let (loc, _comm) = self_loc_comm();
     let locs = iter::once(&loc);
     let tag = None;
@@ -969,7 +968,7 @@ pub fn inbox() -> Vec<Option<Val>> {
         switch();
         let locs = locs.clone();
         let tag = tag.clone();
-        let (vals, inds) = ExecutionState::with(|s| {
+        let (vals, _inds) = ExecutionState::with(|s| {
             let pos = s.next_pos();
             s.must
                 .borrow_mut()
@@ -978,7 +977,7 @@ pub fn inbox() -> Vec<Option<Val>> {
         let mut stuck = false;
         for val in vals.clone() {
             if let Some(s) = val {
-                if (s.is_pending()) {
+                if s.is_pending() {
                     stuck = true;
                     break;
                 }

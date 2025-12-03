@@ -4,7 +4,6 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 
 use crate::event::Event;
-use crate::revisit::RevisitEnum::ForwardRevisit;
 use std::fmt::Debug;
 
 /// Models the different possible revisit types.  These all carry the

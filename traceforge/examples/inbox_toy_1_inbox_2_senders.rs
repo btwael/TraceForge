@@ -18,7 +18,7 @@ struct Msg {
 // Expected executions: 4
 fn example() {
     let inbx_thread = thread::spawn(move || {
-        let m = traceforge::inbox();
+        let _ = traceforge::inbox();
     });
 
     let inb_tid = inbx_thread.thread().id();

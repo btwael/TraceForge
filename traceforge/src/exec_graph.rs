@@ -524,8 +524,7 @@ impl ExecutionGraph {
             a => panic!("Expecting RecvMsg or Block but got {}", a),
         }
     }
-
-    // TODO(btwael): review return type end references
+    
     pub(crate) fn inbox_val(&self, e: Event) -> Option<Vec<Val>> {
         match self.label(e) {
             LabelEnum::Inbox(ilab) => {
@@ -548,10 +547,8 @@ impl ExecutionGraph {
     pub(crate) fn val_copy(&self, rpos: Event) -> Option<Val> {
         self.val(rpos).cloned()
     }
-
-    // TODO(btwael): review return type end references
+    
     pub(crate) fn vals_copy(&self, ipos: Event) -> Option<Vec<Val>> {
-        // TODO(btwael)
         self.inbox_val(ipos)
     }
 
@@ -562,7 +559,7 @@ impl ExecutionGraph {
     pub(crate) fn is_sends(&self, events: Vec<Event>) -> bool {
         for ev in events {
             let m = matches!(self.label(ev), LabelEnum::SendMsg(_));
-            if (!m) {
+            if !m {
                 return false;
             }
         }
@@ -583,20 +580,6 @@ impl ExecutionGraph {
         } else {
             None
         }
-    }
-
-    pub(crate) fn sends_with_readers(&self) -> Vec<Event> {
-        let mut events = Vec::new();
-        for thr in self.threads.iter() {
-            for (idx, label) in thr.labels.iter().enumerate() {
-                if let LabelEnum::SendMsg(slab) = label {
-                    if slab.reader().is_some() {
-                        events.push(Event::new(thr.tid, idx as u32));
-                    }
-                }
-            }
-        }
-        events
     }
 
     /// Returns whether this is a send that is not read by *anyone*
@@ -736,7 +719,6 @@ impl ExecutionGraph {
     }
 
     pub(crate) fn change_inbox_rfs(&mut self, inbox: Event, sends: Option<Vec<Event>>) {
-        // TODO(btwael)
         assert!(self.is_inbox(inbox));
         assert!(sends.as_ref().is_none() || self.is_sends(sends.as_ref().unwrap().clone()));
 

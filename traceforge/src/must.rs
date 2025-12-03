@@ -1216,7 +1216,6 @@ impl Must {
         }
     }
 
-    // TODO(btwael)
     fn visit_inbox_rfs(&mut self, pos: Event) -> Vec<Option<Val>> {
         let rfs = self.checker.inbox_rfs(
             &self.current.graph,

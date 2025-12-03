@@ -248,7 +248,6 @@ impl LabelEnum {
                 }
             }
 
-            // TODO(btwael): how precise is this?
             LabelEnum::Inbox(s) => {
                 if let LabelEnum::Inbox(o) = other {
                     if s.senders() != o.senders() {
@@ -258,7 +257,6 @@ impl LabelEnum {
                             o.senders()
                         ));
                     }
-                    // If you store the chosen read(s), compare them too:
                     if s.rfs() != o.rfs() {
                         return Err(format!(
                             "Expected inbox to read from {:?} but read from {:?}",
@@ -1232,8 +1230,7 @@ impl Inbox {
     pub(crate) fn set_revisitable(&mut self, status: bool) {
         self.revisitable = status
     }
-
-    // TODO(btwael): from RecvMsg, do we need this
+    
     pub(crate) fn recover_lost(&mut self, other: Self) {
         self.loc = other.loc;
     }
