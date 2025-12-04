@@ -529,11 +529,17 @@ impl ExecutionGraph {
         match self.label(e) {
             LabelEnum::Inbox(ilab) => {
                 if let Some(rfs) = ilab.rfs() {
-                    Some(
-                        rfs.iter()
-                            .map(|rf| self.send_label(*rf).unwrap().val().clone())
-                            .collect(),
-                    )
+                    let vals: Vec<Val> = rfs
+                        .iter()
+                        .filter_map(|rf| {
+                            if self.contains(*rf) {
+                                self.send_label(*rf).map(|s| s.val().clone())
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
+                    Some(vals)
                 } else {
                     None
                 }
@@ -656,8 +662,12 @@ impl ExecutionGraph {
             Some(rfs) => rfs
                 .iter()
                 .map(|send| {
-                    self.send_label(*send)
-                        .map(|slab| ilab.recv_loc().get_matching_index(slab.send_loc()))
+                    if self.contains(*send) {
+                        self.send_label(*send)
+                            .map(|slab| ilab.recv_loc().get_matching_index(slab.send_loc()))
+                    } else {
+                        None
+                    }
                 })
                 .collect(),
         }

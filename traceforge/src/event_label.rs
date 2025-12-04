@@ -290,7 +290,7 @@ impl LabelEnum {
             // and thus we will never reach this path.
             // If ever needed, return true since we can compare neither locations
             // (they are lost during deserialization) nor tags (they are predicates)
-            (BlockType::Value(_), BlockType::Value(_)) => unreachable!(),
+            (BlockType::Value(_, _), BlockType::Value(_, _)) => unreachable!(),
             _ => false,
         }
     }
@@ -1139,7 +1139,7 @@ pub(crate) enum BlockType {
     Assume,
     Assert,
     // Internal blocking
-    Value(RecvLoc),
+    Value(RecvLoc, usize),
     Join(ThreadId),
 }
 
@@ -1188,16 +1188,26 @@ pub(crate) struct Inbox {
     label: EventLabel,
     loc: RecvLoc,
     rfs: Option<Vec<Event>>,
+    min: usize,
+    max: Option<usize>,
     revisitable: bool,
     empty_considered: bool,
 }
 
 impl Inbox {
-    pub(crate) fn new(pos: Event, loc: RecvLoc, rfs: Option<Vec<Event>>) -> Self {
+    pub(crate) fn new(
+        pos: Event,
+        loc: RecvLoc,
+        rfs: Option<Vec<Event>>,
+        min: usize,
+        max: Option<usize>,
+    ) -> Self {
         Self {
             label: EventLabel::new(pos),
             loc,
             rfs,
+            min,
+            max,
             revisitable: true,
             empty_considered: false,
         }
@@ -1220,7 +1230,19 @@ impl Inbox {
     }
 
     pub(crate) fn is_non_blocking(&self) -> bool {
-        true
+        self.min == 0
+    }
+
+    pub(crate) fn min(&self) -> usize {
+        self.min
+    }
+
+    pub(crate) fn max(&self) -> Option<usize> {
+        self.max
+    }
+
+    pub(crate) fn has_capacity_for(&self, count: usize) -> bool {
+        self.max.map(|m| count <= m).unwrap_or(true)
     }
 
     pub(crate) fn is_revisitable(&self) -> bool {
@@ -1233,6 +1255,8 @@ impl Inbox {
     
     pub(crate) fn recover_lost(&mut self, other: Self) {
         self.loc = other.loc;
+        self.min = other.min;
+        self.max = other.max;
     }
 
     pub(crate) fn recv_loc(&self) -> &RecvLoc {
@@ -1269,10 +1293,16 @@ as_label!(Inbox);
 
 impl fmt::Display for Inbox {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let max = self
+            .max
+            .map(|m| m.to_string())
+            .unwrap_or_else(|| "inf".to_string());
         write!(
             f,
-            "{}: INBOX() [{}]",
+            "{}: INBOX(min={}, max={}) [{}]",
             self.label,
+            self.min,
+            max,
             match self.rfs() {
                 None => "{}".to_string(),
                 Some(rfs) if rfs.is_empty() => "{}".to_string(),

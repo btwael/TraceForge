@@ -958,19 +958,32 @@ fn recv_val_block_with_tag<'a>(
 }
 
 pub fn inbox() -> Vec<Option<Val>> {
-    inbox_extended(None)
+    inbox_with_bounds(0, None)
 }
 
 pub fn inbox_with_tag<F>(f: F) -> Vec<Option<Val>>
 where
     F: Fn(ThreadId, Option<u32>) -> bool + 'static + Send + Sync,
 {
-    inbox_extended(Some(PredicateType(Arc::new(f))))
+    inbox_with_tag_and_bounds(f, 0, None)
 }
 
-pub(crate) fn inbox_extended(
-    tag: Option<PredicateType>,
-) -> Vec<Option<Val>> {
+pub fn inbox_with_bounds(min: usize, max: Option<usize>) -> Vec<Option<Val>> {
+    inbox_extended(None, min, max)
+}
+
+pub fn inbox_with_tag_and_bounds<F>(
+    f: F,
+    min: usize,
+    max: Option<usize>,
+) -> Vec<Option<Val>>
+where
+    F: Fn(ThreadId, Option<u32>) -> bool + 'static + Send + Sync,
+{
+    inbox_extended(Some(PredicateType(Arc::new(f))), min, max)
+}
+
+pub(crate) fn inbox_extended(tag: Option<PredicateType>, min: usize, max: Option<usize>) -> Vec<Option<Val>> {
     let (loc, _comm) = self_loc_comm();
     let locs = iter::once(&loc);
 
@@ -980,12 +993,26 @@ pub(crate) fn inbox_extended(
         switch();
         let locs = locs.clone();
         let tag = tag.clone();
-        let (vals, _inds) = ExecutionState::with(|s| {
+        let (vals, blocked, _pos) = ExecutionState::with(|s| {
             let pos = s.next_pos();
-            s.must
+            let (vals, _inds, blocked) = s
+                .must
                 .borrow_mut()
-                .handle_inbox(Inbox::new(pos, RecvLoc::new(locs, tag), None))
+                .handle_inbox(Inbox::new(
+                    pos,
+                    RecvLoc::new(locs, tag),
+                    None,
+                    min,
+                    max,
+                ));
+            (vals, blocked, pos)
         });
+        if blocked {
+            ExecutionState::with(|s| {
+                s.prev_pos();
+            });
+            continue;
+        }
         let mut stuck = false;
         for val in vals.clone() {
             if let Some(s) = val {

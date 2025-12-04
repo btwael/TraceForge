@@ -156,7 +156,7 @@ impl Consistency {
         g: &'a ExecutionGraph,
         ilab: &'a Inbox,
         sends: impl Iterator<Item = &'a SendMsg>,
-        view: Option<(&'a VectorClock, Event)>,
+        view: Option<(&'a VectorClock, Option<Event>)>,
         check_concurrent: bool,
     ) -> impl Iterator<Item = &'a SendMsg> {
         let rpos = ilab.pos();
@@ -164,7 +164,7 @@ impl Consistency {
             let spos = slab.pos();
 
             // exclude one event
-            if view.is_some_and(|(_, excl)| excl == spos) {
+            if view.is_some_and(|(_, excl)| excl.is_some_and(|ev| ev == spos)) {
                 return false;
             }
 
@@ -273,7 +273,7 @@ impl Consistency {
     fn coherent_inbox_rfs_in_view(
         &self,
         g: &ExecutionGraph,
-        view: Option<(&VectorClock, Event)>,
+        view: Option<(&VectorClock, Option<Event>)>,
         inbox: &Inbox,
         check_concurrent: bool,
     ) -> Vec<Event> {
@@ -446,12 +446,39 @@ impl Consistency {
 
     pub(crate) fn inbox_reads_tiebreaker(
         &self,
-        _g: &ExecutionGraph,
+        g: &ExecutionGraph,
         ilab: &Inbox,
-        _rev: &Revisit,
+        rev: &Revisit,
     ) -> bool {
         // Non-blocking inbox is maximal when it currently takes the empty subset.
-        ilab.rfs().map_or(true, |rfs| rfs.is_empty())
+        if ilab.is_non_blocking() {
+            return ilab.rfs().map_or(true, |rfs| rfs.is_empty());
+        }
+
+        let Some(current) = ilab.rfs() else {
+            return false;
+        };
+
+        let view = g.revisit_view(rev);
+        let exclude = match &rev.rev {
+            crate::revisit::RevisitPlacement::Default(ev) => Some(*ev),
+            crate::revisit::RevisitPlacement::Inbox(_) => None,
+        };
+
+        let mut cands =
+            self.coherent_inbox_rfs_in_view(g, Some((&view, exclude)), ilab, false);
+
+        if let crate::revisit::RevisitPlacement::Inbox(sends) = &rev.rev {
+            cands.retain(|e| !sends.contains(e));
+        }
+
+        let limit = ilab
+            .max()
+            .map(|m| m.min(cands.len()))
+            .unwrap_or(cands.len());
+        let canonical: Vec<Event> = cands.into_iter().take(limit).collect();
+
+        current == canonical
     }
 
     /// Returns the rf options for rlab, with the first being the non-revisit rf step
@@ -524,6 +551,15 @@ impl Consistency {
         inbox: &Inbox,
         sends: &Vec<Event>,
     ) -> bool {
+        if let Some(max) = inbox.max() {
+            if sends.len() > max {
+                return false;
+            }
+        }
+        if sends.len() < inbox.min() {
+            return false;
+        }
+
         // Each chosen send must exist, match, be undropped, and not already read by another receiver.
         for &s in sends {
             let Some(slab) = g.send_label(s) else {

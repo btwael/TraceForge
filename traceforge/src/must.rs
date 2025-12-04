@@ -437,7 +437,10 @@ impl Must {
         stuck
     }
 
-    pub(crate) fn handle_inbox(&mut self, ilab: Inbox) -> (Vec<Option<Val>>, Vec<Option<usize>>) {
+    pub(crate) fn handle_inbox(
+        &mut self,
+        ilab: Inbox,
+    ) -> (Vec<Option<Val>>, Vec<Option<usize>>, bool) {
         if self.is_replay(ilab.pos()) {
             info!("| Replay Mode for receive {}", ilab);
             let mut ilab = ilab;
@@ -459,7 +462,7 @@ impl Must {
                 Some(vs) => vs.into_iter().map(Some).collect(),
                 None => Vec::new(),
             };
-            return (vals, g.get_receiving_indexes(ilab));
+            return (vals, g.get_receiving_indexes(ilab), false);
         }
         info!("| Handle Mode for {}", ilab);
 
@@ -473,13 +476,12 @@ impl Must {
         let vals = self.visit_inbox_rfs(pos);
         self.current.graph.register_inbox(&pos);
         let g = &self.current.graph;
-        (
-            vals,
-            match g.inbox_label(pos) {
-                Some(il) => g.get_receiving_indexes(il),
-                None => Vec::new(),
-            },
-        )
+        let blocked = matches!(g.label(pos), LabelEnum::Block(_));
+        let indexes = match g.inbox_label(pos) {
+            Some(il) => g.get_receiving_indexes(il),
+            None => Vec::new(),
+        };
+        (vals, indexes, blocked)
     }
 
     /// Returns the next thread id to use in thread creation.
@@ -769,7 +771,7 @@ impl Must {
             LabelEnum::Block(blab) => match blab.btype() {
                 // it's an internal blocking and the instruction points
                 // at least *2* instructions before it (see event_label::Block)
-                BlockType::Join(_) | BlockType::Value(_) => (*i as u32) < blab.pos().index - 1,
+                BlockType::Join(_) | BlockType::Value(_, _) => (*i as u32) < blab.pos().index - 1,
                 // it's a user blocking and the instruction points before it
                 BlockType::Assume | BlockType::Assert => (*i as u32) < blab.pos().index,
             },
@@ -797,16 +799,14 @@ impl Must {
     fn is_waiting_on_written(&self, t: ThreadId) -> bool {
         let g = &self.current.graph;
         if let LabelEnum::Block(blab) = g.thread_last(t).unwrap() {
-            if let BlockType::Value(loc) = blab.btype() {
-                g.matching_stores(loc).any(|send| {
-                    // We need to consider two cases:
-                    // . Monitor reading from the send:
-                    // . . We are monitoring it and we haven't read it already
-                    send.can_be_monitor_read(&blab.pos()) ||
-                    // . Plain read from the send:
-                    // . . It is unread and the location *really* matches (not via monitoring)
-                        send.can_be_read_from(loc)
-                })
+            if let BlockType::Value(loc, min) = blab.btype() {
+                let available = g
+                    .matching_stores(loc)
+                    .filter(|send| {
+                        send.can_be_monitor_read(&blab.pos()) || send.can_be_read_from(loc)
+                    })
+                    .count();
+                available >= *min
             } else {
                 false
             }
@@ -863,13 +863,13 @@ impl Must {
                 match blab {
                     LabelEnum::Block(b) => {
                         match b.btype() {
-                            BlockType::Value(loc) => {
+                            BlockType::Value(loc, min) => {
                                 if self.current.graph.is_thread_daemon(i) {
                                     // daemon threads can keep waiting on messages
                                     debug!("Thread {i} is a daemon, keep going");
                                     continue;
                                 } else {
-                                    return Some(BlockType::Value(loc.clone()));
+                                    return Some(BlockType::Value(loc.clone(), *min));
                                 }
                             }
                             block => {
@@ -899,7 +899,7 @@ impl Must {
             None => EndCondition::AllThreadsCompleted,
             Some(block) => match block {
                 BlockType::Assume | BlockType::Assert => EndCondition::FailedAssumption,
-                BlockType::Value(_) | BlockType::Join(_) => EndCondition::Deadlock,
+                BlockType::Value(_, _) | BlockType::Join(_) => EndCondition::Deadlock,
             },
         };
 
@@ -1210,6 +1210,7 @@ impl Must {
                         .unwrap()
                         .recv_loc()
                         .clone(),
+                    1,
                 ),
             )));
             None
@@ -1217,9 +1218,10 @@ impl Must {
     }
 
     fn visit_inbox_rfs(&mut self, pos: Event) -> Vec<Option<Val>> {
+        let ilab = self.current.graph.inbox_label(pos).unwrap().clone();
         let rfs = self.checker.inbox_rfs(
             &self.current.graph,
-            self.current.graph.inbox_label(pos).unwrap(),
+            &ilab,
         );
 
         info!(
@@ -1228,20 +1230,40 @@ impl Must {
             self.fmt_events(&rfs)
         );
 
-        // Enumerate all possible subsets (including empty) of the available sends.
-        let mut combinations = compute_inbox_possible_subsets_from_rfs(&rfs);
+        let min = ilab.min();
+        let max = ilab.max();
+
+        let upper = max.map_or(rfs.len(), |m| m.min(rfs.len()));
+        if min > upper {
+            info!(
+                "[inbox:{}] blocking: needs {} messages but only {} available",
+                pos, min, rfs.len()
+            );
+            self.add_to_graph(LabelEnum::Block(Block::new(
+                pos,
+                BlockType::Value(ilab.recv_loc().clone(), min),
+            )));
+            return Vec::new();
+        }
+
+        // Enumerate all possible subsets of the available sends respecting min/max.
+        let mut combinations = compute_inbox_possible_subsets_from_rfs(&rfs, min, max);
         info!(
             "[inbox:{}] computed subsets: {}",
             pos,
             self.fmt_event_sets(&combinations)
         );
 
-        // Non-blocking inbox: explore the empty subset in the current execution,
-        // and schedule forward revisits for every non-empty subset.
+        // Canonical subset: empty for non-blocking inbox, greedy prefix otherwise.
+        let canonical = if ilab.is_non_blocking() {
+            Vec::new()
+        } else {
+            rfs.iter().take(upper).cloned().collect::<Vec<_>>()
+        };
+
+        combinations.retain(|subset| *subset != canonical);
+
         for subset in combinations.drain(..) {
-            if subset.is_empty() {
-                continue;
-            }
             info!(
                 "  [inbox:{}] enqueue forward revisit for subset {}",
                 pos,
@@ -1254,8 +1276,19 @@ impl Must {
             );
         }
 
-        info!("[inbox:{}] choosing empty subset (timeout)", pos);
-        self.current.graph.change_inbox_rfs(pos, None);
+        if canonical.is_empty() {
+            info!("[inbox:{}] choosing empty subset (timeout)", pos);
+            self.current.graph.change_inbox_rfs(pos, None);
+        } else {
+            info!(
+                "[inbox:{}] choosing canonical subset {}",
+                pos,
+                self.fmt_event_set(&canonical)
+            );
+            self.current
+                .graph
+                .change_inbox_rfs(pos, Some(canonical.clone()));
+        }
 
         match self.current.graph.vals_copy(pos) {
             Some(vs) => vs.into_iter().map(Some).collect(),
@@ -1369,6 +1402,11 @@ impl Must {
                     }
                 }
                 RecvLike::Inbox(i) => {
+                    let current_size = i.rfs().map(|r| r.len()).unwrap_or(0);
+                    if !i.has_capacity_for(current_size + 1) {
+                        continue;
+                    }
+
                     let seed_rev = Revisit::new_inbox(i.pos(), vec![pos]);
                     if !self.is_maximal_inbox(i, &seed_rev) {
                         break;
@@ -1391,6 +1429,12 @@ impl Must {
                     for mut subset in subsets_containing(&cands, pos) {
                         subset.sort();
                         subset.dedup();
+                        if subset.len() < i.min() {
+                            continue;
+                        }
+                        if !i.has_capacity_for(subset.len()) {
+                            continue;
+                        }
                         if !seen_extended.insert(subset.clone()) {
                             continue;
                         }
@@ -1455,6 +1499,9 @@ impl Must {
         match lab.rfs() {
             None => false, // nothing to delete
             Some(rfs) => rfs.iter().any(|&rf| {
+                if !g.contains(rf) {
+                    return false;
+                }
                 let rf_stamp = g.label(rf).stamp();
                 rf_stamp > lab.stamp()
                     && rf_stamp > g.label(rev.pos).stamp()
@@ -1607,6 +1654,13 @@ impl Must {
                     } else {
                         elab.recover_result(new_elab);
                     }
+                } else {
+                    unreachable!();
+                }
+            }
+            LabelEnum::Inbox(ilab) => {
+                if let LabelEnum::Inbox(new_ilab) = label {
+                    ilab.recover_lost(new_ilab);
                 } else {
                     unreachable!();
                 }
@@ -2236,24 +2290,51 @@ fn pop_worklist(worklist: &mut RQueue) -> RevisitEnum {
     rev
 }
 
-fn compute_inbox_possible_subsets_from_rfs(events: &Vec<Event>) -> Vec<Vec<Event>> {
-    fn build(idx: usize, events: &[Event], current: &mut Vec<Event>, out: &mut Vec<Vec<Event>>) {
+fn compute_inbox_possible_subsets_from_rfs(
+    events: &[Event],
+    min: usize,
+    max: Option<usize>,
+) -> Vec<Vec<Event>> {
+    fn build(
+        idx: usize,
+        events: &[Event],
+        min: usize,
+        max_len: usize,
+        current: &mut Vec<Event>,
+        out: &mut Vec<Vec<Event>>,
+    ) {
+        if current.len() > max_len {
+            return;
+        }
+        let remaining = events.len() - idx;
+        if current.len() + remaining < min {
+            return;
+        }
+
         if idx == events.len() {
-            out.push(current.clone());
+            let len = current.len();
+            if len >= min && len <= max_len {
+                out.push(current.clone());
+            }
             return;
         }
 
         // Exclude current event
-        build(idx + 1, events, current, out);
+        build(idx + 1, events, min, max_len, current, out);
 
         // Include current event
         current.push(events[idx]);
-        build(idx + 1, events, current, out);
+        build(idx + 1, events, min, max_len, current, out);
         current.pop();
     }
 
-    let mut subsets: Vec<Vec<Event>> = Vec::with_capacity(1usize << events.len());
-    build(0, events, &mut Vec::new(), &mut subsets);
+    let max_len = max.map_or(events.len(), |m| m.min(events.len()));
+    if min > max_len {
+        return Vec::new();
+    }
+
+    let mut subsets: Vec<Vec<Event>> = Vec::new();
+    build(0, events, min, max_len, &mut Vec::new(), &mut subsets);
     subsets
 }
 

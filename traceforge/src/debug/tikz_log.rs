@@ -223,7 +223,7 @@ fn format_label(lab: &LabelEnum) -> String {
         }
         LabelEnum::Block(b) => match b.btype() {
             BlockType::Join(tid) => format!("!TJOIN({})", tid),
-            BlockType::Value(_) => "!R()".to_string(),
+            BlockType::Value(_, _) => "!R()".to_string(),
             other => format!("!{:?}", other),
         },
         _ => format!("{}", lab),
