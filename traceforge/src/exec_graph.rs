@@ -925,17 +925,23 @@ impl ExecutionGraph {
 
         // Readers cache: remove the deleted receives from the sender's readers cache
         let mut deleted_receives = vec![];
+        let mut deleted_receives_inbox = vec![];
         for threads in self.threads.iter() {
             let j = threads.labels.partition_point(|lab| v.contains(lab.pos()));
             for lab in threads.labels[j..].iter() {
-                if let LabelEnum::RecvMsg(rlab) = lab {
-                    deleted_receives.push(rlab.pos());
+                match lab {
+                    LabelEnum::RecvMsg(rlab) => deleted_receives.push(rlab.pos()),
+                    LabelEnum::Inbox(ilab) => deleted_receives_inbox.push(ilab.pos()),
+                    _ => {}
                 }
             }
         }
 
         for deleted in deleted_receives {
             self.remove_from_readers(deleted);
+        }
+        for deleted in deleted_receives_inbox {
+            self.remove_from_readers_inbox(deleted);
         }
 
         // Erase all the threads not found in the vector clock.
