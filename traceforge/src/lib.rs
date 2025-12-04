@@ -958,9 +958,21 @@ fn recv_val_block_with_tag<'a>(
 }
 
 pub fn inbox() -> Vec<Option<Val>> {
+    inbox_extended(None)
+}
+
+pub fn inbox_with_tag<F>(f: F) -> Vec<Option<Val>>
+where
+    F: Fn(ThreadId, Option<u32>) -> bool + 'static + Send + Sync,
+{
+    inbox_extended(Some(PredicateType(Arc::new(f))))
+}
+
+pub(crate) fn inbox_extended(
+    tag: Option<PredicateType>,
+) -> Vec<Option<Val>> {
     let (loc, _comm) = self_loc_comm();
     let locs = iter::once(&loc);
-    let tag = None;
 
     let locs = locs.collect::<Vec<_>>();
     validate_locs(&locs);
