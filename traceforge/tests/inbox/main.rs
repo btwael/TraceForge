@@ -1,1 +1,3 @@
-mod simple_inbox;
+mod inbox_delivery;
+
+mod tagged_inbox;
