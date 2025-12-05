@@ -5,6 +5,7 @@ use crate::exec_graph::ExecutionGraph;
 use crate::exec_pool::ExecutionPool;
 use crate::loc::Loc;
 use crate::revisit::{Revisit, RevisitEnum};
+use crate::symbolic;
 use crate::runtime::failure::init_panic_hook;
 use crate::runtime::task::TaskId;
 use crate::telemetry::{Recorder, Telemetry};
@@ -33,6 +34,8 @@ use std::any::TypeId;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs::File;
 use std::io::Write;
+use z3::Solver;
+use z3::ast::Bool;
 
 const EXECS: &str = "execs";
 const BLOCKED: &str = "blocked";
@@ -56,14 +59,21 @@ type StateStack = Vec<MustState>;
 pub struct MustState {
     graph: ExecutionGraph,
     rqueue: RQueue,
+    #[serde(skip)]
+    solver: Option<Solver>,
 }
 
 impl MustState {
-    fn new() -> Self {
+    fn new(condpor: bool) -> Self {
         Self {
             graph: ExecutionGraph::new(),
             rqueue: RQueue::new(),
+            solver: condpor.then(symbolic::new_solver),
         }
+    }
+
+    fn clone_solver(&self) -> Option<Solver> {
+        self.solver.clone()
     }
 }
 
@@ -145,6 +155,117 @@ pub(crate) struct Must {
 }
 
 impl Must {
+    fn solver_enabled(&self) -> bool {
+        self.config.condpor
+    }
+
+    fn sat_with(&mut self, predicate: &Bool) -> bool {
+        if !self.solver_enabled() {
+            return true;
+        }
+        if let Some(solver) = self.current.solver.clone() {
+            let mut cloned = solver;
+            symbolic::push_constraint(&mut cloned, predicate);
+            symbolic::is_sat(&mut cloned)
+        } else {
+            false
+        }
+    }
+
+    fn push_constraint(&mut self, predicate: &Bool) {
+        if !self.solver_enabled() {
+            return;
+        }
+        if let Some(solver) = self.current.solver.as_mut() {
+            symbolic::push_constraint(solver, predicate);
+        }
+    }
+
+    fn branch_on(&self, predicate: &Bool) -> (Option<Solver>, Option<Solver>) {
+        if !self.solver_enabled() {
+            return (None, None);
+        }
+        if let Some(solver) = &self.current.solver {
+            let pos = symbolic::fork_with(solver, predicate);
+            let neg = symbolic::fork_with(solver, &predicate.not());
+            (pos, neg)
+        } else {
+            (None, None)
+        }
+    }
+
+    pub(crate) fn handle_constraint_eval(&mut self, mut celab: ConstraintEval) {
+        let pos = celab.pos();
+
+        if self.is_replay(pos) {
+            info!("| Replay Mode for {}", celab);
+            let lab = LabelEnum::ConstraintEval(celab);
+            self.current.graph.validate_replay_event(&lab);
+            self.process_event(lab);
+            return;
+        }
+
+        let predicate = celab
+            .formula_id()
+            .and_then(symbolic::get_formula);
+
+        if predicate.is_none() {
+            self.add_to_graph(LabelEnum::ConstraintEval(celab));
+            return;
+        }
+        let predicate = predicate.unwrap();
+
+        // Early prune if current path is already UNSAT.
+        if self.solver_enabled() {
+            if let Some(mut s) = self.current.solver.clone() {
+                if !symbolic::is_sat(&mut s) {
+                    self.stop();
+                    return;
+                }
+            }
+        }
+
+        match celab.kind {
+            ConstraintKind::Assume => {
+                if self.sat_with(&predicate) {
+                    celab.branch_taken = true;
+                    self.push_constraint(&predicate);
+                    self.add_to_graph(LabelEnum::ConstraintEval(celab));
+                } else {
+                    celab.branch_taken = false;
+                    self.add_to_graph(LabelEnum::ConstraintEval(celab));
+                    self.stop();
+                }
+            }
+            ConstraintKind::Assert => {
+                let (pos_solver, neg_solver) = self.branch_on(&predicate);
+
+                if let Some(ns) = neg_solver {
+                    // Failing branch is feasible; record and abort exploration.
+                    self.current.solver = Some(ns);
+                    let mut ev = celab.clone();
+                    ev.branch_taken = false;
+                    self.add_to_graph(LabelEnum::ConstraintEval(ev));
+                    self.store_replay_information(Some(pos));
+                    println!("{}", self.print_graph(Some(pos)));
+                    panic!("symbolic assertion failed: predicate may be false");
+                }
+
+                let has_positive = pos_solver.is_some();
+                if let Some(ps) = pos_solver {
+                    self.current.solver = Some(ps);
+                    let mut ev = celab.clone();
+                    ev.branch_taken = true;
+                    self.add_to_graph(LabelEnum::ConstraintEval(ev));
+                }
+                // Neither branch is satisfiable: stop exploration.
+                if !has_positive {
+                    self.stop();
+                }
+            }
+        }
+    }
+
     pub(crate) fn new(conf: Config, replay_mode: bool) -> Self {
         let seed = conf.seed;
         if conf.schedule_policy == SchedulePolicy::Arbitrary
@@ -159,7 +280,7 @@ impl Must {
 
         Self {
             states: Vec::new(),
-            current: MustState::new(),
+            current: MustState::new(conf.condpor),
             replay_info: REPLAY::ReplayInformation::new(conf.clone(), replay_mode),
             checker: Consistency {},
             config: conf,
@@ -196,6 +317,11 @@ impl Must {
 
     pub(crate) fn begin_execution(must: &Rc<RefCell<Must>>) {
         let mut must = must.borrow_mut();
+        if must.config.condpor {
+            must.current.solver = Some(symbolic::new_solver());
+        } else {
+            must.current.solver = None;
+        }
         must.current.graph.initialize_for_execution();
         must.telemetry.coverage.new_eid();
         // TODO: when must is borrowed, the panic handler cannot capture
@@ -262,6 +388,11 @@ impl Must {
         self.current.rqueue.clear();
         self.states.clear();
         self.current.graph = eg;
+        if self.config.condpor {
+            self.current.solver = Some(symbolic::new_solver());
+        } else {
+            self.current.solver = None;
+        }
     }
 
     /// Add the replay information to a fresh instance of Must
@@ -269,6 +400,9 @@ impl Must {
         self.replay_info = replay_info;
         self.current = self.replay_info.extract_error_state();
         self.config = self.replay_info.config();
+        if self.config.condpor {
+            self.current.solver = Some(symbolic::new_solver());
+        }
     }
 
     /// Extract the replay information from a failing execution
@@ -601,7 +735,19 @@ impl Must {
             self.process_event(lab);
             return;
         }
-        self.add_to_graph(LabelEnum::Block(blab));
+        // Constraints are handled separately.
+        match blab.btype() {
+            BlockType::Assume => {
+                // No predicate info here; leave legacy assume unchanged.
+                self.add_to_graph(LabelEnum::Block(blab));
+            }
+            BlockType::Assert => {
+                self.add_to_graph(LabelEnum::Block(blab));
+            }
+            _ => {
+                self.add_to_graph(LabelEnum::Block(blab));
+            }
+        }
     }
 
     pub(crate) fn handle_sample<
@@ -839,10 +985,11 @@ impl Must {
         let maybe_block = must.borrow_mut().check_blocked();
         let exceeded_max_executions = must.borrow_mut().record_ending_telemetry(&maybe_block);
 
-        let condition = match maybe_block {
+        let condition = match &maybe_block {
             None => EndCondition::AllThreadsCompleted,
             Some(block) => match block {
-                BlockType::Assume | BlockType::Assert => EndCondition::FailedAssumption,
+                BlockType::Assume => EndCondition::FailedAssumption,
+                BlockType::Assert => EndCondition::FailedAssumption,
                 BlockType::Value(_) | BlockType::Join(_) => EndCondition::Deadlock,
             },
         };
@@ -850,6 +997,13 @@ impl Must {
         Must::call_on_stop_on_monitors(must, &condition);
         must.borrow_mut().published_values.clear();
         must.borrow_mut().call_telemetry_after(&condition);
+
+        // Treat failed symbolic assertions as bugs (panic) to match concrete assert! behaviour.
+        if matches!(maybe_block, Some(BlockType::Assert)) {
+            must.borrow_mut().store_replay_information(None);
+            println!("{}", must.borrow().print_graph(None));
+            panic!("symbolic assertion failed");
+        }
 
         if exceeded_max_executions {
             return true; // no more executions.
@@ -1427,9 +1581,18 @@ impl Must {
                 slab.set_dropped();
                 self.current.graph.incr_dropped_sends();
             }
+            LabelEnum::ConstraintEval(_) => {
+                // Constraint events are treated as independent; do nothing for revisits.
+            }
             _ => panic!(),
         };
         self.current.graph.cut_to_stamp(stamp);
+        // Restore solver to match the cut graph, if available
+        if self.config.condpor {
+            if let Some(state) = self.states.last() {
+                self.current.solver = state.clone_solver();
+            }
+        }
         true
     }
 
@@ -1468,6 +1631,13 @@ impl Must {
         if self.config.verbose >= 3 {
             println!("After backward revisit graph");
             println!("{}", self.current.graph);
+        }
+
+        // The cloned graph came from self.current.graph.copy_to_view; solver should match
+        if self.config.condpor {
+            if let Some(state) = self.states.last() {
+                self.current.solver = state.clone_solver();
+            }
         }
 
         if let Some(pqueue_pair) = &self.pqueue {
@@ -1547,6 +1717,9 @@ impl Must {
         }
         let state = self.states.pop().unwrap();
         self.current = state;
+        if self.config.condpor {
+            // solver already carried inside MustState::clone via Option<Solver>
+        }
         if let Some((row, col, row_start, rows_def, last_cols, row_boxes, last_graph, next_anchor)) =
             self.tikz_layout_stack.pop()
         {
@@ -1584,6 +1757,10 @@ impl Must {
         self.tikz_col = next_col;
         self.tikz_row_start = anchor.map(|(_, c)| c).unwrap_or(0);
         self.tikz_next_anchor = anchor;
+        // Carry solver into the new current state if available.
+        if self.config.condpor {
+            self.current.solver = self.states.last().and_then(|s| s.clone_solver());
+        }
     }
 
     fn is_replay(&self, pos: Event) -> bool {
@@ -1900,7 +2077,7 @@ mod tests {
             false,
         ));
         tseg.insert_label(send_at_0.clone());
-        let error_state = MustState::new();
+        let error_state = MustState::new(false);
         must.replay_info = ReplayInformation::create(tseg, error_state, config.clone());
         must.replay_info.next_task(); // Advance to (t0, 0)
         must

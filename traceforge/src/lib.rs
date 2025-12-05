@@ -29,8 +29,10 @@ pub use testmode::{parallel_test, test};
 
 pub mod thread;
 mod vector_clock;
+mod symbolic;
 
 pub use crate::msg::Val; // `Val` is used by monitors.
+pub use symbolic::{assert_symbolic, assume_symbolic, fresh_bool_symbol, SymBool};
 
 use channel::{cons_to_model, self_loc_comm, thread_loc_comm, Receiver};
 use coverage::ExecutionObserver;
@@ -203,6 +205,8 @@ pub struct Config {
     pub(crate) turmoil_trace_file: Option<String>,
     pub(crate) parallel: bool,
     pub(crate) parallel_workers: Option<usize>,
+    #[serde(default)]
+    pub(crate) condpor: bool,
     #[serde(skip)]
     pub(crate) callbacks: Arc<Mutex<Vec<Box<dyn ExecutionObserver + Send>>>>,
 }
@@ -267,6 +271,7 @@ impl ConfigBuilder {
             turmoil_trace_file: None,
             parallel: false,
             parallel_workers: None,
+            condpor: false,
             callbacks: Arc::new(Mutex::new(Vec::new())),
         })
     }
@@ -274,6 +279,9 @@ impl ConfigBuilder {
     /// Checks whether the current config is valid and
     /// returns it if it is. Raises an error otherwise
     fn check_valid(self) -> Self {
+        if self.0.condpor && self.0.parallel {
+            panic!("ConDPOR mode is not supported with parallel exploration");
+        }
         if self.0.symmetry {
             panic!("Symmetry reduction is currently not supported")
         }
@@ -460,6 +468,12 @@ impl ConfigBuilder {
             .lock()
             .expect("Could not lock callbacks configuration")
             .push(cb);
+        self
+    }
+
+    /// Enables ConDPOR-style symbolic exploration.
+    pub fn with_condpor(mut self, enabled: bool) -> Self {
+        self.0.condpor = enabled;
         self
     }
 

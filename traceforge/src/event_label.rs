@@ -25,6 +25,7 @@ pub(crate) enum LabelEnum {
     Choice(Choice),
     Sample(Sample),
     Block(Block),
+    ConstraintEval(ConstraintEval),
 }
 
 macro_rules! match_and_run {
@@ -41,6 +42,7 @@ macro_rules! match_and_run {
             LabelEnum::Choice(l) => l.as_event_label().$name($($arg),*),
             LabelEnum::Sample(l) => l.as_event_label().$name($($arg),*),
             LabelEnum::Block(l) => l.as_event_label().$name($($arg),*),
+            LabelEnum::ConstraintEval(l) => l.as_event_label().$name($($arg),*),
         }
     };
 }
@@ -59,6 +61,7 @@ macro_rules! match_and_run_mut {
             LabelEnum::Choice(l) => l.as_event_label_mut().$name($($arg),*),
             LabelEnum::Sample(l) => l.as_event_label_mut().$name($($arg),*),
             LabelEnum::Block(l) => l.as_event_label_mut().$name($($arg),*),
+            LabelEnum::ConstraintEval(l) => l.as_event_label_mut().$name($($arg),*),
         }
     };
 }
@@ -229,6 +232,17 @@ impl LabelEnum {
                     return Ok(()); // Experimental feature so we're not sure how to compare this.
                 }
             }
+            LabelEnum::ConstraintEval(s) => {
+                if let LabelEnum::ConstraintEval(o) = other {
+                    if s.kind != o.kind || s.branch_taken != o.branch_taken {
+                        return Err(format!(
+                            "Expected constraint {:?} branch {} but got {:?} branch {}",
+                            s.kind, s.branch_taken, o.kind, o.branch_taken
+                        ));
+                    }
+                    return Ok(());
+                }
+            }
             LabelEnum::Block(s) => {
                 if let LabelEnum::Block(o) = other {
                     if !Self::blocks_are_compatible(&s.btype, &o.btype) {
@@ -287,6 +301,7 @@ impl LabelEnum {
             LabelEnum::CToss(_) => "called nondet() -> bool".to_string(),
             LabelEnum::Choice(s) => format!("called Range({:?})::nondet", s.range()),
             LabelEnum::Sample(_) => "called sample()".to_string(),
+            LabelEnum::ConstraintEval(_) => "evaluated a constraint".to_string(),
             LabelEnum::Block(_) => "became blocked".to_string(),
         }
     }
@@ -306,6 +321,7 @@ impl fmt::Display for LabelEnum {
             LabelEnum::Choice(lab) => write!(f, "{}", lab),
             LabelEnum::Sample(lab) => write!(f, "{}", lab),
             LabelEnum::Block(lab) => write!(f, "{}", lab),
+            LabelEnum::ConstraintEval(lab) => write!(f, "{}", lab),
         }
     }
 }
@@ -324,6 +340,7 @@ impl fmt::Debug for LabelEnum {
             LabelEnum::Choice(lab) => write!(f, "{}", lab),
             LabelEnum::Sample(lab) => write!(f, "{}", lab),
             LabelEnum::Block(lab) => write!(f, "{}", lab),
+            LabelEnum::ConstraintEval(lab) => write!(f, "{}", lab),
         }
     }
 }
@@ -1148,5 +1165,54 @@ as_label!(Block);
 impl fmt::Display for Block {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}: BLK {:?}", self.as_event_label(), self.btype())
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) enum ConstraintKind {
+    Assume,
+    Assert,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub(crate) struct ConstraintEval {
+    label: EventLabel,
+    // Identifier into the thread-local formula registry.
+    formula_id: Option<usize>,
+    pub(crate) kind: ConstraintKind,
+    pub(crate) branch_taken: bool,
+}
+
+impl ConstraintEval {
+    pub(crate) fn new(
+        pos: Event,
+        formula_id: Option<usize>,
+        kind: ConstraintKind,
+        branch_taken: bool,
+    ) -> Self {
+        Self {
+            label: EventLabel::new(pos),
+            formula_id,
+            kind,
+            branch_taken,
+        }
+    }
+
+    pub(crate) fn formula_id(&self) -> Option<usize> {
+        self.formula_id
+    }
+}
+
+as_label!(ConstraintEval);
+
+impl fmt::Display for ConstraintEval {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{}: C-{:?} [{}]",
+            self.as_event_label(),
+            self.kind,
+            if self.branch_taken { "true" } else { "false" }
+        )
     }
 }

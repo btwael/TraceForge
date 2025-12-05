@@ -218,6 +218,16 @@ fn format_label(lab: &LabelEnum) -> String {
             BlockType::Value(_) => "!R()".to_string(),
             other => format!("!{:?}", other),
         },
+        LabelEnum::ConstraintEval(c) => {
+            let pos = c.pos();
+            format!(
+                "({}, {}): C-{:?}[{}]",
+                pos.thread,
+                pos.index,
+                c.kind,
+                if c.branch_taken { "true" } else { "false" }
+            )
+        }
         _ => format!("{}", lab),
     }
 }
