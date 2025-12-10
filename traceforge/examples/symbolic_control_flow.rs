@@ -1,27 +1,28 @@
 use traceforge::{recv_msg_block, send_msg, symbolic, thread, verify, Config};
 
 fn program() {
+    // Thread ids in this execution:
     let main_id = thread::current_id();
 
-    // Worker 1
-    let t1 = thread::spawn(move || {
-        let b1: symbolic::SymExpr = symbolic::fresh_bool();
-        send_msg(main_id, b1.id());
-    });
-
-    // Worker 2
     let t2 = thread::spawn(move || {
-        let b2: symbolic::SymExpr = symbolic::fresh_bool();
-        send_msg(main_id, b2);
+        let v: symbolic::SymExpr = recv_msg_block();
+
+        let ok = symbolic::eval((v % 2).eq(symbolic::int_val(0)));
+
+        send_msg(main_id, ok);
     });
 
-    // Collector in main thread
-    let x: symbolic::SymExpr = recv_msg_block();
-    let y: symbolic::SymExpr = recv_msg_block();
+    let worker2_id = t2.thread().id();
 
-    symbolic::assert(x.eq(y));
+    let i: symbolic::SymExpr = symbolic::fresh_int();
+    send_msg(worker2_id, i);
 
-    t1.join().unwrap();
+    let ok: bool = recv_msg_block();
+
+    if ok {
+        symbolic::assert((i % 2).eq(symbolic::int_val(0)));
+    }
+
     t2.join().unwrap();
 }
 

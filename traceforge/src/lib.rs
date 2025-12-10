@@ -29,10 +29,9 @@ pub use testmode::{parallel_test, test};
 
 pub mod thread;
 mod vector_clock;
-mod symbolic;
+pub mod symbolic;
 
 pub use crate::msg::Val; // `Val` is used by monitors.
-pub use symbolic::{assert_symbolic, assume_symbolic, fresh_bool_symbol, SymBool};
 
 use channel::{cons_to_model, self_loc_comm, thread_loc_comm, Receiver};
 use coverage::ExecutionObserver;

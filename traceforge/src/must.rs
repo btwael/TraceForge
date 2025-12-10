@@ -227,9 +227,9 @@ impl Must {
 
         match celab.kind {
             ConstraintKind::Assume => {
-                if self.sat_with(&predicate) {
+                if self.sat_with(&predicate.as_bool().unwrap()) {
                     celab.branch_taken = true;
-                    self.push_constraint(&predicate);
+                    self.push_constraint(&predicate.as_bool().unwrap());
                     self.add_to_graph(LabelEnum::ConstraintEval(celab));
                 } else {
                     celab.branch_taken = false;
@@ -238,7 +238,7 @@ impl Must {
                 }
             }
             ConstraintKind::Assert => {
-                let (pos_solver, neg_solver) = self.branch_on(&predicate);
+                let (pos_solver, neg_solver) = self.branch_on(&predicate.as_bool().unwrap());
 
                 if let Some(ns) = neg_solver {
                     // Failing branch is feasible; record and abort exploration.
