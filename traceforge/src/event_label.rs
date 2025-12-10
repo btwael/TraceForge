@@ -1191,7 +1191,6 @@ pub(crate) struct Inbox {
     min: usize,
     max: Option<usize>,
     revisitable: bool,
-    empty_considered: bool,
 }
 
 impl Inbox {
@@ -1209,7 +1208,6 @@ impl Inbox {
             min,
             max,
             revisitable: true,
-            empty_considered: false,
         }
     }
 
@@ -1219,14 +1217,6 @@ impl Inbox {
 
     pub(crate) fn set_rf(&mut self, rfs: Option<Vec<Event>>) {
         self.rfs = rfs
-    }
-
-    pub(crate) fn empty_considered(&self) -> bool {
-        self.empty_considered
-    }
-
-    pub(crate) fn mark_empty_considered(&mut self) {
-        self.empty_considered = true;
     }
 
     pub(crate) fn is_non_blocking(&self) -> bool {
