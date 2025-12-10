@@ -998,8 +998,14 @@ impl Must {
         must.borrow_mut().published_values.clear();
         must.borrow_mut().call_telemetry_after(&condition);
 
-        // Treat failed symbolic assertions as bugs (panic) to match concrete assert! behaviour.
-        if matches!(maybe_block, Some(BlockType::Assert)) {
+        let panic_on_symbolic_assert = {
+            let must_ref = must.borrow();
+            must_ref.solver_enabled() && !must_ref.config.keep_going_after_error
+        };
+
+        // Treat failed symbolic assertions as bugs (panic) to match concrete assert! behaviour
+        // when we are not configured to keep exploring after errors.
+        if matches!(maybe_block, Some(BlockType::Assert)) && panic_on_symbolic_assert {
             must.borrow_mut().store_replay_information(None);
             println!("{}", must.borrow().print_graph(None));
             panic!("symbolic assertion failed");
