@@ -1289,7 +1289,7 @@ impl fmt::Display for Inbox {
             .unwrap_or_else(|| "inf".to_string());
         write!(
             f,
-            "{}: INBOX(min={}, max={}) [{}]",
+            "{}: INBOX({}, {}) [{}]",
             self.label,
             self.min,
             max,
