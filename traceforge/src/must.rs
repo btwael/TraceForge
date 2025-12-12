@@ -1425,17 +1425,17 @@ impl Must {
                     cands.dedup();
 
                     // enumerate subsets that include `pos`
-                    let mut seen_extended: HashSet<Vec<Event>> = HashSet::new();
                     for mut subset in subsets_containing(&cands, pos) {
-                        subset.sort();
-                        subset.dedup();
+                        Consistency::normalize_event_set(&mut subset);
                         if subset.len() < i.min() {
                             continue;
                         }
                         if !i.has_capacity_for(subset.len()) {
                             continue;
                         }
-                        if !seen_extended.insert(subset.clone()) {
+                        // Only generate the subset when the freshly added send
+                        // is the owner (newest send in the subset).
+                        if Consistency::inbox_owner(&self.current.graph, &subset) != Some(pos) {
                             continue;
                         }
                         info!(

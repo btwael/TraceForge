@@ -17,6 +17,21 @@ use crate::vector_clock::VectorClock;
 pub(crate) struct Consistency {}
 
 impl Consistency {
+    /// Sort and deduplicate an event set using the global total order on events.
+    pub(crate) fn normalize_event_set(events: &mut Vec<Event>) {
+        events.sort();
+        events.dedup();
+    }
+
+    /// Return the owner of a set: the newest (max-stamp) event so that a subset
+    /// is generated exactly once, when its last send arrives.
+    pub(crate) fn inbox_owner(g: &ExecutionGraph, events: &[Event]) -> Option<Event> {
+        events
+            .iter()
+            .copied()
+            .max_by_key(|e| g.label(*e).stamp())
+    }
+
     // Checks if there is a TotalOrder relation between the two sends slab1 and slab2
     fn send_before(&self, g: &ExecutionGraph, slab1: Event, slab2: Event) -> bool {
         // Apart from slab1, also do not query send_before(slab2, slab2)
@@ -471,6 +486,7 @@ impl Consistency {
         if let crate::revisit::RevisitPlacement::Inbox(sends) = &rev.rev {
             cands.retain(|e| !sends.contains(e));
         }
+        Consistency::normalize_event_set(&mut cands);
 
         let limit = ilab
             .max()
