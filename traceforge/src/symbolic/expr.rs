@@ -15,6 +15,62 @@ impl SymExpr {
         SymExpr { id }
     }
 
+    pub fn and(self, other: SymExpr) -> Self {
+        let f1 = get_formula(self.id)
+            .expect("unknown formula id")
+            .as_bool()
+            .unwrap();
+        let f2 = get_formula(other.id)
+            .expect("unknown formula id")
+            .as_bool()
+            .unwrap();
+        let f = Bool::and(&[f1, f2]);
+        let id = store_formula(Dynamic::from_ast(&f));
+        SymExpr { id }
+    }
+
+    pub fn or(self, other: SymExpr) -> Self {
+        let f1 = get_formula(self.id)
+            .expect("unknown formula id")
+            .as_bool()
+            .unwrap();
+        let f2 = get_formula(other.id)
+            .expect("unknown formula id")
+            .as_bool()
+            .unwrap();
+        let f = Bool::or(&[f1, f2]);
+        let id = store_formula(Dynamic::from_ast(&f));
+        SymExpr { id }
+    }
+
+    pub fn xor(self, other: SymExpr) -> Self {
+        let f1 = get_formula(self.id)
+            .expect("unknown formula id")
+            .as_bool()
+            .unwrap();
+        let f2 = get_formula(other.id)
+            .expect("unknown formula id")
+            .as_bool()
+            .unwrap();
+        let f = f1.xor(f2);
+        let id = store_formula(Dynamic::from_ast(&f));
+        SymExpr { id }
+    }
+
+    pub fn implies(self, other: SymExpr) -> Self {
+        let f1 = get_formula(self.id)
+            .expect("unknown formula id")
+            .as_bool()
+            .unwrap();
+        let f2 = get_formula(other.id)
+            .expect("unknown formula id")
+            .as_bool()
+            .unwrap();
+        let f = f1.implies(f2);
+        let id = store_formula(Dynamic::from_ast(&f));
+        SymExpr { id }
+    }
+
     pub fn neg(self) -> Self {
         let formula = get_formula(self.id).expect("unknown formula id");
         let neg = formula.as_bool().unwrap().not();
