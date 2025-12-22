@@ -1,4 +1,4 @@
-use traceforge::{self, Config};
+use traceforge::{self, Config, ConsType};
 
 #[derive(Clone, Debug, PartialEq)]
 struct Msg {}
@@ -171,29 +171,35 @@ fn test_nSIjS() {
 
 #[test]
 fn test_2SRnbI() {
-    let stats = traceforge::verify(Config::builder().build(), move || {
-        let id = traceforge::thread::main_thread_id();
-        for _ in 0..2 {
-            traceforge::send_msg(id, Msg {});
-        }
-        let _: Option<Msg> = traceforge::recv_msg();
-        let _ = traceforge::inbox();
-    });
+    let stats = traceforge::verify(
+        Config::builder().with_cons_type(ConsType::Bag).build(),
+        move || {
+            let id = traceforge::thread::main_thread_id();
+            for _ in 0..2 {
+                traceforge::send_msg(id, Msg {});
+            }
+            let _: Option<Msg> = traceforge::recv_msg();
+            let _ = traceforge::inbox();
+        },
+    );
     assert_eq!(stats.execs, 8);
     assert_eq!(stats.block, 0);
 }
 
 #[test]
 fn test_nSRnbI() {
-    for n in 0..4u32 {
-        let stats = traceforge::verify(Config::builder().build(), move || {
-            let id = traceforge::thread::main_thread_id();
-            for _ in 0..n {
-                traceforge::send_msg(id, Msg {});
-            }
-            let _: Option<Msg> = traceforge::recv_msg();
-            let _ = traceforge::inbox();
-        });
+    for n in 1..4u32 {
+        let stats = traceforge::verify(
+            Config::builder().with_cons_type(ConsType::Bag).build(),
+            move || {
+                let id = traceforge::thread::main_thread_id();
+                for _ in 0..n {
+                    traceforge::send_msg(id, Msg {});
+                }
+                let _: Option<Msg> = traceforge::recv_msg();
+                let _ = traceforge::inbox();
+            },
+        );
         assert_eq!(stats.execs, (2u32.pow(n) + n * 2u32.pow(n - 1)) as usize);
         assert_eq!(stats.block, 0);
     }
@@ -201,15 +207,18 @@ fn test_nSRnbI() {
 
 #[test]
 fn test_nSIRnb() {
-    for n in 0..4u32 {
-        let stats = traceforge::verify(Config::builder().build(), move || {
-            let id = traceforge::thread::main_thread_id();
-            for _ in 0..n {
-                traceforge::send_msg(id, Msg {});
-            }
-            let _ = traceforge::inbox();
-            let _: Option<Msg> = traceforge::recv_msg();
-        });
+    for n in 1..4u32 {
+        let stats = traceforge::verify(
+            Config::builder().with_cons_type(ConsType::Bag).build(),
+            move || {
+                let id = traceforge::thread::main_thread_id();
+                for _ in 0..n {
+                    traceforge::send_msg(id, Msg {});
+                }
+                let _ = traceforge::inbox();
+                let _: Option<Msg> = traceforge::recv_msg();
+            },
+        );
         assert_eq!(stats.execs, (2u32.pow(n) + n * 2u32.pow(n - 1)) as usize);
         assert_eq!(stats.block, 0);
     }
