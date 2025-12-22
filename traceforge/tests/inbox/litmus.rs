@@ -223,3 +223,153 @@ fn test_nSIRnb() {
         assert_eq!(stats.block, 0);
     }
 }
+
+#[test]
+fn test_RnbInS() {
+    for n in 1..4u32 {
+        let stats = traceforge::verify(
+            Config::builder().with_cons_type(ConsType::Bag).build(),
+            move || {
+                let id = traceforge::thread::main_thread_id();
+                let _: Option<Msg> = traceforge::recv_msg();
+                let _ = traceforge::inbox();
+                for _ in 0..n {
+                    traceforge::send_msg(id, Msg {});
+                }
+            },
+        );
+        assert_eq!(stats.execs, 1);
+        assert_eq!(stats.block, 0);
+    }
+}
+
+#[test]
+fn test_IRnbnS() {
+    for n in 1..4u32 {
+        let stats = traceforge::verify(
+            Config::builder().with_cons_type(ConsType::Bag).build(),
+            move || {
+                let id = traceforge::thread::main_thread_id();
+                let _ = traceforge::inbox();
+                let _: Option<Msg> = traceforge::recv_msg();
+                for _ in 0..n {
+                    traceforge::send_msg(id, Msg {});
+                }
+            },
+        );
+        assert_eq!(stats.execs, 1);
+        assert_eq!(stats.block, 0);
+    }
+}
+
+#[test]
+fn test_2SRnbI2SIRn() {
+    let stats = traceforge::verify(
+        Config::builder().with_cons_type(ConsType::Bag).build(),
+        move || {
+            let id = traceforge::thread::main_thread_id();
+            for _ in 0..2 {
+                traceforge::send_msg(id, Msg {});
+            }
+            let _: Option<Msg> = traceforge::recv_msg();
+            let _ = traceforge::inbox();
+            for _ in 0..2 {
+                traceforge::send_msg(id, Msg {});
+            }
+            let _ = traceforge::inbox();
+            let _: Option<Msg> = traceforge::recv_msg();
+        },
+    );
+    assert_eq!(
+        stats.execs,
+        (3 * (2i32.pow(2) + 2 * 2i32.pow(1))
+            + 4 * (2i32.pow(3) + 3 * 2i32.pow(2))
+            + 1 * (2i32.pow(4) + 4 * 2i32.pow(3))) as usize
+    );
+    assert_eq!(stats.block, 0);
+}
+
+#[test]
+fn test_2SRnbI1inf() {
+    let stats = traceforge::verify(
+        Config::builder().with_cons_type(ConsType::Bag).build(),
+        move || {
+            let id = traceforge::thread::main_thread_id();
+            for _ in 0..2 {
+                traceforge::send_msg(id, Msg {});
+            }
+            let _: Option<Msg> = traceforge::recv_msg();
+            let _ = traceforge::inbox_with_bounds(1, None);
+        },
+    );
+    assert_eq!(stats.execs, 5);
+    assert_eq!(stats.block, 0);
+}
+
+#[test]
+fn test_2SRnbI2inf() {
+    let stats = traceforge::verify(
+        Config::builder().with_cons_type(ConsType::Bag).build(),
+        move || {
+            let id = traceforge::thread::main_thread_id();
+            for _ in 0..2 {
+                traceforge::send_msg(id, Msg {});
+            }
+            let _: Option<Msg> = traceforge::recv_msg();
+            let _ = traceforge::inbox_with_bounds(2, None);
+        },
+    );
+    assert_eq!(stats.execs, 1);
+    assert_eq!(stats.block, 2);
+}
+
+#[test]
+fn test_2SRnbI1x1() {
+    let stats = traceforge::verify(
+        Config::builder().with_cons_type(ConsType::Bag).build(),
+        move || {
+            let id = traceforge::thread::main_thread_id();
+            for _ in 0..2 {
+                traceforge::send_msg(id, Msg {});
+            }
+            let _: Option<Msg> = traceforge::recv_msg();
+            let _ = traceforge::inbox_with_bounds(1, Some(1));
+        },
+    );
+    assert_eq!(stats.execs, 4);
+    assert_eq!(stats.block, 0);
+}
+
+#[test]
+fn test_2SRnbI1x2() {
+    let stats = traceforge::verify(
+        Config::builder().with_cons_type(ConsType::Bag).build(),
+        move || {
+            let id = traceforge::thread::main_thread_id();
+            for _ in 0..2 {
+                traceforge::send_msg(id, Msg {});
+            }
+            let _: Option<Msg> = traceforge::recv_msg();
+            let _ = traceforge::inbox_with_bounds(1, Some(2));
+        },
+    );
+    assert_eq!(stats.execs, 5);
+    assert_eq!(stats.block, 0);
+}
+
+#[test]
+fn test_2SRnbI2x2() {
+    let stats = traceforge::verify(
+        Config::builder().with_cons_type(ConsType::Bag).build(),
+        move || {
+            let id = traceforge::thread::main_thread_id();
+            for _ in 0..2 {
+                traceforge::send_msg(id, Msg {});
+            }
+            let _: Option<Msg> = traceforge::recv_msg();
+            let _ = traceforge::inbox_with_bounds(2, Some(2));
+        },
+    );
+    assert_eq!(stats.execs, 1);
+    assert_eq!(stats.block, 2);
+}
