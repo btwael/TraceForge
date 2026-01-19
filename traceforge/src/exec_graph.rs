@@ -1015,6 +1015,13 @@ impl ExecutionGraph {
                     porf.update(self.label(rf).cached_porf());
                 }
             }
+            LabelEnum::Inbox(ilab) => {
+                if let Some(rfs) = ilab.rfs() {
+                    for rf in rfs {
+                        porf.update(self.label(rf).cached_porf());
+                    }
+                }
+            }
             _ => { /* Nothing more to do */ }
         };
         porf
@@ -1047,6 +1054,15 @@ impl ExecutionGraph {
                 if let Some(rf) = rlab.rf() {
                     if self.label(rf).cached_porf().contains(first) {
                         return true;
+                    }
+                }
+            }
+            LabelEnum::Inbox(ilab) => {
+                if let Some(rfs) = ilab.rfs() {
+                    for rf in rfs {
+                        if self.label(rf).cached_porf().contains(first) {
+                            return true;
+                        }
                     }
                 }
             }
@@ -1113,6 +1129,13 @@ impl ExecutionGraph {
             // If the event is a RecvMsg, call `top_sort_util` on the sender first
             if self.is_recv(ei) && self.recv_label(ei).unwrap().rf().is_some() {
                 self.top_sort_util(view, graph, self.recv_label(ei).unwrap().rf().unwrap());
+            }
+            if self.is_inbox(ei) {
+                if let Some(rfs) = self.inbox_label(ei).unwrap().rfs() {
+                    for rf in rfs {
+                        self.top_sort_util(view, graph, rf);
+                    }
+                }
             }
 
             // If the event is a TJoin, call `top_sort_util` on the terminating thread

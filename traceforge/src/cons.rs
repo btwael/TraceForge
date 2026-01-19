@@ -111,7 +111,7 @@ impl Consistency {
         g: &'a ExecutionGraph,
         rlab: &'a RecvMsg,
         sends: impl Iterator<Item = &'a SendMsg>,
-        view: Option<(&'a VectorClock, Event)>,
+        view: Option<(&'a VectorClock, Option<Event>)>,
         check_concurrent: bool,
     ) -> impl Iterator<Item = &'a SendMsg> {
         let rpos = rlab.pos();
@@ -119,7 +119,7 @@ impl Consistency {
             let spos = slab.pos();
 
             // exclude one event
-            if view.is_some_and(|(_, excl)| excl == spos) {
+            if view.is_some_and(|(_, excl)| excl.is_some_and(|ev| ev == spos)) {
                 return false;
             }
 
@@ -246,7 +246,7 @@ impl Consistency {
         &self,
         g: &ExecutionGraph,
         // an optional view, excluding one event (a newly added send)
-        view: Option<(&VectorClock, Event)>,
+        view: Option<(&VectorClock, Option<Event>)>,
         recv: &RecvMsg,
         porf_override: bool,
         check_concurrent: bool,
@@ -297,7 +297,15 @@ impl Consistency {
         let rfs =
             Self::filter_available_sends_in_view_for_inbox(g, inbox, sends, view, check_concurrent);
 
-        let mut rfs: Vec<Event> = rfs.map(|lab| lab.pos()).collect();
+        let mut rfs: Vec<Event> = if inbox.comm() != CommunicationModel::NoOrder {
+            // Respect the channel's delivery model, mirroring recv behavior.
+            Self::retain_sb_minimals(rfs, false)
+                .iter()
+                .map(|lab| lab.pos())
+                .collect()
+        } else {
+            rfs.map(|lab| lab.pos()).collect()
+        };
 
         rfs.sort();
         rfs
@@ -331,6 +339,18 @@ impl Consistency {
                     CommunicationModel::TotalOrder => { /* empty */ }
                     // posw does *not* include rf from TotalOrder events
                     _ => posw.update(g.label(rf).cached_posw()),
+                }
+            }
+        }
+        if let Some(ilab) = g.inbox_label(prev) {
+            if let Some(rfs) = ilab.rfs() {
+                for rf in rfs {
+                    porf.update(g.label(rf).cached_porf());
+                    match ilab.comm() {
+                        CommunicationModel::TotalOrder => { /* empty */ }
+                        // posw does *not* include rf from TotalOrder events
+                        _ => posw.update(g.label(rf).cached_posw()),
+                    }
                 }
             }
         }
@@ -430,12 +450,20 @@ impl Consistency {
         rev: &Revisit,
         porf_override: bool,
     ) -> bool {
-        // rlab is not in the prefix of the revisitor
-        assert!(!g
-            .send_label(rev.rev_event())
-            .unwrap()
-            .porf()
-            .contains(rlab.pos()));
+        let (view, exclude) = match &rev.rev {
+            crate::revisit::RevisitPlacement::Default(send) => {
+                // rlab is not in the prefix of the revisitor
+                assert!(!g.send_label(*send).unwrap().porf().contains(rlab.pos()));
+                (
+                    g.revisit_view(&Revisit::new(rlab.pos(), *send)),
+                    Some(*send),
+                )
+            }
+            crate::revisit::RevisitPlacement::Inbox(sends) => {
+                let rev_inbox = Revisit::new_inbox(rlab.pos(), sends.clone());
+                (g.revisit_view(&rev_inbox), None)
+            }
+        };
         // rlab is stamp greater or equal that revisitee's stamp
         assert!(rlab.stamp() >= g.label(rev.pos).stamp());
 
@@ -444,15 +472,11 @@ impl Consistency {
             return rlab.rf().is_none();
         }
 
-        // rlab should be maximal wrt the view of a
-        // hypothetical [rev.rev -> rlab] revisit
-        let view = g.revisit_view(&Revisit::new(rlab.pos(), rev.rev_event()));
-
         // First (non-revisit) is the maximal one.
         rlab.rf().unwrap()
             == self.coherent_rfs_in_view(
                 g,
-                Some((&view, rev.rev_event())),
+                Some((&view, exclude)),
                 rlab,
                 porf_override,
                 false,
@@ -554,7 +578,7 @@ impl Consistency {
 
         // if any of them, apart from slab, could be read by rlab after the revisit, then the execution is inconsistent
         let overwritten =
-            Self::filter_available_sends_in_view(g, rlab, sends, Some((&view, spos)), false)
+            Self::filter_available_sends_in_view(g, rlab, sends, Some((&view, Some(spos))), false)
                 .next()
                 .is_none();
         overwritten

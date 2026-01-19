@@ -1187,6 +1187,7 @@ impl fmt::Display for Block {
 pub(crate) struct Inbox {
     label: EventLabel,
     loc: RecvLoc,
+    comm: CommunicationModel,
     rfs: Option<Vec<Event>>,
     min: usize,
     max: Option<usize>,
@@ -1197,6 +1198,7 @@ impl Inbox {
     pub(crate) fn new(
         pos: Event,
         loc: RecvLoc,
+        comm: CommunicationModel,
         rfs: Option<Vec<Event>>,
         min: usize,
         max: Option<usize>,
@@ -1204,6 +1206,7 @@ impl Inbox {
         Self {
             label: EventLabel::new(pos),
             loc,
+            comm,
             rfs,
             min,
             max,
@@ -1247,10 +1250,15 @@ impl Inbox {
         self.loc = other.loc;
         self.min = other.min;
         self.max = other.max;
+        self.comm = other.comm;
     }
 
     pub(crate) fn recv_loc(&self) -> &RecvLoc {
         &self.loc
+    }
+
+    pub(crate) fn comm(&self) -> CommunicationModel {
+        self.comm
     }
 
     pub(crate) fn receiver(&self) -> ThreadId {

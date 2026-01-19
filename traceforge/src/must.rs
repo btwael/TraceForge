@@ -1469,6 +1469,18 @@ impl Must {
     // be deleted from the revisit.
     fn revisited_by_deleted(&self, rlab: &RecvMsg, rev: &Revisit) -> bool {
         let g = &self.current.graph;
+        // Union of PORF prefixes of the chosen sends for this revisit.
+        let mut target_prefix = VectorClock::new();
+        match &rev.rev {
+            RevisitPlacement::Default(send) => {
+                target_prefix.update(g.send_label(*send).unwrap().porf());
+            }
+            RevisitPlacement::Inbox(sends) => {
+                for &s in sends {
+                    target_prefix.update(g.send_label(s).unwrap().porf());
+                }
+            }
+        }
         rlab.rf().is_some_and(|rf| {
             let stamp = g.label(rf).stamp();
             // Reads from stamp-later
@@ -1477,7 +1489,7 @@ impl Must {
                 // stamp-after rev.pos
                 stamp > g.label(rev.pos).stamp() &&
                 // and not porf-before rev.rev
-                !g.send_label(rev.rev_event()).unwrap().porf().contains(rf)
+                !target_prefix.contains(rf)
         })
     }
 
@@ -1701,9 +1713,31 @@ impl Must {
     fn forward_revisit(&mut self, rev: &Revisit) -> bool {
         let placement = self.fmt_revisit_placement(&rev.rev);
         info!("[revisit/forward] start {} <= {}", rev.pos, placement);
-        let lab = self.current.graph.label_mut(rev.pos);
-        let pos = lab.pos();
-        let stamp = lab.stamp();
+        let pos = rev.pos;
+        let stamp = self.current.graph.label(pos).stamp();
+
+        if matches!(self.current.graph.label(pos), LabelEnum::Inbox(_)) {
+            if let RevisitPlacement::Inbox(sends) = &rev.rev {
+                let view = self.current.graph.view_from_stamp(stamp);
+                let prefix = self.current.graph.copy_to_view(&view);
+                let Some(inbox) = prefix.inbox_label(pos) else {
+                    return false;
+                };
+                if !self
+                    .checker
+                    .is_revisit_consistent_inbox(&prefix, inbox, sends)
+                {
+                    info!(
+                        "  [revisit] skip inbox {} due to inconsistent subset {}",
+                        pos,
+                        self.fmt_event_set(sends)
+                    );
+                    return false;
+                }
+            }
+        }
+
+        let lab = self.current.graph.label_mut(pos);
 
         match lab {
             LabelEnum::CToss(ctlab) => ctlab.set_result(!ctlab.result()),

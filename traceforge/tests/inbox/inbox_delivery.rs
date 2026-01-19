@@ -1,4 +1,4 @@
-use traceforge::{self, thread};
+use traceforge::{self, thread, ConsType};
 
 #[derive(Clone, Debug, PartialEq)]
 struct Msg {

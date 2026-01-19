@@ -140,7 +140,7 @@ fn test_SIS() {
 
 #[test]
 fn test_2SI() {
-    let stats = traceforge::verify(Config::builder().build(), move || {
+    let stats = traceforge::verify(Config::builder().with_cons_type(ConsType::Bag).build(), move || {
         traceforge::send_msg(traceforge::thread::main_thread_id(), Msg {});
         traceforge::send_msg(traceforge::thread::main_thread_id(), Msg {});
         let _ = traceforge::inbox();
@@ -153,7 +153,7 @@ fn test_2SI() {
 fn test_nSIjS() {
     for n in 0..4u32 {
         for j in 0..4u32 {
-            let stats = traceforge::verify(Config::builder().build(), move || {
+            let stats = traceforge::verify(Config::builder().with_cons_type(ConsType::Bag).build(), move || {
                 let id = traceforge::thread::main_thread_id();
                 for _ in 0..n {
                     traceforge::send_msg(id, Msg {});

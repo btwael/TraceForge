@@ -985,7 +985,7 @@ where
 }
 
 pub(crate) fn inbox_extended(tag: Option<PredicateType>, min: usize, max: Option<usize>) -> Vec<Option<Val>> {
-    let (loc, _comm) = self_loc_comm();
+    let (loc, comm) = self_loc_comm();
     let locs = iter::once(&loc);
 
     let locs = locs.collect::<Vec<_>>();
@@ -1002,6 +1002,7 @@ pub(crate) fn inbox_extended(tag: Option<PredicateType>, min: usize, max: Option
                 .handle_inbox(Inbox::new(
                     pos,
                     RecvLoc::new(locs, tag),
+                    comm,
                     None,
                     min,
                     max,
