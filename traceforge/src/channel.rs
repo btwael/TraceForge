@@ -1,4 +1,4 @@
-use std::{future::Future, iter, sync::Arc};
+use std::{future::Future, iter};
 
 use serde::{Deserialize, Serialize};
 
@@ -7,7 +7,6 @@ use crate::{
     identifier::Identifier,
     loc::{CommunicationModel, Loc},
     msg::Message,
-    predicate::PredicateType,
     runtime::execution::ExecutionState,
     thread::ThreadId,
     ConsType, Unique,
@@ -151,7 +150,7 @@ impl<T: Message + Clone + 'static> Receiver<T> {
         crate::recv_msg_with_tag(
             iter::once(&self.inner),
             self.comm,
-            Some(PredicateType(Arc::new(f))),
+            Some(crate::adapt_tag_predicate(f)),
         )
         .map(|x| x.0)
     }
@@ -172,7 +171,7 @@ impl<T: Message + Clone + 'static> Receiver<T> {
         crate::recv_msg_block_with_tag(
             iter::once(&self.inner),
             self.comm,
-            Some(PredicateType(Arc::new(f))),
+            Some(crate::adapt_tag_predicate(f)),
         )
         .0
     }

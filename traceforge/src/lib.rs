@@ -30,6 +30,7 @@ pub use testmode::{parallel_test, test};
 
 pub mod thread;
 mod vector_clock;
+mod tag;
 
 pub use crate::msg::Val; // `Val` is used by monitors.
 
@@ -718,6 +719,16 @@ pub fn select_msg<'a, T: Message + 'static>(
     recv_msg_with_tag(locs, comm, None)
 }
 
+pub(crate) fn adapt_tag_predicate<F>(f: F) -> PredicateType
+where
+    F: Fn(ThreadId, Option<u32>) -> bool + 'static + Send + Sync,
+{
+    PredicateType(Arc::new(move |tid, tag_vec: Option<Vec<u32>>| {
+        let tag = tag_vec.as_ref().and_then(|tags| tags.first().copied());
+        f(tid, tag)
+    }))
+}
+
 pub fn select_tagged_msg<'a, F, T>(
     recvs: impl Iterator<Item = &'a &'a Receiver<T>>,
     comm: CommunicationModel,
@@ -728,7 +739,7 @@ where
     T: Message + 'static,
 {
     let locs = recvs.map(|r| &r.inner);
-    recv_msg_with_tag(locs, comm, Some(PredicateType(Arc::new(f))))
+    recv_msg_with_tag(locs, comm, Some(adapt_tag_predicate(f)))
 }
 
 pub fn select_msg_block<'a, T: Message + 'static>(
@@ -749,7 +760,7 @@ where
     T: Message + 'static,
 {
     let locs = recvs.map(|r| &r.inner);
-    recv_msg_block_with_tag(locs, comm, Some(PredicateType(Arc::new(f))))
+    recv_msg_block_with_tag(locs, comm, Some(adapt_tag_predicate(f)))
 }
 
 /// Main API
@@ -816,7 +827,10 @@ fn send_msg_with_tag<T: Message + 'static>(
 
         let slab = SendMsg::new(
             pos,
-            SendLoc::new(loc, sender_tid, tag),
+            SendLoc::new(loc, sender_tid, match tag {
+                Some(t) => Some(vec![t]),
+                None => None,
+            }),
             comm,
             val,
             monitor_msgs,
@@ -855,7 +869,7 @@ where
     T: Message + 'static,
 {
     let (loc, comm) = self_loc_comm();
-    recv_msg_with_tag(iter::once(&loc), comm, Some(PredicateType(Arc::new(f)))).map(|x| x.0)
+    recv_msg_with_tag(iter::once(&loc), comm, Some(adapt_tag_predicate(f))).map(|x| x.0)
 }
 
 fn recv_msg_with_tag<'a, T: Message + 'static>(
@@ -910,7 +924,7 @@ where
     T: Message + 'static,
 {
     let (loc, comm) = self_loc_comm();
-    recv_msg_block_with_tag(iter::once(&loc), comm, Some(PredicateType(Arc::new(f)))).0
+    recv_msg_block_with_tag(iter::once(&loc), comm, Some(adapt_tag_predicate(f))).0
 }
 
 /// Helper function for [`recv_msg_block`] and [`recv_tagged_msg_block`]
@@ -981,7 +995,7 @@ pub fn inbox_with_tag_and_bounds<F>(
 where
     F: Fn(ThreadId, Option<u32>) -> bool + 'static + Send + Sync,
 {
-    inbox_extended(Some(PredicateType(Arc::new(f))), min, max)
+    inbox_extended(Some(adapt_tag_predicate(f)), min, max)
 }
 
 pub(crate) fn inbox_extended(tag: Option<PredicateType>, min: usize, max: Option<usize>) -> Vec<Option<Val>> {

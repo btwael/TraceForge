@@ -10,7 +10,7 @@ use std::sync::Arc;
 /// A separate type helps in serialization as it isolates all
 /// the code relevant to serializing/deserializing tag predicates.
 #[derive(Clone)]
-pub(crate) struct PredicateType(pub Arc<dyn Send + Sync + Fn(ThreadId, Option<u32>) -> bool>);
+pub(crate) struct PredicateType(pub Arc<dyn Send + Sync + Fn(ThreadId, Option<Vec<u32>>) -> bool>);
 
 impl Serialize for PredicateType {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
