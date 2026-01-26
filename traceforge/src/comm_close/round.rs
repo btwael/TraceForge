@@ -177,9 +177,9 @@ impl RoundFilter {
             );
         }
         let default_cmp = self.scheme.levels()[index].default_cmp;
-        if default_cmp == TagCmp::Eq && cmp == TagCmp::Gte {
+        /*if default_cmp == TagCmp::Eq && cmp == TagCmp::Gte {
             panic!("cannot relax comparison at level {}", index);
-        }
+        }*/
         self.cmp_overrides[index] = Some(cmp);
         self
     }

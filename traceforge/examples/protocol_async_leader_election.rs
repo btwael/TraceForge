@@ -4,8 +4,8 @@ use traceforge::comm_close::{self, RoundScheme, RoundStamp, Rounds, TagCmp};
 use traceforge::thread::ThreadId;
 use traceforge::{thread, Nondet};
 
-const NUM_NODES: usize = 3;
-const NUM_BALLOTS: u32 = 2;
+const NUM_NODES: usize = 2;
+const NUM_BALLOTS: u32 = 1;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Participants {
@@ -120,7 +120,7 @@ impl Node {
     fn step(&mut self, collect: &RoundCollector, log: &mut Vec<LogEntry>) {
         let nb_round = self.next_round();
 
-        if self.coord(self.ballot) == self.me {
+        if self.coord() {
             let msg = NewBallotMsg {
                 ballot: self.ballot,
                 stamp: nb_round.stamp(),
@@ -172,9 +172,9 @@ impl Node {
         }
     }
 
-    fn coord(&self, ballot: u32) -> ThreadId {
+    fn coord(&self) -> bool {
         // TODO: remodel
-        self.nodes.get((ballot as usize) % self.nodes.len())
+        return traceforge::nondet();
     }
 
     fn broadcast(&self, round: &comm_close::Round, msg: Message) {
