@@ -1,125 +1,59 @@
 use std::any::type_name;
-use std::cell::RefCell;
-use std::collections::HashMap;
+use std::iter;
+use std::sync::Arc;
 
-use crate::coverage::ExecutionId;
+use crate::channel::{self_loc_comm, thread_loc_comm};
 use crate::msg::Message;
-use crate::runtime::execution::ExecutionState;
+use crate::predicate::PredicateType;
 use crate::thread::ThreadId;
 use crate::Val;
 
-thread_local! {
-    static ROUND_STATE: RefCell<RoundState> = RefCell::new(RoundState::default());
+pub mod round;
+pub use round::{
+    LevelSpec, Round, RoundId, RoundScheme, RoundSchemeBuilder, RoundStamp, Rounds, TagCmp,
+};
+
+fn ensure_len(label: &str, expected: usize, actual: usize) {
+    if expected != actual {
+        panic!(
+            "{} length {} does not match scheme levels {}",
+            label, actual, expected
+        );
+    }
 }
 
-#[derive(Debug, Default)]
-struct RoundState {
-    execution_id: Option<ExecutionId>,
-    rounds: HashMap<ThreadId, u32>,
-}
-
-fn with_round_state<F, R>(f: F) -> R
-where
-    F: FnOnce(&mut RoundState, ThreadId) -> R,
-{
-    let (tid, eid) = ExecutionState::with(|state| {
-        let must = state.must.borrow();
-        let tid = must.to_thread_id(state.current().id());
-        let eid = must.telemetry.coverage.current_eid();
-        (tid, eid)
-    });
-
-    ROUND_STATE.with(|state| {
-        let mut state = state.borrow_mut();
-        if state.execution_id != Some(eid) {
-            state.execution_id = Some(eid);
-            state.rounds.clear();
+fn matches_components(scheme: &RoundScheme, tag: &[u32], round: &[u32]) -> bool {
+    let expected = scheme.level_count();
+    ensure_len("tag", expected, tag.len());
+    ensure_len("round", expected, round.len());
+    for (index, level) in scheme.levels().iter().enumerate() {
+        let ok = match level.default_cmp {
+            TagCmp::Eq => tag[index] == round[index],
+            TagCmp::Gte => tag[index] >= round[index],
+        };
+        if !ok {
+            return false;
         }
-        f(&mut state, tid)
-    })
+    }
+    true
 }
 
-#[derive(Clone, Copy, Debug, Default)]
-pub struct Rounds {
-    _private: (),
+fn round_tag_predicate(round: &Round) -> PredicateType {
+    let scheme = round.scheme().clone();
+    let round_components = round.components().to_vec();
+    ensure_len("round", scheme.level_count(), round_components.len());
+    PredicateType(Arc::new(move |_tid, tag| {
+        let tag_vec = match tag {
+            Some(tag_vec) => tag_vec,
+            None => return false,
+        };
+        matches_components(&scheme, &tag_vec, &round_components)
+    }))
 }
 
 impl Rounds {
-    pub fn new() -> Self {
-        Self { _private: () }
-    }
-
-    pub fn current(&self) -> Round {
-        current_round()
-    }
-
     pub fn advance(&mut self) -> Round {
-        advance_round()
-    }
-}
-
-fn current_round() -> Round {
-    with_round_state(|state, tid| {
-        let current = *state.rounds.entry(tid).or_insert(0);
-        Round::new(current, tid)
-    })
-}
-
-fn advance_round() -> Round {
-    with_round_state(|state, tid| {
-        let entry = state.rounds.entry(tid).or_insert(0);
-        *entry = entry.checked_add(1).expect("round counter overflow");
-        Round::new(*entry, tid)
-    })
-}
-
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
-pub struct RoundId(u32);
-
-impl std::fmt::Display for RoundId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
-pub struct Round {
-    id: RoundId,
-    thread: ThreadId,
-}
-
-impl Round {
-    fn new(id: u32, thread: ThreadId) -> Self {
-        Self {
-            id: RoundId(id),
-            thread,
-        }
-    }
-
-    pub fn id(&self) -> RoundId {
-        self.id
-    }
-
-    fn tag(&self) -> u32 {
-        self.id.0
-    }
-
-    fn assert_current(&self) {
-        let (current_tid, current_round) = with_round_state(|state, tid| {
-            let current = *state.rounds.entry(tid).or_insert(0);
-            (tid, current)
-        });
-        assert!(
-            current_tid == self.thread,
-            "round token belongs to thread {} but was used on thread {}",
-            self.thread,
-            current_tid
-        );
-        assert!(
-            self.id.0 == current_round,
-            "round token {} is not the current round {}",
-            self.id,
-            current_round
-        );
+        self.advance_round()
     }
 }
 
@@ -134,7 +68,11 @@ impl<T> RoundMsg<T> {
     }
 
     pub fn round_id(&self) -> RoundId {
-        self.round
+        self.round.clone()
+    }
+
+    pub fn round_stamp(&self) -> RoundStamp {
+        RoundStamp::from(&self.round)
     }
 
     pub fn payload(&self, round: &Round) -> &T {
@@ -150,8 +88,8 @@ impl<T> RoundMsg<T> {
     fn assert_round(&self, round: &Round) {
         round.assert_current();
         assert!(
-            self.round >= round.id(),
-            "message from round {} is not valid in round {}",
+            matches_components(round.scheme(), self.round.components(), round.components()),
+            "message from round {:?} is not valid in round {:?}",
             self.round,
             round.id()
         );
@@ -160,49 +98,41 @@ impl<T> RoundMsg<T> {
 
 pub fn send<T: Message + 'static>(tid: ThreadId, msg: T, round: &Round) {
     round.assert_current();
-    let tagged = TaggedVal::new(round.id(), Val::new(msg));
-    crate::send_tagged_msg(tid, round.tag(), tagged);
+    let tagged = TaggedVal::new(round.id().clone(), Val::new(msg));
+    let tag = round.components().to_vec();
+    let (loc, comm) = thread_loc_comm(tid);
+    crate::send_msg_with_tag_vec(tagged, Some(tag), &loc, comm, false);
 }
 
 pub fn send_lossy<T: Message + 'static>(tid: ThreadId, msg: T, round: &Round) {
     round.assert_current();
-    let tagged = TaggedVal::new(round.id(), Val::new(msg));
-    crate::send_tagged_lossy_msg(tid, round.tag(), tagged);
+    let tagged = TaggedVal::new(round.id().clone(), Val::new(msg));
+    let tag = round.components().to_vec();
+    let (loc, comm) = thread_loc_comm(tid);
+    crate::send_msg_with_tag_vec(tagged, Some(tag), &loc, comm, true);
 }
 
 pub fn recv<T: Message + 'static>(round: &Round) -> Option<RoundMsg<T>> {
     round.assert_current();
-    let min_tag = round.tag();
+    let tag_predicate = round_tag_predicate(round);
+    let (loc, comm) = self_loc_comm();
     let tagged: Option<TaggedVal> =
-        crate::recv_tagged_msg(move |_tid, tag| tag.map_or(false, |t| t >= min_tag));
+        crate::recv_msg_with_tag(iter::once(&loc), comm, Some(tag_predicate)).map(|x| x.0);
     tagged.map(|tagged| RoundMsg::new(expect_payload::<T>(tagged.payload), tagged.round))
 }
 
 pub fn recv_block<T: Message + 'static>(round: &Round) -> RoundMsg<T> {
     round.assert_current();
-    let min_tag = round.tag();
+    let tag_predicate = round_tag_predicate(round);
+    let (loc, comm) = self_loc_comm();
     let tagged: TaggedVal =
-        crate::recv_tagged_msg_block(move |_tid, tag| tag.map_or(false, |t| t >= min_tag));
+        crate::recv_msg_block_with_tag(iter::once(&loc), comm, Some(tag_predicate)).0;
     let payload = expect_payload::<T>(tagged.payload);
     RoundMsg::new(payload, tagged.round)
 }
 
 pub fn inbox(round: &Round) -> Vec<Option<RoundMsg<Val>>> {
-    round.assert_current();
-    let min_tag = round.tag();
-    crate::inbox_with_tag_and_bounds(
-        move |_tid, tag| tag.map_or(false, |t| t >= min_tag),
-        0,
-        None,
-    )
-    .into_iter()
-    .map(|val| {
-        val.map(|val| {
-            let tagged = expect_tagged_val(val);
-            RoundMsg::new(tagged.payload, tagged.round)
-        })
-    })
-    .collect()
+    inbox_with_bounds(round, 0, None)
 }
 
 pub fn inbox_with_bounds(
@@ -211,20 +141,16 @@ pub fn inbox_with_bounds(
     max: Option<usize>,
 ) -> Vec<Option<RoundMsg<Val>>> {
     round.assert_current();
-    let min_tag = round.tag();
-    crate::inbox_with_tag_and_bounds(
-        move |_tid, tag| tag.map_or(false, |t| t >= min_tag),
-        min,
-        max,
-    )
-    .into_iter()
-    .map(|val| {
-        val.map(|val| {
-            let tagged = expect_tagged_val(val);
-            RoundMsg::new(tagged.payload, tagged.round)
+    let tag_predicate = round_tag_predicate(round);
+    crate::inbox_extended(Some(tag_predicate), min, max)
+        .into_iter()
+        .map(|val| {
+            val.map(|val| {
+                let tagged = expect_tagged_val(val);
+                RoundMsg::new(tagged.payload, tagged.round)
+            })
         })
-    })
-    .collect()
+        .collect()
 }
 
 #[derive(Clone, Debug, PartialEq)]

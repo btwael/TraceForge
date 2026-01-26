@@ -30,7 +30,6 @@ pub use testmode::{parallel_test, test};
 
 pub mod thread;
 mod vector_clock;
-mod tag;
 
 pub use crate::msg::Val; // `Val` is used by monitors.
 
@@ -790,9 +789,9 @@ pub fn send_tagged_lossy_msg<T: Message + 'static>(t: ThreadId, tag: u32, v: T) 
 }
 
 /// Helper for [`send_msg`] and [`send_tagged_msg`]
-fn send_msg_with_tag<T: Message + 'static>(
+fn send_msg_with_tag_internal<T: Message + 'static>(
     v: T,
-    tag: Option<u32>,
+    tag: Option<Vec<u32>>,
     loc: &Loc,
     comm: CommunicationModel,
     lossy: bool,
@@ -827,10 +826,7 @@ fn send_msg_with_tag<T: Message + 'static>(
 
         let slab = SendMsg::new(
             pos,
-            SendLoc::new(loc, sender_tid, match tag {
-                Some(t) => Some(vec![t]),
-                None => None,
-            }),
+            SendLoc::new(loc, sender_tid, tag),
             comm,
             val,
             monitor_msgs,
@@ -856,6 +852,26 @@ fn send_msg_with_tag<T: Message + 'static>(
     });
 }
 
+/// Helper for [`send_msg`] and [`send_tagged_msg`]
+fn send_msg_with_tag<T: Message + 'static>(
+    v: T,
+    tag: Option<u32>,
+    loc: &Loc,
+    comm: CommunicationModel,
+    lossy: bool,
+) {
+    send_msg_with_tag_internal(v, tag.map(|t| vec![t]), loc, comm, lossy);
+}
+
+pub(crate) fn send_msg_with_tag_vec<T: Message + 'static>(
+    v: T,
+    tag: Option<Vec<u32>>,
+    loc: &Loc,
+    comm: CommunicationModel,
+    lossy: bool,
+) {
+    send_msg_with_tag_internal(v, tag, loc, comm, lossy);
+}
 /// Returns a message from the thread queue or times out
 pub fn recv_msg<T: Message + 'static>() -> Option<T> {
     let (loc, comm) = self_loc_comm();
@@ -872,7 +888,7 @@ where
     recv_msg_with_tag(iter::once(&loc), comm, Some(adapt_tag_predicate(f))).map(|x| x.0)
 }
 
-fn recv_msg_with_tag<'a, T: Message + 'static>(
+pub(crate) fn recv_msg_with_tag<'a, T: Message + 'static>(
     locs: impl Iterator<Item = &'a Loc>,
     comm: CommunicationModel,
     tag: Option<PredicateType>,
@@ -928,7 +944,7 @@ where
 }
 
 /// Helper function for [`recv_msg_block`] and [`recv_tagged_msg_block`]
-fn recv_msg_block_with_tag<'a, T: Message + 'static>(
+pub(crate) fn recv_msg_block_with_tag<'a, T: Message + 'static>(
     locs: impl Iterator<Item = &'a Loc>,
     comm: CommunicationModel,
     tag: Option<PredicateType>,
