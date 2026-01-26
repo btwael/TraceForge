@@ -10,7 +10,8 @@ use crate::Val;
 
 pub mod round;
 pub use round::{
-    LevelSpec, Round, RoundId, RoundScheme, RoundSchemeBuilder, RoundStamp, Rounds, TagCmp,
+    LevelSpec, Round, RoundFilter, RoundId, RoundScheme, RoundSchemeBuilder, RoundStamp, Rounds,
+    TagCmp,
 };
 
 fn ensure_len(label: &str, expected: usize, actual: usize) {
@@ -22,12 +23,25 @@ fn ensure_len(label: &str, expected: usize, actual: usize) {
     }
 }
 
-fn matches_components(scheme: &RoundScheme, tag: &[u32], round: &[u32]) -> bool {
+fn matches_components_with_cmp(
+    scheme: &RoundScheme,
+    tag: &[u32],
+    round: &[u32],
+    cmp_overrides: &[Option<TagCmp>],
+) -> bool {
     let expected = scheme.level_count();
     ensure_len("tag", expected, tag.len());
     ensure_len("round", expected, round.len());
+    if !cmp_overrides.is_empty() {
+        ensure_len("comparison overrides", expected, cmp_overrides.len());
+    }
     for (index, level) in scheme.levels().iter().enumerate() {
-        let ok = match level.default_cmp {
+        let cmp = if cmp_overrides.is_empty() {
+            level.default_cmp
+        } else {
+            cmp_overrides[index].unwrap_or(level.default_cmp)
+        };
+        let ok = match cmp {
             TagCmp::Eq => tag[index] == round[index],
             TagCmp::Gte => tag[index] >= round[index],
         };
@@ -36,6 +50,10 @@ fn matches_components(scheme: &RoundScheme, tag: &[u32], round: &[u32]) -> bool 
         }
     }
     true
+}
+
+fn matches_components(scheme: &RoundScheme, tag: &[u32], round: &[u32]) -> bool {
+    matches_components_with_cmp(scheme, tag, round, &[])
 }
 
 fn round_tag_predicate(round: &Round) -> PredicateType {
@@ -48,6 +66,25 @@ fn round_tag_predicate(round: &Round) -> PredicateType {
             None => return false,
         };
         matches_components(&scheme, &tag_vec, &round_components)
+    }))
+}
+
+fn filter_tag_predicate(filter: &RoundFilter) -> PredicateType {
+    let scheme = filter.scheme().clone();
+    let round_components = filter.components().to_vec();
+    let cmp_overrides = filter.cmp_overrides().to_vec();
+    ensure_len("round", scheme.level_count(), round_components.len());
+    ensure_len(
+        "comparison overrides",
+        scheme.level_count(),
+        cmp_overrides.len(),
+    );
+    PredicateType(Arc::new(move |_tid, tag| {
+        let tag_vec = match tag {
+            Some(tag_vec) => tag_vec,
+            None => return false,
+        };
+        matches_components_with_cmp(&scheme, &tag_vec, &round_components, &cmp_overrides)
     }))
 }
 
@@ -131,6 +168,25 @@ pub fn recv_block<T: Message + 'static>(round: &Round) -> RoundMsg<T> {
     RoundMsg::new(payload, tagged.round)
 }
 
+pub fn recv_with_filter<T: Message + 'static>(filter: &RoundFilter) -> Option<RoundMsg<T>> {
+    filter.assert_current();
+    let tag_predicate = filter_tag_predicate(filter);
+    let (loc, comm) = self_loc_comm();
+    let tagged: Option<TaggedVal> =
+        crate::recv_msg_with_tag(iter::once(&loc), comm, Some(tag_predicate)).map(|x| x.0);
+    tagged.map(|tagged| RoundMsg::new(expect_payload::<T>(tagged.payload), tagged.round))
+}
+
+pub fn recv_block_with_filter<T: Message + 'static>(filter: &RoundFilter) -> RoundMsg<T> {
+    filter.assert_current();
+    let tag_predicate = filter_tag_predicate(filter);
+    let (loc, comm) = self_loc_comm();
+    let tagged: TaggedVal =
+        crate::recv_msg_block_with_tag(iter::once(&loc), comm, Some(tag_predicate)).0;
+    let payload = expect_payload::<T>(tagged.payload);
+    RoundMsg::new(payload, tagged.round)
+}
+
 pub fn inbox(round: &Round) -> Vec<Option<RoundMsg<Val>>> {
     inbox_with_bounds(round, 0, None)
 }
@@ -142,6 +198,28 @@ pub fn inbox_with_bounds(
 ) -> Vec<Option<RoundMsg<Val>>> {
     round.assert_current();
     let tag_predicate = round_tag_predicate(round);
+    crate::inbox_extended(Some(tag_predicate), min, max)
+        .into_iter()
+        .map(|val| {
+            val.map(|val| {
+                let tagged = expect_tagged_val(val);
+                RoundMsg::new(tagged.payload, tagged.round)
+            })
+        })
+        .collect()
+}
+
+pub fn inbox_with_filter(filter: &RoundFilter) -> Vec<Option<RoundMsg<Val>>> {
+    inbox_with_bounds_filter(filter, 0, None)
+}
+
+pub fn inbox_with_bounds_filter(
+    filter: &RoundFilter,
+    min: usize,
+    max: Option<usize>,
+) -> Vec<Option<RoundMsg<Val>>> {
+    filter.assert_current();
+    let tag_predicate = filter_tag_predicate(filter);
     crate::inbox_extended(Some(tag_predicate), min, max)
         .into_iter()
         .map(|val| {
