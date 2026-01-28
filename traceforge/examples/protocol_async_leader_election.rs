@@ -4,19 +4,16 @@ use traceforge::comm_close::{self, RoundScheme, RoundStamp, Rounds, TagCmp};
 use traceforge::thread::ThreadId;
 use traceforge::{thread, Nondet};
 
-const NUM_NODES: usize = 2;
-const NUM_BALLOTS: u32 = 1;
+const DEFAULT_NUM_NODES: usize = 3;
+const DEFAULT_NUM_BALLOTS: u32 = 1;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct Participants {
-    nodes: [ThreadId; NUM_NODES],
+    nodes: Vec<ThreadId>,
 }
 
 impl Participants {
     fn from_vec(nodes: Vec<ThreadId>) -> Self {
-        let nodes: [ThreadId; NUM_NODES] = nodes
-            .try_into()
-            .unwrap_or_else(|_| panic!("expected {} participants", NUM_NODES));
         Self { nodes }
     }
 
@@ -26,25 +23,6 @@ impl Participants {
 
     fn iter(&self) -> std::slice::Iter<'_, ThreadId> {
         self.nodes.iter()
-    }
-
-    fn get(&self, idx: usize) -> ThreadId {
-        self.nodes[idx]
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Phase {
-    NewBallot,
-    AckBallot,
-}
-
-impl Phase {
-    fn tag(self) -> u32 {
-        match self {
-            Phase::NewBallot => 0,
-            Phase::AckBallot => 1,
-        }
     }
 }
 
@@ -77,12 +55,7 @@ struct LogEntry {
     leader: ThreadId,
 }
 
-type RoundCollector = dyn Fn(
-        &comm_close::Round,
-        &comm_close::RoundFilter,
-        usize,
-        Option<usize>,
-    ) -> Vec<Message>
+type RoundCollector = dyn Fn(&comm_close::Round, &comm_close::RoundFilter, usize, Option<usize>) -> Vec<Message>
     + Send
     + Sync;
 
@@ -93,10 +66,11 @@ struct Node {
     ballot: u32,
     leader: ThreadId,
     started: bool,
+    num_ballots: u32,
 }
 
 impl Node {
-    fn new(nodes: Participants, scheme: RoundScheme) -> Self {
+    fn new(nodes: Participants, scheme: RoundScheme, num_ballots: u32) -> Self {
         let me = thread::current().id();
         let rounds = Rounds::with_scheme(scheme);
         Self {
@@ -106,12 +80,13 @@ impl Node {
             ballot: 0,
             leader: me,
             started: false,
+            num_ballots,
         }
     }
 
     fn run(mut self, collect: &RoundCollector) -> Vec<LogEntry> {
         let mut log = Vec::new();
-        for _ in 0..NUM_BALLOTS {
+        for _ in 0..self.num_ballots {
             self.step(collect, &mut log);
         }
         log
@@ -133,10 +108,8 @@ impl Node {
             let nb_msgs = self.collect_new_ballot(&nb_round, collect);
             if nb_msgs.len() == 1 {
                 let msg = &nb_msgs[0];
-                if msg.stamp.gt_at(&nb_round.stamp(), 0) {
-                    self.ballot = msg.stamp.components()[0];
-                    self.rounds.jump(&msg.stamp);
-                }
+                self.ballot = msg.stamp.components()[0];
+                self.rounds.jump(&msg.stamp);
                 self.leader = msg.leader;
             }
         }
@@ -173,8 +146,7 @@ impl Node {
     }
 
     fn coord(&self) -> bool {
-        // TODO: remodel
-        return traceforge::nondet();
+        traceforge::nondet()
     }
 
     fn broadcast(&self, round: &comm_close::Round, msg: Message) {
@@ -224,17 +196,17 @@ impl Node {
     }
 }
 
-fn start_node(collect: &RoundCollector, scheme: RoundScheme) -> Vec<LogEntry> {
+fn start_node(collect: &RoundCollector, scheme: RoundScheme, num_ballots: u32) -> Vec<LogEntry> {
     let init: Message = traceforge::recv_tagged_msg_block(|_, tag| tag.is_none());
     let nodes = match init {
         Message::Init(nodes) => nodes,
         _ => panic!("expected init message"),
     };
-    Node::new(nodes, scheme).run(collect)
+    Node::new(nodes, scheme, num_ballots).run(collect)
 }
 
-fn assert_log_consistency(logs: &[Vec<LogEntry>]) {
-    for ballot in 1..=NUM_BALLOTS {
+fn assert_log_consistency(logs: &[Vec<LogEntry>], num_ballots: u32) {
+    for ballot in 1..=num_ballots {
         let mut chosen: Option<ThreadId> = None;
         for log in logs {
             for entry in log.iter().filter(|entry| entry.ballot == ballot) {
@@ -248,36 +220,46 @@ fn assert_log_consistency(logs: &[Vec<LogEntry>]) {
     }
 }
 
-fn run_protocol(collect: Arc<RoundCollector>) -> traceforge::Stats {
-    traceforge::verify(traceforge::Config::builder().build(), move || {
-        let scheme = RoundScheme::builder()
-            .level("round", TagCmp::Gte)
-            .level("phase", TagCmp::Eq)
-            .build();
-        let mut handles = Vec::new();
-        for _ in 0..NUM_NODES {
-            let receive = collect.clone();
-            let scheme = scheme.clone();
-            handles.push(thread::spawn(move || start_node(receive.as_ref(), scheme)));
-        }
-        let nodes = Participants::from_vec(handles.iter().map(|h| h.thread().id()).collect());
-        for handle in &handles {
-            traceforge::send_msg(handle.thread().id(), Message::Init(nodes));
-        }
+fn run_protocol(
+    collect: Arc<RoundCollector>,
+    num_nodes: usize,
+    num_ballots: u32,
+) -> traceforge::Stats {
+    traceforge::verify(
+        traceforge::Config::builder().with_symmetry(false).build(),
+        move || {
+            let scheme = RoundScheme::builder()
+                .level("round", TagCmp::Gte)
+                .level("phase", TagCmp::Eq)
+                .build();
+            let mut handles = Vec::new();
+            for _ in 0..num_nodes {
+                let receive = collect.clone();
+                let scheme = scheme.clone();
+                let num_ballots = num_ballots;
+                handles.push(thread::spawn(move || {
+                    start_node(receive.as_ref(), scheme, num_ballots)
+                }));
+            }
+            let nodes = Participants::from_vec(handles.iter().map(|h| h.thread().id()).collect());
+            for handle in &handles {
+                traceforge::send_msg(handle.thread().id(), Message::Init(nodes.clone()));
+            }
 
-        let mut logs = Vec::new();
-        for handle in handles {
-            logs.push(handle.join().unwrap());
-        }
-        assert_log_consistency(&logs);
-    })
+            let mut logs = Vec::new();
+            for handle in handles {
+                logs.push(handle.join().unwrap());
+            }
+            assert_log_consistency(&logs, num_ballots);
+        },
+    )
 }
 
-fn run_protocol_with_recv() -> traceforge::Stats {
-    let collect: Arc<RoundCollector> = Arc::new(|round, filter, min, max| {
+fn run_protocol_with_recv(num_nodes: usize, num_ballots: u32) -> traceforge::Stats {
+    let collect: Arc<RoundCollector> = Arc::new(move |round, filter, min, max| {
         let upper = match max {
             Some(upper) => upper,
-            None => NUM_BALLOTS as usize * NUM_NODES,
+            None => num_ballots as usize * num_nodes,
         };
         assert!(upper >= min, "requires max >= min");
         let count = if upper == min {
@@ -293,10 +275,10 @@ fn run_protocol_with_recv() -> traceforge::Stats {
         }
         out
     });
-    run_protocol(collect)
+    run_protocol(collect, num_nodes, num_ballots)
 }
 
-fn run_protocol_with_inbox() -> traceforge::Stats {
+fn run_protocol_with_inbox(num_nodes: usize, num_ballots: u32) -> traceforge::Stats {
     let collect: Arc<RoundCollector> = Arc::new(|round, filter, min, max| {
         comm_close::inbox_with_bounds_filter(filter, min, max)
             .into_iter()
@@ -309,23 +291,56 @@ fn run_protocol_with_inbox() -> traceforge::Stats {
             })
             .collect()
     });
-    run_protocol(collect)
+    run_protocol(collect, num_nodes, num_ballots)
+}
+
+fn parse_args() -> (usize, u32, bool, bool) {
+    let mut num_nodes = DEFAULT_NUM_NODES;
+    let mut num_ballots = DEFAULT_NUM_BALLOTS;
+    let mut use_recv = false;
+    let mut use_inbox = false;
+    let mut args = std::env::args().skip(1).peekable();
+
+    while let Some(arg) = args.next() {
+        if arg == "recv" {
+            use_recv = true;
+        } else if arg == "inbox" {
+            use_inbox = true;
+        } else if arg == "--nodes" {
+            let value = args
+                .next()
+                .unwrap_or_else(|| panic!("--nodes requires a value"));
+            num_nodes = value
+                .parse()
+                .unwrap_or_else(|_| panic!("invalid --nodes value: {}", value));
+        } else if arg == "--ballots" {
+            let value = args
+                .next()
+                .unwrap_or_else(|| panic!("--ballots requires a value"));
+            num_ballots = value
+                .parse()
+                .unwrap_or_else(|_| panic!("invalid --ballots value: {}", value));
+        } else {
+            panic!("unknown argument: {}", arg);
+        }
+    }
+
+    (num_nodes, num_ballots, use_recv, use_inbox)
 }
 
 fn main() {
-    let use_recv = std::env::args().any(|arg| arg == "recv");
-    let use_inbox = std::env::args().any(|arg| arg == "inbox");
+    let (num_nodes, num_ballots, use_recv, use_inbox) = parse_args();
 
-    if (use_recv && use_inbox) {
+    if use_recv && use_inbox {
         panic!("Can't use recv/inbox at the same time!");
     } else if !use_recv && !use_inbox {
         panic!("Must specify recv or inbox!");
     }
 
     let stats = if use_recv {
-        run_protocol_with_recv()
+        run_protocol_with_recv(num_nodes, num_ballots)
     } else {
-        run_protocol_with_inbox()
+        run_protocol_with_inbox(num_nodes, num_ballots)
     };
     println!("Stats = {}, {}", stats.execs, stats.block);
 }

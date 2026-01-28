@@ -4,19 +4,16 @@ use traceforge::comm_close::{self, RoundScheme, RoundStamp, Rounds, TagCmp};
 use traceforge::thread::ThreadId;
 use traceforge::{thread, Nondet};
 
-const NUM_PARTICIPANTS: usize = 4;
-const NUM_ROUNDS: u32 = 4;
+const DEFAULT_NUM_PARTICIPANTS: usize = 3;
+const DEFAULT_NUM_ROUNDS: u32 = 1;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct Participants {
-    nodes: [ThreadId; NUM_PARTICIPANTS],
+    nodes: Vec<ThreadId>,
 }
 
 impl Participants {
     fn from_vec(nodes: Vec<ThreadId>) -> Self {
-        let nodes: [ThreadId; NUM_PARTICIPANTS] = nodes
-            .try_into()
-            .unwrap_or_else(|_| panic!("expected {} participants", NUM_PARTICIPANTS));
         Self { nodes }
     }
 
@@ -62,7 +59,7 @@ struct DecideMsg {
     sender: ThreadId,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct InitMsg {
     coordinator: ThreadId,
     participants: Participants,
@@ -98,10 +95,11 @@ struct Node {
     me: ThreadId,
     rounds: Rounds,
     started: bool,
+    num_rounds: u32,
 }
 
 impl Node {
-    fn new(init: InitMsg, scheme: RoundScheme) -> Self {
+    fn new(init: InitMsg, scheme: RoundScheme, num_rounds: u32) -> Self {
         let me = thread::current().id();
         let role = if me == init.coordinator {
             Role::Coordinator
@@ -116,6 +114,7 @@ impl Node {
             me,
             rounds,
             started: false,
+            num_rounds,
         }
     }
 
@@ -127,7 +126,7 @@ impl Node {
     }
 
     fn run_coordinator(&mut self, collect: &RoundCollector) {
-        for _ in 0..NUM_ROUNDS {
+        for _ in 0..self.num_rounds {
             let round = self.next_round();
             let prepare = PrepareMsg {
                 stamp: round.stamp(),
@@ -154,7 +153,7 @@ impl Node {
     }
 
     fn run_participant(&mut self, collect: &RoundCollector) {
-        for _ in 0..NUM_ROUNDS {
+        for _ in 0..self.num_rounds {
             let round = self.next_round();
             let prepare = self.collect_prepare(&round, collect);
             assert_eq!(prepare.coordinator, self.coordinator);
@@ -238,26 +237,31 @@ impl Node {
     }
 }
 
-fn start_node(collect: &RoundCollector, scheme: RoundScheme) {
+fn start_node(collect: &RoundCollector, scheme: RoundScheme, num_rounds: u32) {
     let init: Message = traceforge::recv_tagged_msg_block(|_, tag| tag.is_none());
     let init = match init {
         Message::Init(init) => init,
         _ => panic!("expected init message"),
     };
-    Node::new(init, scheme).run(collect);
+    Node::new(init, scheme, num_rounds).run(collect);
 }
 
-fn run_protocol(collect: Arc<RoundCollector>) -> traceforge::Stats {
+fn run_protocol(
+    collect: Arc<RoundCollector>,
+    num_participants: usize,
+    num_rounds: u32,
+) -> traceforge::Stats {
     traceforge::verify(traceforge::Config::builder().with_lossy(2).build(), move || {
         let scheme = RoundScheme::builder()
             .level("round", TagCmp::Eq)
             .build();
 
         let mut handles = Vec::new();
-        for _ in 0..(NUM_PARTICIPANTS + 1) {
+        for _ in 0..(num_participants + 1) {
             let receive = collect.clone();
             let scheme = scheme.clone();
-            handles.push(thread::spawn(move || start_node(receive.as_ref(), scheme)));
+            let num_rounds = num_rounds;
+            handles.push(thread::spawn(move || start_node(receive.as_ref(), scheme, num_rounds)));
         }
 
         let coordinator = handles[0].thread().id();
@@ -272,7 +276,7 @@ fn run_protocol(collect: Arc<RoundCollector>) -> traceforge::Stats {
             participants,
         };
         for handle in &handles {
-            traceforge::send_msg(handle.thread().id(), Message::Init(init));
+            traceforge::send_msg(handle.thread().id(), Message::Init(init.clone()));
         }
 
         for handle in handles {
@@ -281,7 +285,7 @@ fn run_protocol(collect: Arc<RoundCollector>) -> traceforge::Stats {
     })
 }
 
-fn run_protocol_with_recv() -> traceforge::Stats {
+fn run_protocol_with_recv(num_participants: usize, num_rounds: u32) -> traceforge::Stats {
     let collect: Arc<RoundCollector> = Arc::new(|round, filter, min, max| {
         let upper = max.expect("requires bounded max");
         assert!(upper >= min, "requires max >= min");
@@ -298,10 +302,10 @@ fn run_protocol_with_recv() -> traceforge::Stats {
         }
         out
     });
-    run_protocol(collect)
+    run_protocol(collect, num_participants, num_rounds)
 }
 
-fn run_protocol_with_inbox() -> traceforge::Stats {
+fn run_protocol_with_inbox(num_participants: usize, num_rounds: u32) -> traceforge::Stats {
     let collect: Arc<RoundCollector> = Arc::new(|round, filter, min, max| {
         comm_close::inbox_with_bounds_filter(filter, min, max)
             .into_iter()
@@ -314,12 +318,45 @@ fn run_protocol_with_inbox() -> traceforge::Stats {
             })
             .collect()
     });
-    run_protocol(collect)
+    run_protocol(collect, num_participants, num_rounds)
+}
+
+fn parse_args() -> (usize, u32, bool, bool) {
+    let mut num_participants = DEFAULT_NUM_PARTICIPANTS;
+    let mut num_rounds = DEFAULT_NUM_ROUNDS;
+    let mut use_recv = false;
+    let mut use_inbox = false;
+    let mut args = std::env::args().skip(1).peekable();
+
+    while let Some(arg) = args.next() {
+        if arg == "recv" {
+            use_recv = true;
+        } else if arg == "inbox" {
+            use_inbox = true;
+        } else if arg == "--participants" {
+            let value = args
+                .next()
+                .unwrap_or_else(|| panic!("--participants requires a value"));
+            num_participants = value
+                .parse()
+                .unwrap_or_else(|_| panic!("invalid --participants value: {}", value));
+        } else if arg == "--rounds" {
+            let value = args
+                .next()
+                .unwrap_or_else(|| panic!("--rounds requires a value"));
+            num_rounds = value
+                .parse()
+                .unwrap_or_else(|_| panic!("invalid --rounds value: {}", value));
+        } else {
+            panic!("unknown argument: {}", arg);
+        }
+    }
+
+    (num_participants, num_rounds, use_recv, use_inbox)
 }
 
 fn main() {
-    let use_recv = std::env::args().any(|arg| arg == "recv");
-    let use_inbox = std::env::args().any(|arg| arg == "inbox");
+    let (num_participants, num_rounds, use_recv, use_inbox) = parse_args();
 
     if use_recv && use_inbox {
         panic!("Can't use recv/inbox at the same time!");
@@ -328,9 +365,9 @@ fn main() {
     }
 
     let stats = if use_recv {
-        run_protocol_with_recv()
+        run_protocol_with_recv(num_participants, num_rounds)
     } else {
-        run_protocol_with_inbox()
+        run_protocol_with_inbox(num_participants, num_rounds)
     };
     println!("Stats = {}, {}", stats.execs, stats.block);
 }

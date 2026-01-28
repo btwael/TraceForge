@@ -4,23 +4,16 @@ use traceforge::comm_close::{self, RoundScheme, RoundStamp, Rounds, TagCmp};
 use traceforge::thread::ThreadId;
 use traceforge::{thread, Nondet};
 
-// Keep bounds explicit and small for verification.
-const NUM_NODES: usize = 3;
-const NUM_ROUNDS: u32 = 3;
+const DEFAULT_NUM_NODES: usize = 3;
+const DEFAULT_NUM_ROUNDS: u32 = 1;
 
-// Chandra-Toueg uses a quorum of size (n + 1) / 2.
-const QUORUM: usize = (NUM_NODES + 1) / 2;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct Participants {
-    nodes: [ThreadId; NUM_NODES],
+    nodes: Vec<ThreadId>,
 }
 
 impl Participants {
     fn from_vec(nodes: Vec<ThreadId>) -> Self {
-        let nodes: [ThreadId; NUM_NODES] = nodes
-            .try_into()
-            .unwrap_or_else(|_| panic!("expected {} participants", NUM_NODES));
         Self { nodes }
     }
 
@@ -59,7 +52,7 @@ impl Phase {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct FirstPhaseMsg {
     stamp: RoundStamp,
-    estimate: i32,
+    estimate: bool,
     timestamp: u32,
     sender: ThreadId,
 }
@@ -67,7 +60,7 @@ struct FirstPhaseMsg {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct SecondPhaseMsg {
     stamp: RoundStamp,
-    estimate: i32,
+    estimate: bool,
     timestamp: u32,
     sender: ThreadId,
 }
@@ -75,16 +68,16 @@ struct SecondPhaseMsg {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ThirdPhaseMsg {
     stamp: RoundStamp,
-    estimate: i32,
+    estimate: bool,
     timestamp: u32,
-    ack: i32,
+    ack: bool,
     sender: ThreadId,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct DecideMsg {
     stamp: RoundStamp,
-    estimate: i32,
+    estimate: bool,
     sender: ThreadId,
 }
 
@@ -100,7 +93,7 @@ enum Message {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct LogEntry {
     round: u32,
-    estimate: i32,
+    estimate: bool,
 }
 
 type RoundCollector = dyn Fn(
@@ -108,16 +101,23 @@ type RoundCollector = dyn Fn(
         &comm_close::RoundFilter,
         usize,
         Option<usize>,
-    ) -> Vec<Message>
+    ) -> Vec<comm_close::RoundMsg<Message>>
     + Send
     + Sync;
+
+enum CollectOutcome<T> {
+    Decide(comm_close::RoundMsg<Message>),
+    Messages(Vec<T>),
+}
 
 struct Node {
     nodes: Participants,
     me: ThreadId,
     rounds: Rounds,
+    num_rounds: u32,
+    quorum: usize,
 
-    estimate: i32,
+    estimate: bool,
     timestamp: u32,
     decided: bool,
 
@@ -126,17 +126,20 @@ struct Node {
 }
 
 impl Node {
-    fn new(nodes: Participants, scheme: RoundScheme) -> Self {
+    fn new(nodes: Participants, scheme: RoundScheme, num_rounds: u32) -> Self {
         let me = thread::current().id();
         let rounds = Rounds::with_scheme(scheme);
+        let quorum = (nodes.len() + 1) / 2;
 
         // Domain of initial values is intentionally tiny for verification.
-        let estimate = if traceforge::nondet() { 0 } else { 1 };
+        let estimate = traceforge::nondet();
 
         Self {
             nodes,
             me,
             rounds,
+            num_rounds,
+            quorum,
             estimate,
             timestamp: 0,
             decided: false,
@@ -146,7 +149,7 @@ impl Node {
 
     fn run(mut self, collect: &RoundCollector) -> Vec<LogEntry> {
         let mut log = Vec::new();
-        for _ in 0..NUM_ROUNDS {
+        for _ in 0..self.num_rounds {
             if self.decided {
                 break;
             }
@@ -160,7 +163,7 @@ impl Node {
         // Inner component: "phase" (First..Fourth) within the current round.
         let first_phase = self.next_round();
         let round_id = self.round_of(&first_phase.stamp());
-        let leader = self.leader_for_round(round_id);
+        let leader = self.coord(round_id);
 
         // --- Phase 1: send (estimate,timestamp) to leader ---
         if leader != self.me {
@@ -183,10 +186,25 @@ impl Node {
             }];
 
             // Collect enough messages to reach a quorum.
-            let min_other = QUORUM.saturating_sub(1);
-            let max_other = self.nodes.len().saturating_sub(1);
-            let mut recvd =
-                self.collect_first_phase(&first_phase, collect, min_other, Some(max_other));
+            let min_other = self.quorum.saturating_sub(1);
+            let mut recvd = match self.collect_first_phase(
+                &first_phase,
+                collect,
+                min_other,
+                Some(min_other),
+            ) {
+                CollectOutcome::Decide(msg) => {
+                    let stamp = msg.round_stamp();
+                    let jumped = self.rounds.jump(&stamp);
+                    let payload = msg.payload(&jumped);
+                    let Message::Decide(decide) = payload else {
+                        panic!("expected DecideMsg");
+                    };
+                    self.decide(self.round_of(&decide.stamp), decide.estimate, log);
+                    return;
+                }
+                CollectOutcome::Messages(msgs) => msgs,
+            };
             mbox.append(&mut recvd);
 
             let chosen = Self::max_timestamp(&mbox);
@@ -195,7 +213,7 @@ impl Node {
 
         // --- Phase 2: leader broadcasts estimate; receivers set timestamp=round_id and ack=1 ---
         let second_phase = self.rounds.advance_level(1);
-        let mut ack: i32 = 0;
+        let mut ack: bool = false;
 
         if self.me == leader {
             let msg = SecondPhaseMsg {
@@ -208,17 +226,29 @@ impl Node {
 
             // Leader "receives" its own value in this phase.
             self.timestamp = round_id;
-            ack = 1;
+            ack = true;
         } else {
-            let msgs = self.collect_second_phase(&second_phase, collect, 0, Some(1));
+            let msgs = match self.collect_second_phase(&second_phase, collect, 0, Some(1)) {
+                CollectOutcome::Decide(msg) => {
+                    let stamp = msg.round_stamp();
+                    let jumped = self.rounds.jump(&stamp);
+                    let payload = msg.payload(&jumped);
+                    let Message::Decide(decide) = payload else {
+                        panic!("expected DecideMsg");
+                    };
+                    self.decide(self.round_of(&decide.stamp), decide.estimate, log);
+                    return;
+                }
+                CollectOutcome::Messages(msgs) => msgs,
+            };
             if msgs.len() == 1 {
                 let msg = &msgs[0];
                 self.estimate = msg.estimate;
                 self.timestamp = round_id;
-                ack = 1;
+                ack = true;
             } else {
                 // Timeout branch.
-                ack = -1;
+                ack = false;
             }
         }
 
@@ -245,25 +275,36 @@ impl Node {
                 sender: self.me,
             }];
 
-            let min_other = QUORUM.saturating_sub(1);
-            let max_other = self.nodes.len().saturating_sub(1);
-            let mut recvd =
-                self.collect_third_phase(&third_phase, collect, min_other, Some(max_other));
+            let min_other = self.quorum.saturating_sub(1);
+            let mut recvd = match self.collect_third_phase(
+                &third_phase,
+                collect,
+                min_other,
+                Some(min_other),
+            ) {
+                CollectOutcome::Decide(msg) => {
+                    let stamp = msg.round_stamp();
+                    let jumped = self.rounds.jump(&stamp);
+                    let payload = msg.payload(&jumped);
+                    let Message::Decide(decide) = payload else {
+                        panic!("expected DecideMsg");
+                    };
+                    self.decide(self.round_of(&decide.stamp), decide.estimate, log);
+                    return;
+                }
+                CollectOutcome::Messages(msgs) => msgs,
+            };
             mbox.append(&mut recvd);
 
-            if Self::all_ack(&mbox) {
-                1
-            } else {
-                -1
-            }
+            Self::all_ack(&mbox)
         } else {
-            0
+            false
         };
 
         // --- Phase 4: if leader_ack==1, leader broadcasts DECIDE; everybody may receive DECIDE ---
         let fourth_phase = self.rounds.advance_level(1);
 
-        if self.me == leader && leader_ack == 1 {
+        if self.me == leader && leader_ack {
             let msg = DecideMsg {
                 stamp: fourth_phase.stamp(),
                 estimate: self.estimate,
@@ -299,7 +340,7 @@ impl Node {
         stamp.components()[1]
     }
 
-    fn leader_for_round(&self, round_id: u32) -> ThreadId {
+    fn coord(&self, round_id: u32) -> ThreadId {
         // Rotate leader by round.
         let idx = (round_id as usize) % self.nodes.len();
         self.nodes.get(idx)
@@ -313,7 +354,7 @@ impl Node {
         }
     }
 
-    fn decide(&mut self, round_id: u32, estimate: i32, log: &mut Vec<LogEntry>) {
+    fn decide(&mut self, round_id: u32, estimate: bool, log: &mut Vec<LogEntry>) {
         if self.decided {
             return;
         }
@@ -330,16 +371,33 @@ impl Node {
         collect: &RoundCollector,
         min: usize,
         max: Option<usize>,
-    ) -> Vec<FirstPhaseMsg> {
-        // Only accept Phase-1 messages for *this* round (ignore future-round Phase-1 messages).
-        let filter = round.filter().level_cmp(0, TagCmp::Eq);
-        collect(round, &filter, min, max)
-            .into_iter()
-            .filter_map(|msg| match msg {
-                Message::First(payload) => Some(payload),
-                _ => panic!("expected FirstPhaseMsg"),
-            })
-            .collect()
+    ) -> CollectOutcome<FirstPhaseMsg> {
+        // Accept current Phase-1 messages, but allow early DECIDE from any round.
+        let stamp = round.stamp();
+        let round_id = self.round_of(&stamp);
+        let phase_tag = self.phase_of(&stamp);
+        let filter = round
+            .filter()
+            .level_cmp(0, TagCmp::Eq)
+            .or_pattern(|p| {
+                p.level_cmp(0, TagCmp::Gte)
+                    .level_eq_value(1, Phase::Fourth.tag())
+            });
+
+        let mut out = Vec::new();
+        for msg in collect(round, &filter, min, max) {
+            let msg_stamp = msg.round_stamp();
+            if self.phase_of(&msg_stamp) == Phase::Fourth.tag() {
+                return CollectOutcome::Decide(msg);
+            }
+            if self.round_of(&msg_stamp) == round_id && self.phase_of(&msg_stamp) == phase_tag {
+                match msg.payload(round) {
+                    Message::First(payload) => out.push(payload.clone()),
+                    _ => panic!("expected FirstPhaseMsg"),
+                }
+            }
+        }
+        CollectOutcome::Messages(out)
     }
 
     fn collect_second_phase(
@@ -348,16 +406,33 @@ impl Node {
         collect: &RoundCollector,
         min: usize,
         max: Option<usize>,
-    ) -> Vec<SecondPhaseMsg> {
-        // Only accept Phase-2 messages for *this* round.
-        let filter = round.filter().level_cmp(0, TagCmp::Eq);
-        collect(round, &filter, min, max)
-            .into_iter()
-            .filter_map(|msg| match msg {
-                Message::Second(payload) => Some(payload),
-                _ => panic!("expected SecondPhaseMsg"),
-            })
-            .collect()
+    ) -> CollectOutcome<SecondPhaseMsg> {
+        // Accept current Phase-2 messages, but allow early DECIDE from any round.
+        let stamp = round.stamp();
+        let round_id = self.round_of(&stamp);
+        let phase_tag = self.phase_of(&stamp);
+        let filter = round
+            .filter()
+            .level_cmp(0, TagCmp::Eq)
+            .or_pattern(|p| {
+                p.level_cmp(0, TagCmp::Gte)
+                    .level_eq_value(1, Phase::Fourth.tag())
+            });
+
+        let mut out = Vec::new();
+        for msg in collect(round, &filter, min, max) {
+            let msg_stamp = msg.round_stamp();
+            if self.phase_of(&msg_stamp) == Phase::Fourth.tag() {
+                return CollectOutcome::Decide(msg);
+            }
+            if self.round_of(&msg_stamp) == round_id && self.phase_of(&msg_stamp) == phase_tag {
+                match msg.payload(round) {
+                    Message::Second(payload) => out.push(payload.clone()),
+                    _ => panic!("expected SecondPhaseMsg"),
+                }
+            }
+        }
+        CollectOutcome::Messages(out)
     }
 
     fn collect_third_phase(
@@ -366,16 +441,33 @@ impl Node {
         collect: &RoundCollector,
         min: usize,
         max: Option<usize>,
-    ) -> Vec<ThirdPhaseMsg> {
-        // Only accept Phase-3 messages for *this* round.
-        let filter = round.filter().level_cmp(0, TagCmp::Eq);
-        collect(round, &filter, min, max)
-            .into_iter()
-            .filter_map(|msg| match msg {
-                Message::Third(payload) => Some(payload),
-                _ => panic!("expected ThirdPhaseMsg"),
-            })
-            .collect()
+    ) -> CollectOutcome<ThirdPhaseMsg> {
+        // Accept current Phase-3 messages, but allow early DECIDE from any round.
+        let stamp = round.stamp();
+        let round_id = self.round_of(&stamp);
+        let phase_tag = self.phase_of(&stamp);
+        let filter = round
+            .filter()
+            .level_cmp(0, TagCmp::Eq)
+            .or_pattern(|p| {
+                p.level_cmp(0, TagCmp::Gte)
+                    .level_eq_value(1, Phase::Fourth.tag())
+            });
+
+        let mut out = Vec::new();
+        for msg in collect(round, &filter, min, max) {
+            let msg_stamp = msg.round_stamp();
+            if self.phase_of(&msg_stamp) == Phase::Fourth.tag() {
+                return CollectOutcome::Decide(msg);
+            }
+            if self.round_of(&msg_stamp) == round_id && self.phase_of(&msg_stamp) == phase_tag {
+                match msg.payload(round) {
+                    Message::Third(payload) => out.push(payload.clone()),
+                    _ => panic!("expected ThirdPhaseMsg"),
+                }
+            }
+        }
+        CollectOutcome::Messages(out)
     }
 
     fn collect_decide(
@@ -390,8 +482,8 @@ impl Node {
         let filter = round.filter();
         collect(round, &filter, min, max)
             .into_iter()
-            .filter_map(|msg| match msg {
-                Message::Decide(payload) => Some(payload),
+            .filter_map(|msg| match msg.payload(round) {
+                Message::Decide(payload) => Some(payload.clone()),
                 _ => panic!("expected DecideMsg"),
             })
             .collect()
@@ -405,21 +497,21 @@ impl Node {
     }
 
     fn all_ack(messages: &[ThirdPhaseMsg]) -> bool {
-        messages.iter().all(|m| m.ack == 1)
+        messages.iter().all(|m| m.ack)
     }
 }
 
-fn start_node(collect: &RoundCollector, scheme: RoundScheme) -> Vec<LogEntry> {
+fn start_node(collect: &RoundCollector, scheme: RoundScheme, num_rounds: u32) -> Vec<LogEntry> {
     let init: Message = traceforge::recv_tagged_msg_block(|_, tag| tag.is_none());
     let nodes = match init {
         Message::Init(nodes) => nodes,
         _ => panic!("expected init message"),
     };
-    Node::new(nodes, scheme).run(collect)
+    Node::new(nodes, scheme, num_rounds).run(collect)
 }
 
 fn assert_agreement(logs: &[Vec<LogEntry>]) {
-    let mut chosen: Option<i32> = None;
+    let mut chosen: Option<bool> = None;
 
     for log in logs {
         for entry in log {
@@ -432,7 +524,11 @@ fn assert_agreement(logs: &[Vec<LogEntry>]) {
     }
 }
 
-fn run_protocol(collect: Arc<RoundCollector>) -> traceforge::Stats {
+fn run_protocol(
+    collect: Arc<RoundCollector>,
+    num_nodes: usize,
+    num_rounds: u32,
+) -> traceforge::Stats {
     traceforge::verify(traceforge::Config::builder().build(), move || {
         // Tag layout (outer -> inner): (round, phase).
         // - round: grows monotonically, so we use Gte by default;
@@ -443,15 +539,15 @@ fn run_protocol(collect: Arc<RoundCollector>) -> traceforge::Stats {
             .build();
 
         let mut handles = Vec::new();
-        for _ in 0..NUM_NODES {
+        for _ in 0..num_nodes {
             let receive = collect.clone();
             let scheme = scheme.clone();
-            handles.push(thread::spawn(move || start_node(receive.as_ref(), scheme)));
+            handles.push(thread::spawn(move || start_node(receive.as_ref(), scheme, num_rounds)));
         }
 
         let nodes = Participants::from_vec(handles.iter().map(|h| h.thread().id()).collect());
         for handle in &handles {
-            traceforge::send_msg(handle.thread().id(), Message::Init(nodes));
+            traceforge::send_msg(handle.thread().id(), Message::Init(nodes.clone()));
         }
 
         let mut logs = Vec::new();
@@ -463,10 +559,14 @@ fn run_protocol(collect: Arc<RoundCollector>) -> traceforge::Stats {
 }
 
 fn run_protocol_with_recv() -> traceforge::Stats {
-    let collect: Arc<RoundCollector> = Arc::new(|round, filter, min, max| {
+    run_protocol_with_recv_params(DEFAULT_NUM_NODES, DEFAULT_NUM_ROUNDS)
+}
+
+fn run_protocol_with_recv_params(num_nodes: usize, num_rounds: u32) -> traceforge::Stats {
+    let collect: Arc<RoundCollector> = Arc::new(move |round, filter, min, max| {
         let upper = match max {
             Some(upper) => upper,
-            None => (NUM_ROUNDS as usize) * 4 * NUM_NODES,
+            None => (num_rounds as usize) * 4 * num_nodes,
         };
         assert!(upper >= min, "requires max >= min");
         let count = if upper == min {
@@ -478,15 +578,19 @@ fn run_protocol_with_recv() -> traceforge::Stats {
         let mut out = Vec::new();
         for _ in 0..count {
             let msg = comm_close::recv_block_with_filter::<Message>(filter);
-            out.push(msg.payload(round).clone());
+            out.push(msg);
         }
         out
     });
-    run_protocol(collect)
+    run_protocol(collect, num_nodes, num_rounds)
 }
 
 fn run_protocol_with_inbox() -> traceforge::Stats {
-    let collect: Arc<RoundCollector> = Arc::new(|round, filter, min, max| {
+    run_protocol_with_inbox_params(DEFAULT_NUM_NODES, DEFAULT_NUM_ROUNDS)
+}
+
+fn run_protocol_with_inbox_params(num_nodes: usize, num_rounds: u32) -> traceforge::Stats {
+    let collect: Arc<RoundCollector> = Arc::new(move |round, filter, min, max| {
         comm_close::inbox_with_bounds_filter(filter, min, max)
             .into_iter()
             .flatten()
@@ -495,15 +599,49 @@ fn run_protocol_with_inbox() -> traceforge::Stats {
                     .as_any_ref()
                     .downcast_ref::<Message>()
                     .cloned()
+                    .map(|payload| comm_close::RoundMsg::from_parts(msg.round_id(), payload))
             })
             .collect()
     });
-    run_protocol(collect)
+    run_protocol(collect, num_nodes, num_rounds)
+}
+
+fn parse_args() -> (usize, u32, bool, bool) {
+    let mut num_nodes = DEFAULT_NUM_NODES;
+    let mut num_rounds = DEFAULT_NUM_ROUNDS;
+    let mut use_recv = false;
+    let mut use_inbox = false;
+    let mut args = std::env::args().skip(1).peekable();
+
+    while let Some(arg) = args.next() {
+        if arg == "recv" {
+            use_recv = true;
+        } else if arg == "inbox" {
+            use_inbox = true;
+        } else if arg == "--nodes" || arg == "--node" {
+            let value = args
+                .next()
+                .unwrap_or_else(|| panic!("{} requires a value", arg));
+            num_nodes = value
+                .parse()
+                .unwrap_or_else(|_| panic!("invalid {} value: {}", arg, value));
+        } else if arg == "--rounds" {
+            let value = args
+                .next()
+                .unwrap_or_else(|| panic!("--rounds requires a value"));
+            num_rounds = value
+                .parse()
+                .unwrap_or_else(|_| panic!("invalid --rounds value: {}", value));
+        } else {
+            panic!("unknown argument: {}", arg);
+        }
+    }
+
+    (num_nodes, num_rounds, use_recv, use_inbox)
 }
 
 fn main() {
-    let use_recv = std::env::args().any(|arg| arg == "recv");
-    let use_inbox = std::env::args().any(|arg| arg == "inbox");
+    let (num_nodes, num_rounds, use_recv, use_inbox) = parse_args();
 
     if (use_recv && use_inbox) {
         panic!("Can't use recv/inbox at the same time!");
@@ -512,9 +650,9 @@ fn main() {
     }
 
     let stats = if use_recv {
-        run_protocol_with_recv()
+        run_protocol_with_recv_params(num_nodes, num_rounds)
     } else {
-        run_protocol_with_inbox()
+        run_protocol_with_inbox_params(num_nodes, num_rounds)
     };
     println!("Stats = {}, {}", stats.execs, stats.block);
 }

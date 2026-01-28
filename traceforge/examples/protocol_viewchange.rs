@@ -12,8 +12,6 @@ const NUM_ROUNDS: u32 = 1;
 // Majority quorum for view change.
 const QUORUM: usize = (NUM_NODES / 2) + 1;
 
-// Keep logs tiny.
-const MAX_LOG_LEN: usize = 3;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Participants {
@@ -54,6 +52,17 @@ enum Phase {
     StartViewChange,
     DoViewChange,
     StartView,
+}
+
+impl Phase {
+    fn tag(self) -> u32 {
+        match self {
+            Phase::Aux => 0,
+            Phase::StartViewChange => 1,
+            Phase::DoViewChange => 2,
+            Phase::StartView => 3,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -100,6 +109,10 @@ type RoundCollector = dyn Fn(
     + Send
     + Sync;
 
+type JumpCollector = dyn Fn(&comm_close::RoundFilter, usize, Option<usize>) -> Vec<RoundStamp>
+    + Send
+    + Sync;
+
 struct Node {
     nodes: Participants,
     me: ThreadId,
@@ -121,7 +134,7 @@ impl Node {
             rounds.advance_round();
         }
 
-        let log = Self::init_log();
+        let log = Self::init_log(nodes.len());
 
         Self {
             nodes,
@@ -132,15 +145,20 @@ impl Node {
         }
     }
 
-    fn run(mut self, collect: &RoundCollector) -> Vec<LogEntry> {
+    fn run(mut self, collect: &RoundCollector, collect_jump: &JumpCollector) -> Vec<LogEntry> {
         let mut out = Vec::new();
         for _ in 0..NUM_ROUNDS {
-            self.step_view_change(collect, &mut out);
+            self.step_view_change(collect, collect_jump, &mut out);
         }
         out
     }
 
-    fn step_view_change(&mut self, collect: &RoundCollector, out: &mut Vec<LogEntry>) {
+    fn step_view_change(
+        &mut self,
+        collect: &RoundCollector,
+        collect_jump: &JumpCollector,
+        out: &mut Vec<LogEntry>,
+    ) {
         let _aux = self.rounds.current();
         let svc_round = self.rounds.advance_level(1);
         let view = self.view_of(&svc_round.stamp());
@@ -156,18 +174,32 @@ impl Node {
 
         // Collect a bounded, nondet number of messages from this view or higher views
         // (and from StartViewChange/DoViewChange/StartView phases).
-        let mut mbox = self.collect_any_vc_msgs(&svc_round, collect, 0, Some(NUM_NODES * 4));
+        let mut mbox = self.collect_vc_msgs(
+            &svc_round,
+            collect,
+            0,
+            Some(NUM_NODES * 4),
+            &[Phase::StartViewChange, Phase::DoViewChange],
+        );
+        let jump_msgs =
+            self.collect_jump_msgs(&svc_round, collect_jump, 0, Some(NUM_NODES * 4));
 
         // --- Jump rule: if we see a higher view, jump to it ---
-        if let Some(target) = self.max_view_in_mbox(&mbox).filter(|v| *v > view) {
+        if let Some(target) = self
+            .max_view_in_mbox(&mbox)
+            .into_iter()
+            .chain(jump_msgs.into_iter().map(|s| self.view_of(&s)))
+            .max()
+            .filter(|v| *v > view)
+        {
             self.prev_view = view;
             self.jump_to_view(target);
             return;
         }
 
         // --- StartViewChange quorum condition ---
-        let svc_count = 1 + Self::count_svc_for_view(&mbox, view);
-        let saw_dvc_for_view = Self::has_dvc_for_view(&mbox, view);
+        let svc_count = 1 + self.count_phase_for_view(&mbox, view, Phase::StartViewChange);
+        let saw_dvc_for_view = self.has_phase_for_view(&mbox, view, Phase::DoViewChange);
 
         if svc_count < QUORUM && !saw_dvc_for_view {
             // Timeout / failed attempt: go to next view.
@@ -203,10 +235,24 @@ impl Node {
             }];
 
             // Pull more messages (still allowing higher-view jumps).
-            let more = self.collect_any_vc_msgs(&dvc_round, collect, 0, Some(NUM_NODES * 4));
+            let more = self.collect_vc_msgs(
+                &dvc_round,
+                collect,
+                0,
+                Some(NUM_NODES * 4),
+                &[Phase::DoViewChange],
+            );
             mbox.extend(more);
+            let jump_msgs =
+                self.collect_jump_msgs(&dvc_round, collect_jump, 0, Some(NUM_NODES * 4));
 
-            if let Some(target) = self.max_view_in_mbox(&mbox).filter(|v| *v > view) {
+            if let Some(target) = self
+                .max_view_in_mbox(&mbox)
+                .into_iter()
+                .chain(jump_msgs.into_iter().map(|s| self.view_of(&s)))
+                .max()
+                .filter(|v| *v > view)
+            {
                 self.prev_view = view;
                 self.jump_to_view(target);
                 return;
@@ -251,9 +297,23 @@ impl Node {
             });
         } else {
             // Replica waits (nondeterministically) for StartView, but can still jump on a higher view.
-            let msgs = self.collect_any_vc_msgs(&sv_round, collect, 0, Some(NUM_NODES * 4));
+            let msgs = self.collect_vc_msgs(
+                &sv_round,
+                collect,
+                0,
+                Some(NUM_NODES * 4),
+                &[Phase::StartView],
+            );
+            let jump_msgs =
+                self.collect_jump_msgs(&sv_round, collect_jump, 0, Some(NUM_NODES * 4));
 
-            if let Some(target) = self.max_view_in_mbox(&msgs).filter(|v| *v > view) {
+            if let Some(target) = self
+                .max_view_in_mbox(&msgs)
+                .into_iter()
+                .chain(jump_msgs.into_iter().map(|s| self.view_of(&s)))
+                .max()
+                .filter(|v| *v > view)
+            {
                 self.prev_view = view;
                 self.jump_to_view(target);
                 return;
@@ -276,8 +336,8 @@ impl Node {
         self.rounds.advance_round();
     }
 
-    fn init_log() -> Vec<bool> {
-        let len: usize = (0..=MAX_LOG_LEN).nondet();
+    fn init_log(max_len: usize) -> Vec<bool> {
+        let len: usize = (0..=max_len).nondet();
         let mut log = Vec::new();
         for _ in 0..len {
             log.push(traceforge::nondet());
@@ -311,17 +371,47 @@ impl Node {
         }
     }
 
-    fn collect_any_vc_msgs(
+    fn collect_vc_msgs(
         &self,
         round: &comm_close::Round,
         collect: &RoundCollector,
         min: usize,
         max: Option<usize>,
+        current_phases: &[Phase],
     ) -> Vec<Message> {
-        // We base the filter on StartViewChange, and relax the phase comparator to accept
-        // StartViewChange/DoViewChange/StartView from this view or higher views.
-        let filter = round.filter().level_cmp(1, TagCmp::Gte);
+        // Accept only the requested phases for the current view.
+        let current_view = self.view_of(&round.stamp());
+        let mut filter = round.filter().no_base();
+        for phase in current_phases {
+            let tag = phase.tag();
+            filter = filter.or_pattern(|p| {
+                p.level_eq_value(0, current_view).level_eq_value(1, tag)
+            });
+        }
         collect(round, &filter, min, max)
+    }
+
+    fn collect_jump_msgs(
+        &self,
+        round: &comm_close::Round,
+        collect_jump: &JumpCollector,
+        min: usize,
+        max: Option<usize>,
+    ) -> Vec<RoundStamp> {
+        let current_view = self.view_of(&round.stamp());
+        let next_view = current_view.saturating_add(1);
+        let filter = round
+            .filter()
+            .no_base()
+            .or_pattern(|p| {
+                p.level_gte_value(0, next_view)
+                    .level_eq_value(1, Phase::StartViewChange.tag())
+            })
+            .or_pattern(|p| {
+                p.level_gte_value(0, next_view)
+                    .level_eq_value(1, Phase::DoViewChange.tag())
+            });
+        collect_jump(&filter, min, max)
     }
 
     fn max_view_in_mbox(&self, msgs: &[Message]) -> Option<u32> {
@@ -338,15 +428,21 @@ impl Node {
         max
     }
 
-    fn count_svc_for_view(msgs: &[Message], view: u32) -> usize {
+    fn count_phase_for_view(&self, msgs: &[Message], view: u32, phase: Phase) -> usize {
         msgs.iter()
-            .filter(|m| matches!(m, Message::StartViewChange(svc) if svc.stamp.components()[0] == view))
+            .filter(|m| match (phase, m) {
+                (Phase::StartViewChange, Message::StartViewChange(svc)) => {
+                    self.view_of(&svc.stamp) == view
+                }
+                (Phase::DoViewChange, Message::DoViewChange(dvc)) => self.view_of(&dvc.stamp) == view,
+                (Phase::StartView, Message::StartView(sv)) => self.view_of(&sv.stamp) == view,
+                _ => false,
+            })
             .count()
     }
 
-    fn has_dvc_for_view(msgs: &[Message], view: u32) -> bool {
-        msgs.iter()
-            .any(|m| matches!(m, Message::DoViewChange(dvc) if dvc.stamp.components()[0] == view))
+    fn has_phase_for_view(&self, msgs: &[Message], view: u32, phase: Phase) -> bool {
+        self.count_phase_for_view(msgs, view, phase) > 0
     }
 
     fn choose_log(msgs: &[DoViewChangeMsg]) -> Vec<bool> {
@@ -366,15 +462,20 @@ impl Node {
     fn committed_count(log: &[bool]) -> usize {
         log.iter().filter(|b| **b).count()
     }
+
 }
 
-fn start_node(collect: &RoundCollector, scheme: RoundScheme) -> Vec<LogEntry> {
+fn start_node(
+    collect: &RoundCollector,
+    collect_jump: &JumpCollector,
+    scheme: RoundScheme,
+) -> Vec<LogEntry> {
     let init: Message = traceforge::recv_tagged_msg_block(|_, tag| tag.is_none());
     let nodes = match init {
         Message::Init(nodes) => nodes,
         _ => panic!("expected init message"),
     };
-    Node::new(nodes, scheme).run(collect)
+    Node::new(nodes, scheme).run(collect, collect_jump)
 }
 
 fn assert_consistent_start_view(logs: &[Vec<LogEntry>]) {
@@ -392,7 +493,7 @@ fn assert_consistent_start_view(logs: &[Vec<LogEntry>]) {
     }
 }
 
-fn run_protocol(collect: Arc<RoundCollector>) -> traceforge::Stats {
+fn run_protocol(collect: Arc<RoundCollector>, collect_jump: Arc<JumpCollector>) -> traceforge::Stats {
     traceforge::verify(traceforge::Config::builder().build(), move || {
         // Tag layout (outer -> inner): (view, phase).
         // - view: grows monotonically, so we use Gte by default (supports jumps to higher views).
@@ -405,8 +506,9 @@ fn run_protocol(collect: Arc<RoundCollector>) -> traceforge::Stats {
         let mut handles = Vec::new();
         for _ in 0..NUM_NODES {
             let receive = collect.clone();
+            let receive_jump = collect_jump.clone();
             let scheme = scheme.clone();
-            handles.push(thread::spawn(move || start_node(receive.as_ref(), scheme)));
+            handles.push(thread::spawn(move || start_node(receive.as_ref(), receive_jump.as_ref(), scheme)));
         }
 
         let nodes = Participants::from_vec(handles.iter().map(|h| h.thread().id()).collect());
@@ -442,7 +544,21 @@ fn run_protocol_with_recv() -> traceforge::Stats {
         }
         out
     });
-    run_protocol(collect)
+    let collect_jump: Arc<JumpCollector> = Arc::new(|filter, min, max| {
+        let upper = max.unwrap_or(NUM_ROUNDS as usize * 8 * NUM_NODES);
+        let count = if upper == min {
+            min
+        } else {
+            (min..=upper).nondet()
+        };
+        let mut out = Vec::new();
+        for _ in 0..count {
+            let msg = comm_close::recv_block_with_filter::<Message>(filter);
+            out.push(msg.round_stamp());
+        }
+        out
+    });
+    run_protocol(collect, collect_jump)
 }
 
 fn run_protocol_with_inbox() -> traceforge::Stats {
@@ -458,7 +574,14 @@ fn run_protocol_with_inbox() -> traceforge::Stats {
             })
             .collect()
     });
-    run_protocol(collect)
+    let collect_jump: Arc<JumpCollector> = Arc::new(|filter, min, max| {
+        comm_close::inbox_with_bounds_filter(filter, min, max)
+            .into_iter()
+            .flatten()
+            .map(|msg| msg.round_stamp())
+            .collect()
+    });
+    run_protocol(collect, collect_jump)
 }
 
 fn main() {

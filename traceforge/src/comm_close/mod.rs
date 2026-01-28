@@ -13,6 +13,7 @@ pub use round::{
     LevelSpec, Round, RoundFilter, RoundId, RoundScheme, RoundSchemeBuilder, RoundStamp, Rounds,
     TagCmp,
 };
+use round::{LevelCond, RoundPattern};
 
 fn ensure_len(label: &str, expected: usize, actual: usize) {
     if expected != actual {
@@ -52,8 +53,60 @@ fn matches_components_with_cmp(
     true
 }
 
+fn matches_pattern(tag: &[u32], round: &[u32], pattern: &RoundPattern) -> bool {
+    ensure_len("tag", pattern.conds.len(), tag.len());
+    ensure_len("round", pattern.conds.len(), round.len());
+    for (index, cond) in pattern.conds.iter().enumerate() {
+        let ok = match cond {
+            LevelCond::Cmp(cmp) => match cmp {
+                TagCmp::Eq => tag[index] == round[index],
+                TagCmp::Gte => tag[index] >= round[index],
+            },
+            LevelCond::Eq(value) => tag[index] == *value,
+            LevelCond::Gte(value) => tag[index] >= *value,
+            LevelCond::Any => true,
+        };
+        if !ok {
+            return false;
+        }
+    }
+    true
+}
+
+fn matches_components_with_patterns(
+    scheme: &RoundScheme,
+    tag: &[u32],
+    round: &[u32],
+    cmp_overrides: &[Option<TagCmp>],
+    patterns: &[RoundPattern],
+    base_enabled: bool,
+) -> bool {
+    if base_enabled && matches_components_with_cmp(scheme, tag, round, cmp_overrides) {
+        return true;
+    }
+    for pattern in patterns {
+        if matches_pattern(tag, round, pattern) {
+            return true;
+        }
+    }
+    false
+}
+
 fn matches_components(scheme: &RoundScheme, tag: &[u32], round: &[u32]) -> bool {
     matches_components_with_cmp(scheme, tag, round, &[])
+}
+
+fn matches_components_lexicographic(tag: &[u32], round: &[u32]) -> bool {
+    ensure_len("tag", round.len(), tag.len());
+    ensure_len("round", tag.len(), round.len());
+    for (t, r) in tag.iter().zip(round.iter()) {
+        if t > r {
+            return true;
+        } else if t < r {
+            return false;
+        }
+    }
+    true
 }
 
 fn round_tag_predicate(round: &Round) -> PredicateType {
@@ -73,6 +126,8 @@ fn filter_tag_predicate(filter: &RoundFilter) -> PredicateType {
     let scheme = filter.scheme().clone();
     let round_components = filter.components().to_vec();
     let cmp_overrides = filter.cmp_overrides().to_vec();
+    let patterns = filter.patterns().to_vec();
+    let base_enabled = filter.base_enabled();
     ensure_len("round", scheme.level_count(), round_components.len());
     ensure_len(
         "comparison overrides",
@@ -84,7 +139,14 @@ fn filter_tag_predicate(filter: &RoundFilter) -> PredicateType {
             Some(tag_vec) => tag_vec,
             None => return false,
         };
-        matches_components_with_cmp(&scheme, &tag_vec, &round_components, &cmp_overrides)
+        matches_components_with_patterns(
+            &scheme,
+            &tag_vec,
+            &round_components,
+            &cmp_overrides,
+            &patterns,
+            base_enabled,
+        )
     }))
 }
 
@@ -101,6 +163,10 @@ pub struct RoundMsg<T> {
 
 impl<T> RoundMsg<T> {
     fn new(payload: T, round: RoundId) -> Self {
+        Self { payload, round }
+    }
+
+    pub fn from_parts(round: RoundId, payload: T) -> Self {
         Self { payload, round }
     }
 
@@ -125,7 +191,7 @@ impl<T> RoundMsg<T> {
     fn assert_round(&self, round: &Round) {
         round.assert_current();
         assert!(
-            matches_components(round.scheme(), self.round.components(), round.components()),
+            matches_components_lexicographic(self.round.components(), round.components()),
             "message from round {:?} is not valid in round {:?}",
             self.round,
             round.id()

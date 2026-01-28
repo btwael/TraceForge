@@ -165,6 +165,8 @@ pub struct RoundFilter {
     thread: ThreadId,
     components: Vec<u32>,
     cmp_overrides: Vec<Option<TagCmp>>,
+    patterns: Vec<RoundPattern>,
+    base_enabled: bool,
 }
 
 impl RoundFilter {
@@ -176,11 +178,27 @@ impl RoundFilter {
                 index, levels
             );
         }
-        let default_cmp = self.scheme.levels()[index].default_cmp;
-        /*if default_cmp == TagCmp::Eq && cmp == TagCmp::Gte {
+        /*let default_cmp = self.scheme.levels()[index].default_cmp;
+        if default_cmp == TagCmp::Eq && cmp == TagCmp::Gte {
             panic!("cannot relax comparison at level {}", index);
         }*/
         self.cmp_overrides[index] = Some(cmp);
+        self
+    }
+
+    pub fn or_pattern(
+        mut self,
+        f: impl FnOnce(RoundPatternBuilder) -> RoundPatternBuilder,
+    ) -> Self {
+        let builder = RoundPatternBuilder::from_filter(&self);
+        let pattern = f(builder).build();
+        self.validate_pattern(&pattern);
+        self.patterns.push(pattern);
+        self
+    }
+
+    pub fn no_base(mut self) -> Self {
+        self.base_enabled = false;
         self
     }
 
@@ -198,6 +216,14 @@ impl RoundFilter {
 
     pub(crate) fn cmp_overrides(&self) -> &[Option<TagCmp>] {
         &self.cmp_overrides
+    }
+
+    pub(crate) fn patterns(&self) -> &[RoundPattern] {
+        &self.patterns
+    }
+
+    pub(crate) fn base_enabled(&self) -> bool {
+        self.base_enabled
     }
 
     pub(crate) fn scheme(&self) -> &RoundScheme {
@@ -222,6 +248,123 @@ impl RoundFilter {
             );
         });
     }
+
+    fn validate_pattern(&self, pattern: &RoundPattern) {
+        let levels = self.scheme.level_count();
+        if pattern.conds.len() != levels {
+            panic!(
+                "pattern length {} does not match scheme levels {}",
+                pattern.conds.len(),
+                levels
+            );
+        }
+        let mut saw_greater = false;
+        for (index, cond) in pattern.conds.iter().enumerate() {
+            let current = self.components[index];
+            let min_allowed = match cond {
+                LevelCond::Cmp(_) => current,
+                LevelCond::Eq(value) => *value,
+                LevelCond::Gte(value) => *value,
+                LevelCond::Any => 0,
+            };
+            if !saw_greater {
+                if min_allowed < current {
+                    panic!(
+                        "round filter pattern at level {} allows past value {} < current {}",
+                        index, min_allowed, current
+                    );
+                } else if min_allowed > current {
+                    saw_greater = true;
+                }
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct RoundPatternBuilder {
+    conds: Vec<LevelCond>,
+}
+
+impl RoundPatternBuilder {
+    fn from_filter(filter: &RoundFilter) -> Self {
+        let conds = filter
+            .scheme
+            .levels()
+            .iter()
+            .enumerate()
+            .map(|(index, level)| {
+                let cmp = filter.cmp_overrides[index].unwrap_or(level.default_cmp);
+                LevelCond::Cmp(cmp)
+            })
+            .collect();
+        Self { conds }
+    }
+
+    pub fn level_cmp(mut self, index: usize, cmp: TagCmp) -> Self {
+        if index >= self.conds.len() {
+            panic!(
+                "level {} is out of range for {} round levels",
+                index,
+                self.conds.len()
+            );
+        }
+        self.conds[index] = LevelCond::Cmp(cmp);
+        self
+    }
+
+    pub fn level_eq_value(mut self, index: usize, value: u32) -> Self {
+        if index >= self.conds.len() {
+            panic!(
+                "level {} is out of range for {} round levels",
+                index,
+                self.conds.len()
+            );
+        }
+        self.conds[index] = LevelCond::Eq(value);
+        self
+    }
+
+    pub fn level_gte_value(mut self, index: usize, value: u32) -> Self {
+        if index >= self.conds.len() {
+            panic!(
+                "level {} is out of range for {} round levels",
+                index,
+                self.conds.len()
+            );
+        }
+        self.conds[index] = LevelCond::Gte(value);
+        self
+    }
+
+    pub fn level_any(mut self, index: usize) -> Self {
+        if index >= self.conds.len() {
+            panic!(
+                "level {} is out of range for {} round levels",
+                index,
+                self.conds.len()
+            );
+        }
+        self.conds[index] = LevelCond::Any;
+        self
+    }
+
+    fn build(self) -> RoundPattern {
+        RoundPattern { conds: self.conds }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct RoundPattern {
+    pub(crate) conds: Vec<LevelCond>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum LevelCond {
+    Cmp(TagCmp),
+    Eq(u32),
+    Gte(u32),
+    Any,
 }
 
 #[derive(Clone, Debug)]
@@ -259,6 +402,8 @@ impl Round {
             thread: self.thread,
             components: self.id.0.clone(),
             cmp_overrides: vec![None; levels],
+            patterns: Vec::new(),
+            base_enabled: true,
         }
     }
 
