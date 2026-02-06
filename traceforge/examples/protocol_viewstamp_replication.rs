@@ -1,27 +1,53 @@
-use std::collections::BTreeMap;
-use std::sync::Arc;
 
-use traceforge::comm_close::{self, RoundScheme, RoundStamp, Rounds, TagCmp};
+use traceforge::comm_close::{self, DefaultMatch, RoundScheme, RoundStamp, Rounds};
 use traceforge::thread::ThreadId;
 use traceforge::{thread, Nondet};
 
-// Keep bounds explicit and small for verification.
-const NUM_NODES: usize = 4;
-const NUM_ROUNDS: u32 = 3;
-
-// C code waits for n/2 replies; primary counts itself implicitly.
-const QUORUM: usize = NUM_NODES / 2;
+const DEFAULT_NUM_NODES: usize = 3;
+const DEFAULT_MAX_VIEWS: u32 = 1;
+const DEFAULT_MAX_OPS: u32 = 1;
+const MAX_VALUE: u32 = 2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReceiveMode {
+    Recv,
+    Inbox,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, traceforge::RoundKey)]
+enum Key {
+    View,
+    Kind,
+    VcRound,
+    Op,
+    OpRound,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, traceforge::RoundEnum)]
+enum Kind {
+    ViewChange,
+    Normal,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, traceforge::RoundEnum)]
+enum VcRound {
+    DoViewChange,
+    StartView,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, traceforge::RoundEnum)]
+enum OpRound {
+    Prepare,
+    PrepareOk,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct Participants {
-    nodes: [ThreadId; NUM_NODES],
+    nodes: Vec<ThreadId>,
 }
 
 impl Participants {
     fn from_vec(nodes: Vec<ThreadId>) -> Self {
-        let nodes: [ThreadId; NUM_NODES] = nodes
-            .try_into()
-            .unwrap_or_else(|_| panic!("expected {} participants", NUM_NODES));
         Self { nodes }
     }
 
@@ -33,467 +59,506 @@ impl Participants {
         self.nodes.iter()
     }
 
-    fn get(&self, idx: usize) -> ThreadId {
+    fn primary_for_view(&self, view: u32) -> ThreadId {
+        let idx = (view as usize) % self.nodes.len();
         self.nodes[idx]
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Phase {
-    DoViewChange,
-    StartView,
-    Prepare,
-    PrepareOk,
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct LogEntry {
-    view: u32,
-    op_number: u32,
+    value: u32,
     committed: bool,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct DoViewChangeMsg {
-    stamp: RoundStamp,
-    replica: ThreadId,
-    log: Vec<LogEntry>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct StartViewMsg {
-    stamp: RoundStamp,
-    primary: ThreadId,
-    log: Vec<LogEntry>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct PrepareMsg {
-    stamp: RoundStamp,
-    view: u32,
-    op_number: u32,
-    has_request: bool,
-    commit_hint: Option<u32>,
-    sender: ThreadId,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct PrepareOkMsg {
-    stamp: RoundStamp,
-    view: u32,
-    op_number: u32,
-    sender: ThreadId,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Message {
     Init(Participants),
-    DoViewChange(DoViewChangeMsg),
-    StartView(StartViewMsg),
-    Prepare(PrepareMsg),
-    PrepareOk(PrepareOkMsg),
-}
 
-type RoundCollector = dyn Fn(
-        &comm_close::Round,
-        &comm_close::RoundFilter,
-        usize,
-        Option<usize>,
-    ) -> Vec<Message>
-    + Send
-    + Sync;
+    // View change.
+    DoViewChange {
+        view: u32,
+        sender: ThreadId,
+        log: Vec<LogEntry>,
+    },
+    StartView {
+        view: u32,
+        sender: ThreadId,
+        log: Vec<LogEntry>,
+    },
+
+    // Normal operation.
+    Prepare {
+        view: u32,
+        op: u32,
+        value: u32,
+        sender: ThreadId,
+        commit_hint: Option<(u32, u32)>,
+    },
+    PrepareOk {
+        view: u32,
+        op: u32,
+        sender: ThreadId,
+    },
+}
 
 struct Node {
     nodes: Participants,
     me: ThreadId,
     rounds: Rounds,
+    mode: ReceiveMode,
+
+    // Replicated log.
     log: Vec<LogEntry>,
-    op_number: u32,
+
+    max_views: u32,
+    max_ops: u32,
+
     started: bool,
 }
 
 impl Node {
-    fn new(nodes: Participants, scheme: RoundScheme) -> Self {
+    fn new(nodes: Participants, scheme: RoundScheme, max_views: u32, max_ops: u32, mode: ReceiveMode) -> Self {
         let me = thread::current().id();
         let rounds = Rounds::with_scheme(scheme);
         Self {
             nodes,
             me,
             rounds,
+            mode,
             log: Vec::new(),
-            op_number: 0,
+            max_views,
+            max_ops,
             started: false,
         }
     }
 
-    fn run(mut self, collect: &RoundCollector) -> Vec<LogEntry> {
-        for _ in 0..NUM_ROUNDS {
-            self.step_view(collect);
+    fn run(mut self) -> Vec<LogEntry> {
+        // As in the C spec: we keep trying view changes until one view is established.
+        // Then we run a bounded number of normal operations, unless we trigger a view change again.
+        while self.rounds.current().get_u32(Key::View) < self.max_views {
+            if !self.do_view_change() {
+                continue;
+            }
+            if self.do_normal_ops() {
+                break;
+            }
+            // do_normal_ops may advance the view on failure; retry.
         }
         self.log
     }
 
-    fn step_view(&mut self, collect: &RoundCollector) {
-        let dvc_round = self.next_view();
-        let view = self.view_of(&dvc_round.stamp());
-        let primary = self.primary_for_view(view);
+    /// Executes one view-change attempt. Returns true if the view is established and we enter normal mode.
+    fn do_view_change(&mut self) -> bool {
+        let view_round = self.next_view_round();
+        let view = view_round.get_u32(Key::View);
+        let primary = self.nodes.primary_for_view(view);
+        let quorum = self.nodes.len() / 2 + 1;
 
-        if self.me != primary {
-            let msg = DoViewChangeMsg {
-                stamp: dvc_round.stamp(),
-                replica: self.me,
-                log: self.log.clone(),
-            };
-            comm_close::send(primary, Message::DoViewChange(msg), &dvc_round);
-        }
-
-        if self.me == primary {
-            let mut logs = vec![self.log.clone()];
-            let recvd = self.collect_do_view_change(&dvc_round, collect, 0, Some(NUM_NODES * 2));
-            for msg in recvd {
-                logs.push(msg.log);
-            }
-            if logs.len().saturating_sub(1) < QUORUM {
-                self.rounds.advance_round();
-                return;
-            }
-            self.log = Self::choose_log(&logs);
-        }
-
-        let sv_round = self.rounds.advance_level(1);
-        if self.me == primary {
-            let msg = StartViewMsg {
-                stamp: sv_round.stamp(),
-                primary: self.me,
-                log: self.log.clone(),
-            };
-            self.broadcast(&sv_round, Message::StartView(msg));
-        } else {
-            let mut msgs = self.collect_start_view(&sv_round, collect, 0, Some(1));
-            if let Some(msg) = msgs.pop() {
-                self.log = msg.log;
-                self.sync_op_number();
-            } else {
-                self.rounds.advance_round();
-                return;
-            }
-        }
-
-        let prepare_round = self.rounds.advance_level(1);
-        let mut prepared_op: Option<u32> = None;
-        if self.me == primary {
-            let has_request = traceforge::nondet();
-            let op_number = self.op_number;
-            let msg = PrepareMsg {
-                stamp: prepare_round.stamp(),
+        // DoViewChange: everyone sends their log to the new primary.
+        comm_close::send(
+            primary,
+            Message::DoViewChange {
                 view,
-                op_number,
-                has_request,
-                commit_hint: self.last_committed_op(),
                 sender: self.me,
-            };
-            if has_request {
-                self.log.push(LogEntry {
+                log: self.log.clone(),
+            },
+        );
+
+        if self.me == primary {
+            // Primary collects DoViewChange messages.
+            let do_vc_round = self.rounds.current();
+            let mbox = self.collect_do_view_change(&do_vc_round, 0, self.nodes.len());
+
+            if mbox.len() < quorum {
+                // Timeout -> next view.
+                self.rounds.advance(Key::View);
+                return false;
+            }
+
+            // Choose the log with the most committed entries (tie-breaker: longest).
+            let mut best = self.log.clone();
+            for (m, _) in &mbox {
+                if let Message::DoViewChange { log, .. } = m {
+                    if Self::better_log(log, &best) {
+                        best = log.clone();
+                    }
+                }
+            }
+            self.log = best;
+
+            // StartView: broadcast chosen log.
+            let _start_view_round = self.rounds.advance(Key::VcRound);
+            self.broadcast(Message::StartView {
+                view,
+                sender: self.me,
+                log: self.log.clone(),
+            });
+
+            // Switch to Normal mode.
+            let _normal_round = self.rounds.advance(Key::Kind);
+            self.rounds.goto_u32(Key::Op, self.log.len() as u32);
+            true
+        } else {
+            // Backup waits for StartView.
+            let _start_view_round = self.rounds.advance(Key::VcRound);
+            let mbox = self.collect_start_view(&self.rounds.current(), 0, 1);
+            if mbox.len() != 1 {
+                self.rounds.advance(Key::View);
+                return false;
+            }
+
+            let (msg, stamp) = &mbox[0];
+            self.rounds.jump(stamp);
+
+            match msg {
+                Message::StartView { log, .. } => {
+                    self.log = log.clone();
+                }
+                _ => panic!("expected StartView"),
+            }
+
+            let _normal_round = self.rounds.advance(Key::Kind);
+            self.rounds.goto_u32(Key::Op, self.log.len() as u32);
+            true
+        }
+    }
+
+    fn do_normal_ops(&mut self) -> bool {
+        let mut stable = true;
+        let view = self.rounds.current().get_u32(Key::View);
+        let primary = self.nodes.primary_for_view(view);
+        let quorum = self.nodes.len() / 2 + 1;
+
+        for _ in 0..self.max_ops {
+            let r = self.rounds.current();
+            let op = r.get_u32(Key::Op);
+
+            if self.me == primary {
+                // Prepare: propose a new operation value.
+                let value = (0..=MAX_VALUE as usize).nondet() as u32;
+                self.ensure_op_value(op, value);
+
+                let commit_hint = self.last_committed_pair();
+
+                self.broadcast(Message::Prepare {
                     view,
-                    op_number,
-                    committed: false,
+                    op,
+                    value,
+                    sender: self.me,
+                    commit_hint,
                 });
-                self.op_number += 1;
-                prepared_op = Some(op_number);
-            }
-            self.broadcast(&prepare_round, Message::Prepare(msg));
-        } else {
-            let mut msgs = self.collect_prepare(&prepare_round, collect, 0, Some(1));
-            let msg = match msgs.pop() {
-                Some(msg) => msg,
-                None => {
-                    self.rounds.advance_round();
-                    return;
+
+                // PrepareOk: collect a quorum.
+                let _ok_round = self.rounds.advance(Key::OpRound);
+
+                // Count leader itself.
+                comm_close::send(
+                    primary,
+                    Message::PrepareOk {
+                        view,
+                        op,
+                        sender: self.me,
+                    },
+                );
+
+                let oks = self.collect_prepare_ok(&self.rounds.current(), 0, self.nodes.len());
+                if oks.len() >= quorum {
+                    self.mark_committed(op);
+                    self.rounds.advance(Key::Op);
+                } else {
+                    // Failed to commit -> trigger a view change (advance view) and stop normal ops.
+                    stable = false;
+                    self.rounds.advance(Key::View);
+                    break;
                 }
-            };
-            if let Some(commit) = msg.commit_hint {
-                self.mark_committed(commit);
-            }
-            if msg.has_request && msg.op_number == self.op_number {
-                self.log.push(LogEntry {
-                    view: msg.view,
-                    op_number: msg.op_number,
-                    committed: false,
-                });
-                self.op_number += 1;
-                prepared_op = Some(msg.op_number);
+            } else {
+                // Backup: receive Prepare (allow op >= current to catch up).
+                let prepares = self.collect_prepare(&r, 0, self.nodes.len());
+                let chosen = prepares
+                    .into_iter()
+                    .find(|(m, _)| matches!(m, Message::Prepare { sender, .. } if *sender == primary));
+
+                let Some((msg, stamp)) = chosen else {
+                    stable = false;
+                    self.rounds.advance(Key::View);
+                    break;
+                };
+
+                let (op, value, commit_hint) = match msg {
+                    Message::Prepare { op, value, commit_hint, .. } => (op, value, commit_hint),
+                    _ => panic!("expected Prepare"),
+                };
+
+                self.rounds.jump(&stamp);
+                self.ensure_op_value(op, value);
+                if let Some((committed_op, committed_value)) = commit_hint {
+                    self.ensure_op_value(committed_op, committed_value);
+                    self.mark_committed(committed_op);
+                }
+
+                // Send PrepareOk.
+                let _ok_round = self.rounds.advance(Key::OpRound);
+                comm_close::send(
+                    primary,
+                    Message::PrepareOk {
+                        view,
+                        op,
+                        sender: self.me,
+                    },
+                );
+
+                // Next op.
+                self.rounds.advance(Key::Op);
             }
         }
-
-        let prepare_ok_round = self.rounds.advance_level(1);
-        if self.me == primary {
-            if let Some(op_number) = prepared_op {
-                let recvd =
-                    self.collect_prepare_ok(&prepare_ok_round, collect, 0, Some(NUM_NODES * 2));
-                let ok_count = recvd
-                    .iter()
-                    .filter(|msg| msg.op_number == op_number)
-                    .count();
-                if ok_count >= QUORUM {
-                    self.mark_committed(op_number);
-                }
-            }
-        } else if let Some(op_number) = prepared_op {
-            let msg = PrepareOkMsg {
-                stamp: prepare_ok_round.stamp(),
-                view,
-                op_number,
-                sender: self.me,
-            };
-            comm_close::send(primary, Message::PrepareOk(msg), &prepare_ok_round);
-        }
-
-        self.rounds.advance_round();
+        stable
     }
 
-    fn next_view(&mut self) -> comm_close::Round {
-        if self.started {
-            self.rounds.advance_round()
-        } else {
+    fn next_view_round(&mut self) -> comm_close::Round {
+        if !self.started {
             self.started = true;
-            self.rounds.current()
         }
+        // The RoundScheme resets (Kind/VcRound/Op/OpRound) automatically when we advance `View`.
+        self.rounds.current()
     }
 
-    fn view_of(&self, stamp: &RoundStamp) -> u32 {
-        stamp.components()[0]
-    }
-
-    fn primary_for_view(&self, view: u32) -> ThreadId {
-        let idx = (view as usize) % self.nodes.len();
-        self.nodes.get(idx)
-    }
-
-    fn broadcast(&self, round: &comm_close::Round, msg: Message) {
+    fn broadcast(&self, msg: Message) {
         for node in self.nodes.iter() {
-            if *node != self.me {
-                comm_close::send(*node, msg.clone(), round);
+            comm_close::send(*node, msg.clone());
+        }
+    }
+
+    fn ensure_op_value(&mut self, op: u32, value: u32) {
+        let idx = op as usize;
+        while self.log.len() <= idx {
+            self.log.push(LogEntry { value: 0, committed: false });
+        }
+        self.log[idx].value = value;
+    }
+
+    fn mark_committed(&mut self, op: u32) {
+        let idx = op as usize;
+        if idx < self.log.len() {
+            self.log[idx].committed = true;
+        }
+    }
+
+    fn last_committed_pair(&self) -> Option<(u32, u32)> {
+        for (i, e) in self.log.iter().enumerate().rev() {
+            if e.committed {
+                return Some((i as u32, e.value));
             }
         }
+        None
     }
 
-    fn sync_op_number(&mut self) {
-        let next = self
-            .log
-            .iter()
-            .map(|e| e.op_number)
-            .max()
-            .map(|v| v + 1)
-            .unwrap_or(0);
-        self.op_number = next;
-    }
-
-    fn last_committed_op(&self) -> Option<u32> {
-        self.log
-            .iter()
-            .filter(|e| e.committed)
-            .map(|e| e.op_number)
-            .max()
-    }
-
-    fn mark_committed(&mut self, op_number: u32) {
-        if let Some(entry) = self.log.iter_mut().find(|e| e.op_number == op_number) {
-            entry.committed = true;
+    fn better_log(candidate: &[LogEntry], current: &[LogEntry]) -> bool {
+        let cand_committed = candidate.iter().filter(|e| e.committed).count();
+        let curr_committed = current.iter().filter(|e| e.committed).count();
+        if cand_committed != curr_committed {
+            return cand_committed > curr_committed;
         }
-    }
-
-    fn choose_log(logs: &[Vec<LogEntry>]) -> Vec<LogEntry> {
-        let mut best = logs[0].clone();
-        let mut best_committed = Self::committed_count(&best);
-        for log in logs.iter().skip(1) {
-            let count = Self::committed_count(log);
-            if count > best_committed {
-                best = log.clone();
-                best_committed = count;
-            }
-        }
-        best
-    }
-
-    fn committed_count(log: &[LogEntry]) -> usize {
-        log.iter().filter(|e| e.committed).count()
+        candidate.len() > current.len()
     }
 
     fn collect_do_view_change(
         &self,
         round: &comm_close::Round,
-        collect: &RoundCollector,
         min: usize,
-        max: Option<usize>,
-    ) -> Vec<DoViewChangeMsg> {
-        let filter = round.filter();
-        collect(round, &filter, min, max)
+        max: usize,
+    ) -> Vec<(Message, RoundStamp)> {
+        let filter = round
+            .filter()
+            .level_cmp(Key::View, DefaultMatch::Eq)
+            .level_cmp(Key::Kind, DefaultMatch::Eq)
+            .level_cmp(Key::VcRound, DefaultMatch::Eq);
+        self.collect_messages_with_filter(round, &filter, min, max)
             .into_iter()
-            .filter_map(|msg| match msg {
-                Message::DoViewChange(payload) => Some(payload),
-                _ => panic!("expected DoViewChangeMsg"),
-            })
+            .filter(|(m, _)| matches!(m, Message::DoViewChange { .. }))
             .collect()
     }
 
     fn collect_start_view(
         &self,
         round: &comm_close::Round,
-        collect: &RoundCollector,
         min: usize,
-        max: Option<usize>,
-    ) -> Vec<StartViewMsg> {
-        let filter = round.filter();
-        collect(round, &filter, min, max)
+        max: usize,
+    ) -> Vec<(Message, RoundStamp)> {
+        let filter = round
+            .filter()
+            .level_cmp(Key::View, DefaultMatch::Eq)
+            .level_cmp(Key::Kind, DefaultMatch::Eq)
+            .level_cmp(Key::VcRound, DefaultMatch::Eq);
+        self.collect_messages_with_filter(round, &filter, min, max)
             .into_iter()
-            .filter_map(|msg| match msg {
-                Message::StartView(payload) => Some(payload),
-                _ => panic!("expected StartViewMsg"),
-            })
+            .filter(|(m, _)| matches!(m, Message::StartView { .. }))
             .collect()
     }
 
     fn collect_prepare(
         &self,
         round: &comm_close::Round,
-        collect: &RoundCollector,
         min: usize,
-        max: Option<usize>,
-    ) -> Vec<PrepareMsg> {
-        let filter = round.filter();
-        collect(round, &filter, min, max)
+        max: usize,
+    ) -> Vec<(Message, RoundStamp)> {
+        let filter = round
+            .filter()
+            .level_cmp(Key::View, DefaultMatch::Eq)
+            .level_cmp(Key::Kind, DefaultMatch::Eq)
+            .level_cmp(Key::Op, DefaultMatch::Gte)
+            .level_cmp(Key::OpRound, DefaultMatch::Eq);
+        self.collect_messages_with_filter(round, &filter, min, max)
             .into_iter()
-            .filter_map(|msg| match msg {
-                Message::Prepare(payload) => Some(payload),
-                _ => panic!("expected PrepareMsg"),
-            })
+            .filter(|(m, _)| matches!(m, Message::Prepare { .. }))
             .collect()
     }
 
     fn collect_prepare_ok(
         &self,
         round: &comm_close::Round,
-        collect: &RoundCollector,
         min: usize,
-        max: Option<usize>,
-    ) -> Vec<PrepareOkMsg> {
-        let filter = round.filter();
-        collect(round, &filter, min, max)
+        max: usize,
+    ) -> Vec<Message> {
+        let filter = round
+            .filter()
+            .level_cmp(Key::View, DefaultMatch::Eq)
+            .level_cmp(Key::Kind, DefaultMatch::Eq)
+            .level_cmp(Key::Op, DefaultMatch::Eq)
+            .level_cmp(Key::OpRound, DefaultMatch::Eq);
+        self.collect_messages_with_filter(round, &filter, min, max)
             .into_iter()
-            .filter_map(|msg| match msg {
-                Message::PrepareOk(payload) => Some(payload),
-                _ => panic!("expected PrepareOkMsg"),
-            })
+            .map(|(m, _)| m)
+            .filter(|m| matches!(m, Message::PrepareOk { .. }))
             .collect()
     }
-}
 
-fn start_node(collect: &RoundCollector, scheme: RoundScheme) -> Vec<LogEntry> {
-    let init: Message = traceforge::recv_tagged_msg_block(|_, tag| tag.is_none());
-    let nodes = match init {
-        Message::Init(nodes) => nodes,
-        _ => panic!("expected init message"),
-    };
-    Node::new(nodes, scheme).run(collect)
-}
-
-fn assert_consistent_commits(logs: &[Vec<LogEntry>]) {
-    let mut by_view: BTreeMap<u32, Option<u32>> = BTreeMap::new();
-    for log in logs {
-        for entry in log.iter().filter(|e| e.committed) {
-            let slot = by_view.entry(entry.view).or_insert(None);
-            if let Some(prev) = *slot {
-                assert_eq!(prev, entry.op_number);
-            } else {
-                *slot = Some(entry.op_number);
+    fn collect_messages_with_filter(
+        &self,
+        round: &comm_close::Round,
+        filter: &comm_close::RoundFilter,
+        min: usize,
+        max: usize,
+    ) -> Vec<(Message, RoundStamp)> {
+        assert!(max >= min, "requires max >= min");
+        match self.mode {
+            ReceiveMode::Recv => {
+                let mut out = Vec::new();
+                let count = if max == min { min } else { (min..=max).nondet() };
+                for _ in 0..count {
+                    let msg = comm_close::recv_block_with_filter::<Message>(filter);
+                    out.push((msg.payload(round).clone(), msg.round_stamp()));
+                }
+                out
+            }
+            ReceiveMode::Inbox => {
+                let msgs = comm_close::inbox_with_bounds_filter(filter, min, Some(max));
+                let mut out = Vec::new();
+                for msg in msgs.into_iter().flatten() {
+                    let payload = msg
+                        .payload(round)
+                        .as_any_ref()
+                        .downcast_ref::<Message>()
+                        .cloned()
+                        .expect("expected Message payload");
+                    out.push((payload, msg.round_stamp()));
+                }
+                out
             }
         }
     }
 }
 
-fn run_protocol(collect: Arc<RoundCollector>) -> traceforge::Stats {
+fn start_node(scheme: RoundScheme, max_views: u32, max_ops: u32, mode: ReceiveMode) -> Vec<LogEntry> {
+    let init: Message = traceforge::recv_tagged_msg_block(|_, tag| tag.is_none());
+    let nodes = match init {
+        Message::Init(nodes) => nodes,
+        _ => panic!("expected init message"),
+    };
+    Node::new(nodes, scheme, max_views, max_ops, mode).run()
+}
+
+fn assert_committed_consistency(logs: &[Vec<LogEntry>]) {
+    let max_len = logs.iter().map(|l| l.len()).max().unwrap_or(0);
+    for idx in 0..max_len {
+        let mut chosen: Option<u32> = None;
+        for log in logs {
+            if let Some(entry) = log.get(idx) {
+                if entry.committed {
+                    if let Some(prev) = chosen {
+                        assert_eq!(prev, entry.value);
+                    } else {
+                        chosen = Some(entry.value);
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn run_protocol(num_nodes: usize, max_views: u32, max_ops: u32, mode: ReceiveMode) -> traceforge::Stats {
     traceforge::verify(traceforge::Config::builder().build(), move || {
-        // Tag layout (outer -> inner): (view, phase).
-        // - view: use Eq to keep messages scoped to the current view.
-        // - phase: steps within a view.
         let scheme = RoundScheme::builder()
-            .level("view", TagCmp::Eq)
-            .level("phase", TagCmp::Eq)
+            .from_u32(Key::View)
+            .from_enum::<Kind>(Key::Kind)
+            .from_enum::<VcRound>(Key::VcRound)
+            .from_u32(Key::Op)
+            .from_enum::<OpRound>(Key::OpRound)
             .build();
 
         let mut handles = Vec::new();
-        for _ in 0..NUM_NODES {
-            let receive = collect.clone();
+        for _ in 0..num_nodes {
             let scheme = scheme.clone();
-            handles.push(thread::spawn(move || start_node(receive.as_ref(), scheme)));
+            let mode = mode;
+            handles.push(thread::spawn(move || start_node(scheme, max_views, max_ops, mode)));
         }
 
         let nodes = Participants::from_vec(handles.iter().map(|h| h.thread().id()).collect());
         for handle in &handles {
-            traceforge::send_msg(handle.thread().id(), Message::Init(nodes));
+            traceforge::send_msg(handle.thread().id(), Message::Init(nodes.clone()));
         }
 
         let mut logs = Vec::new();
         for handle in handles {
             logs.push(handle.join().unwrap());
         }
-        assert_consistent_commits(&logs);
+
+        assert_committed_consistency(&logs);
     })
 }
 
-fn run_protocol_with_recv() -> traceforge::Stats {
-    let collect: Arc<RoundCollector> = Arc::new(|round, filter, min, max| {
-        let upper = match max {
-            Some(upper) => upper,
-            None => (NUM_ROUNDS as usize) * 8 * NUM_NODES,
-        };
-        assert!(upper >= min, "requires max >= min");
-        let count = if upper == min {
-            min
+fn parse_args() -> (usize, u32, u32, ReceiveMode) {
+    let mut num_nodes = DEFAULT_NUM_NODES;
+    let mut views = DEFAULT_MAX_VIEWS;
+    let mut ops = DEFAULT_MAX_OPS;
+    let mut mode: Option<ReceiveMode> = None;
+
+    let mut args = std::env::args().skip(1).peekable();
+    while let Some(arg) = args.next() {
+        if arg == "recv" {
+            mode = Some(ReceiveMode::Recv);
+        } else if arg == "inbox" {
+            mode = Some(ReceiveMode::Inbox);
+        } else if arg == "--nodes" {
+            let value = args.next().unwrap_or_else(|| panic!("--nodes requires a value"));
+            num_nodes = value.parse().unwrap_or_else(|_| panic!("invalid --nodes value: {}", value));
+        } else if arg == "--views" {
+            let value = args.next().unwrap_or_else(|| panic!("--views requires a value"));
+            views = value.parse().unwrap_or_else(|_| panic!("invalid --views value: {}", value));
+        } else if arg == "--ops" {
+            let value = args.next().unwrap_or_else(|| panic!("--ops requires a value"));
+            ops = value.parse().unwrap_or_else(|_| panic!("invalid --ops value: {}", value));
         } else {
-            (min..=upper).nondet()
-        };
-
-        let mut out = Vec::new();
-        for _ in 0..count {
-            let msg = comm_close::recv_block_with_filter::<Message>(filter);
-            out.push(msg.payload(round).clone());
+            panic!("unknown argument: {}", arg);
         }
-        out
-    });
-    run_protocol(collect)
-}
+    }
 
-fn run_protocol_with_inbox() -> traceforge::Stats {
-    let collect: Arc<RoundCollector> = Arc::new(|round, filter, min, max| {
-        comm_close::inbox_with_bounds_filter(filter, min, max)
-            .into_iter()
-            .flatten()
-            .filter_map(|msg| {
-                msg.payload(round)
-                    .as_any_ref()
-                    .downcast_ref::<Message>()
-                    .cloned()
-            })
-            .collect()
-    });
-    run_protocol(collect)
+    let mode = mode.unwrap_or_else(|| panic!("Must specify recv or inbox!"));
+    (num_nodes, views, ops, mode)
 }
 
 fn main() {
-    let use_recv = std::env::args().any(|arg| arg == "recv");
-    let use_inbox = std::env::args().any(|arg| arg == "inbox");
-
-    if use_recv && use_inbox {
-        panic!("Can't use recv/inbox at the same time!");
-    } else if !use_recv && !use_inbox {
-        panic!("Must specify recv or inbox!");
-    }
-
-    let stats = if use_recv {
-        run_protocol_with_recv()
-    } else {
-        run_protocol_with_inbox()
-    };
+    let (num_nodes, views, ops, mode) = parse_args();
+    let stats = run_protocol(num_nodes, views, ops, mode);
     println!("Stats = {}, {}", stats.execs, stats.block);
 }

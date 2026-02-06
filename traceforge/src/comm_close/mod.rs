@@ -1,181 +1,28 @@
+pub mod round;
+
+pub use round::{
+    EnumCodec, EnumLevelBuilder, LevelKind, LevelSpec, Round, RoundEnum, RoundKey, RoundScheme,
+    RoundSchemeBuilder, RoundStamp, RoundStampView, RoundOrder, Rounds, DefaultMatch,
+    DefaultFilter, U32LevelBuilder,
+};
+
+use crate::channel::{self_loc_comm, thread_loc_comm};
+use crate::msg::{Message, Val};
+use crate::predicate::PredicateType;
+use crate::thread::ThreadId;
 use std::any::type_name;
 use std::iter;
 use std::sync::Arc;
 
-use crate::channel::{self_loc_comm, thread_loc_comm};
-use crate::msg::Message;
-use crate::predicate::PredicateType;
-use crate::thread::ThreadId;
-use crate::Val;
-
-pub mod round;
-pub use round::{
-    LevelSpec, Round, RoundFilter, RoundId, RoundScheme, RoundSchemeBuilder, RoundStamp, Rounds,
-    TagCmp,
-};
-use round::{LevelCond, RoundPattern};
-
-fn ensure_len(label: &str, expected: usize, actual: usize) {
-    if expected != actual {
-        panic!(
-            "{} length {} does not match scheme levels {}",
-            label, actual, expected
-        );
-    }
-}
-
-fn matches_components_with_cmp(
-    scheme: &RoundScheme,
-    tag: &[u32],
-    round: &[u32],
-    cmp_overrides: &[Option<TagCmp>],
-) -> bool {
-    let expected = scheme.level_count();
-    ensure_len("tag", expected, tag.len());
-    ensure_len("round", expected, round.len());
-    if !cmp_overrides.is_empty() {
-        ensure_len("comparison overrides", expected, cmp_overrides.len());
-    }
-    for (index, level) in scheme.levels().iter().enumerate() {
-        let cmp = if cmp_overrides.is_empty() {
-            level.default_cmp
-        } else {
-            cmp_overrides[index].unwrap_or(level.default_cmp)
-        };
-        let ok = match cmp {
-            TagCmp::Eq => tag[index] == round[index],
-            TagCmp::Gte => tag[index] >= round[index],
-        };
-        if !ok {
-            return false;
-        }
-    }
-    true
-}
-
-fn matches_pattern(tag: &[u32], round: &[u32], pattern: &RoundPattern) -> bool {
-    ensure_len("tag", pattern.conds.len(), tag.len());
-    ensure_len("round", pattern.conds.len(), round.len());
-    for (index, cond) in pattern.conds.iter().enumerate() {
-        let ok = match cond {
-            LevelCond::Cmp(cmp) => match cmp {
-                TagCmp::Eq => tag[index] == round[index],
-                TagCmp::Gte => tag[index] >= round[index],
-            },
-            LevelCond::Eq(value) => tag[index] == *value,
-            LevelCond::Gte(value) => tag[index] >= *value,
-            LevelCond::Any => true,
-        };
-        if !ok {
-            return false;
-        }
-    }
-    true
-}
-
-fn matches_components_with_patterns(
-    scheme: &RoundScheme,
-    tag: &[u32],
-    round: &[u32],
-    cmp_overrides: &[Option<TagCmp>],
-    patterns: &[RoundPattern],
-    base_enabled: bool,
-) -> bool {
-    if base_enabled && matches_components_with_cmp(scheme, tag, round, cmp_overrides) {
-        return true;
-    }
-    for pattern in patterns {
-        if matches_pattern(tag, round, pattern) {
-            return true;
-        }
-    }
-    false
-}
-
-fn matches_components(scheme: &RoundScheme, tag: &[u32], round: &[u32]) -> bool {
-    matches_components_with_cmp(scheme, tag, round, &[])
-}
-
-fn matches_components_lexicographic(tag: &[u32], round: &[u32]) -> bool {
-    ensure_len("tag", round.len(), tag.len());
-    ensure_len("round", tag.len(), round.len());
-    for (t, r) in tag.iter().zip(round.iter()) {
-        if t > r {
-            return true;
-        } else if t < r {
-            return false;
-        }
-    }
-    true
-}
-
-fn round_tag_predicate(round: &Round) -> PredicateType {
-    let scheme = round.scheme().clone();
-    let round_components = round.components().to_vec();
-    ensure_len("round", scheme.level_count(), round_components.len());
-    PredicateType(Arc::new(move |_tid, tag| {
-        let tag_vec = match tag {
-            Some(tag_vec) => tag_vec,
-            None => return false,
-        };
-        matches_components(&scheme, &tag_vec, &round_components)
-    }))
-}
-
-fn filter_tag_predicate(filter: &RoundFilter) -> PredicateType {
-    let scheme = filter.scheme().clone();
-    let round_components = filter.components().to_vec();
-    let cmp_overrides = filter.cmp_overrides().to_vec();
-    let patterns = filter.patterns().to_vec();
-    let base_enabled = filter.base_enabled();
-    ensure_len("round", scheme.level_count(), round_components.len());
-    ensure_len(
-        "comparison overrides",
-        scheme.level_count(),
-        cmp_overrides.len(),
-    );
-    PredicateType(Arc::new(move |_tid, tag| {
-        let tag_vec = match tag {
-            Some(tag_vec) => tag_vec,
-            None => return false,
-        };
-        matches_components_with_patterns(
-            &scheme,
-            &tag_vec,
-            &round_components,
-            &cmp_overrides,
-            &patterns,
-            base_enabled,
-        )
-    }))
-}
-
-impl Rounds {
-    pub fn advance(&mut self) -> Round {
-        self.advance_round()
-    }
-}
-
+#[derive(Clone, Debug, PartialEq)]
 pub struct RoundMsg<T> {
     payload: T,
-    round: RoundId,
+    stamp: RoundStamp,
 }
 
 impl<T> RoundMsg<T> {
-    fn new(payload: T, round: RoundId) -> Self {
-        Self { payload, round }
-    }
-
-    pub fn from_parts(round: RoundId, payload: T) -> Self {
-        Self { payload, round }
-    }
-
-    pub fn round_id(&self) -> RoundId {
-        self.round.clone()
-    }
-
-    pub fn round_stamp(&self) -> RoundStamp {
-        RoundStamp::from(&self.round)
+    fn new(payload: T, stamp: RoundStamp) -> Self {
+        Self { payload, stamp }
     }
 
     pub fn payload(&self, round: &Round) -> &T {
@@ -188,31 +35,129 @@ impl<T> RoundMsg<T> {
         f(&self.payload)
     }
 
+    pub fn stamp(&self) -> &RoundStamp {
+        &self.stamp
+    }
+
+    pub fn round_stamp(&self) -> RoundStamp {
+        self.stamp.clone()
+    }
+
     fn assert_round(&self, round: &Round) {
         round.assert_current();
+        let tag = self.stamp.components();
+        let current = round.components();
+        ensure_len("message round", current.len(), tag.len());
         assert!(
-            matches_components_lexicographic(self.round.components(), round.components()),
+            matches_components_lexicographic(tag, current),
             "message from round {:?} is not valid in round {:?}",
-            self.round,
-            round.id()
+            self.stamp,
+            round.components()
         );
     }
 }
 
-pub fn send<T: Message + 'static>(tid: ThreadId, msg: T, round: &Round) {
-    round.assert_current();
-    let tagged = TaggedVal::new(round.id().clone(), Val::new(msg));
-    let tag = round.components().to_vec();
-    let (loc, comm) = thread_loc_comm(tid);
-    crate::send_msg_with_tag_vec(tagged, Some(tag), &loc, comm, false);
+#[derive(Clone)]
+pub struct RoundFilter {
+    scheme: Arc<RoundScheme>,
+    components: Vec<u32>,
+    base_matches: Vec<DefaultMatch>,
+    cmp_overrides: Vec<Option<DefaultMatch>>,
+    order: RoundOrder,
 }
 
-pub fn send_lossy<T: Message + 'static>(tid: ThreadId, msg: T, round: &Round) {
+impl RoundFilter {
+    fn new(scheme: Arc<RoundScheme>, components: Vec<u32>) -> Self {
+        let level_count = scheme.levels().len();
+        let (order, base_matches) = match scheme.default_filter() {
+            Some(filter) => (filter.order(), filter.matches().to_vec()),
+            None => (
+                scheme.default_round_order(),
+                vec![DefaultMatch::Any; level_count],
+            ),
+        };
+        Self {
+            scheme,
+            components,
+            base_matches,
+            cmp_overrides: vec![None; level_count],
+            order,
+        }
+    }
+
+    pub fn level_cmp<K: RoundKey>(mut self, key: K, cmp: DefaultMatch) -> Self {
+        let index = self.scheme.key_position(key);
+        self.cmp_overrides[index] = Some(cmp);
+        self
+    }
+
+    pub fn round_order(mut self, order: RoundOrder) -> Self {
+        self.order = order;
+        self
+    }
+
+    fn assert_current(&self) {
+        let current = round::current_round_stamp_for_send();
+        assert!(
+            self.components == current.components(),
+            "round filter {:?} is not the current round {:?}",
+            self.components,
+            current.components()
+        );
+    }
+
+    fn scheme(&self) -> &RoundScheme {
+        &self.scheme
+    }
+
+    fn components(&self) -> &[u32] {
+        &self.components
+    }
+
+    fn base_matches(&self) -> &[DefaultMatch] {
+        &self.base_matches
+    }
+
+    fn cmp_overrides(&self) -> &[Option<DefaultMatch>] {
+        &self.cmp_overrides
+    }
+
+    fn order(&self) -> RoundOrder {
+        self.order
+    }
+}
+
+impl Round {
+    pub fn filter(&self) -> RoundFilter {
+        RoundFilter::new(Arc::new(self.scheme().clone()), self.components().to_vec())
+    }
+}
+
+pub fn send<T: Message + 'static>(tid: ThreadId, msg: T) {
+    let stamp = round::current_round_stamp_for_send();
+    send_with_stamp(tid, msg, stamp, false);
+}
+
+pub fn send_lossy<T: Message + 'static>(tid: ThreadId, msg: T) {
+    let stamp = round::current_round_stamp_for_send();
+    send_with_stamp(tid, msg, stamp, true);
+}
+
+pub fn send_with_round<T: Message + 'static>(tid: ThreadId, msg: T, round: &Round) {
     round.assert_current();
-    let tagged = TaggedVal::new(round.id().clone(), Val::new(msg));
-    let tag = round.components().to_vec();
+    send_with_stamp(tid, msg, round.stamp(), false);
+}
+
+pub fn send_lossy_with_round<T: Message + 'static>(tid: ThreadId, msg: T, round: &Round) {
+    round.assert_current();
+    send_with_stamp(tid, msg, round.stamp(), true);
+}
+
+fn send_with_stamp<T: Message + 'static>(tid: ThreadId, msg: T, stamp: RoundStamp, lossy: bool) {
+    let tag = stamp.components().to_vec();
+    let tagged = TaggedVal::new(stamp, Val::new(msg));
     let (loc, comm) = thread_loc_comm(tid);
-    crate::send_msg_with_tag_vec(tagged, Some(tag), &loc, comm, true);
+    crate::send_msg_with_tag_vec(tagged, Some(tag), &loc, comm, lossy);
 }
 
 pub fn recv<T: Message + 'static>(round: &Round) -> Option<RoundMsg<T>> {
@@ -221,7 +166,7 @@ pub fn recv<T: Message + 'static>(round: &Round) -> Option<RoundMsg<T>> {
     let (loc, comm) = self_loc_comm();
     let tagged: Option<TaggedVal> =
         crate::recv_msg_with_tag(iter::once(&loc), comm, Some(tag_predicate)).map(|x| x.0);
-    tagged.map(|tagged| RoundMsg::new(expect_payload::<T>(tagged.payload), tagged.round))
+    tagged.map(|tagged| RoundMsg::new(expect_payload::<T>(tagged.payload), tagged.stamp))
 }
 
 pub fn recv_block<T: Message + 'static>(round: &Round) -> RoundMsg<T> {
@@ -231,7 +176,7 @@ pub fn recv_block<T: Message + 'static>(round: &Round) -> RoundMsg<T> {
     let tagged: TaggedVal =
         crate::recv_msg_block_with_tag(iter::once(&loc), comm, Some(tag_predicate)).0;
     let payload = expect_payload::<T>(tagged.payload);
-    RoundMsg::new(payload, tagged.round)
+    RoundMsg::new(payload, tagged.stamp)
 }
 
 pub fn recv_with_filter<T: Message + 'static>(filter: &RoundFilter) -> Option<RoundMsg<T>> {
@@ -240,7 +185,7 @@ pub fn recv_with_filter<T: Message + 'static>(filter: &RoundFilter) -> Option<Ro
     let (loc, comm) = self_loc_comm();
     let tagged: Option<TaggedVal> =
         crate::recv_msg_with_tag(iter::once(&loc), comm, Some(tag_predicate)).map(|x| x.0);
-    tagged.map(|tagged| RoundMsg::new(expect_payload::<T>(tagged.payload), tagged.round))
+    tagged.map(|tagged| RoundMsg::new(expect_payload::<T>(tagged.payload), tagged.stamp))
 }
 
 pub fn recv_block_with_filter<T: Message + 'static>(filter: &RoundFilter) -> RoundMsg<T> {
@@ -250,29 +195,7 @@ pub fn recv_block_with_filter<T: Message + 'static>(filter: &RoundFilter) -> Rou
     let tagged: TaggedVal =
         crate::recv_msg_block_with_tag(iter::once(&loc), comm, Some(tag_predicate)).0;
     let payload = expect_payload::<T>(tagged.payload);
-    RoundMsg::new(payload, tagged.round)
-}
-
-pub fn inbox(round: &Round) -> Vec<Option<RoundMsg<Val>>> {
-    inbox_with_bounds(round, 0, None)
-}
-
-pub fn inbox_with_bounds(
-    round: &Round,
-    min: usize,
-    max: Option<usize>,
-) -> Vec<Option<RoundMsg<Val>>> {
-    round.assert_current();
-    let tag_predicate = round_tag_predicate(round);
-    crate::inbox_extended(Some(tag_predicate), min, max)
-        .into_iter()
-        .map(|val| {
-            val.map(|val| {
-                let tagged = expect_tagged_val(val);
-                RoundMsg::new(tagged.payload, tagged.round)
-            })
-        })
-        .collect()
+    RoundMsg::new(payload, tagged.stamp)
 }
 
 pub fn inbox_with_filter(filter: &RoundFilter) -> Vec<Option<RoundMsg<Val>>> {
@@ -291,21 +214,169 @@ pub fn inbox_with_bounds_filter(
         .map(|val| {
             val.map(|val| {
                 let tagged = expect_tagged_val(val);
-                RoundMsg::new(tagged.payload, tagged.round)
+                RoundMsg::new(tagged.payload, tagged.stamp)
             })
         })
         .collect()
 }
 
+fn round_tag_predicate(round: &Round) -> PredicateType {
+    let levels = round.scheme().levels().to_vec();
+    let round_components = round.components().to_vec();
+    let (order, base_matches) = match round.scheme().default_filter() {
+        Some(filter) => (filter.order(), filter.matches().to_vec()),
+        None => (
+            round.scheme().default_round_order(),
+            vec![DefaultMatch::Any; levels.len()],
+        ),
+    };
+    PredicateType(Arc::new(move |_tid, tag| {
+        let tag_vec = match tag {
+            Some(tag_vec) => tag_vec,
+            None => return false,
+        };
+        matches_components(
+            &levels,
+            &tag_vec,
+            &round_components,
+            &base_matches,
+            order,
+        )
+    }))
+}
+
+fn matches_components(
+    levels: &[LevelSpec],
+    tag: &[u32],
+    round: &[u32],
+    base_matches: &[DefaultMatch],
+    order: RoundOrder,
+) -> bool {
+    let expected = levels.len();
+    ensure_len("tag", expected, tag.len());
+    ensure_len("round", expected, round.len());
+    ensure_len("default matches", expected, base_matches.len());
+    let order_ok = match order {
+        RoundOrder::ComponentWise => {
+            for (t, r) in tag.iter().zip(round.iter()) {
+                if t < r {
+                    return false;
+                }
+            }
+            true
+        }
+        RoundOrder::Lexicographic => matches_components_lexicographic(tag, round),
+    };
+    if !order_ok {
+        return false;
+    }
+    for (index, _) in levels.iter().enumerate() {
+        let ok = match base_matches[index] {
+            DefaultMatch::Eq => tag[index] == round[index],
+            DefaultMatch::Gte => tag[index] >= round[index],
+            DefaultMatch::Any => true,
+        };
+        if !ok {
+            return false;
+        }
+    }
+    true
+}
+
+fn filter_tag_predicate(filter: &RoundFilter) -> PredicateType {
+    let levels = filter.scheme().levels().to_vec();
+    let round_components = filter.components().to_vec();
+    let base_matches = filter.base_matches().to_vec();
+    let cmp_overrides = filter.cmp_overrides().to_vec();
+    let order = filter.order();
+    PredicateType(Arc::new(move |_tid, tag| {
+        let tag_vec = match tag {
+            Some(tag_vec) => tag_vec,
+            None => return false,
+        };
+        matches_components_with_cmp(
+            &levels,
+            &tag_vec,
+            &round_components,
+            &base_matches,
+            &cmp_overrides,
+            order,
+        )
+    }))
+}
+
+fn matches_components_with_cmp(
+    levels: &[LevelSpec],
+    tag: &[u32],
+    round: &[u32],
+    base_matches: &[DefaultMatch],
+    cmp_overrides: &[Option<DefaultMatch>],
+    order: RoundOrder,
+) -> bool {
+    let expected = levels.len();
+    ensure_len("tag", expected, tag.len());
+    ensure_len("round", expected, round.len());
+    ensure_len("default matches", expected, base_matches.len());
+    ensure_len("comparison overrides", expected, cmp_overrides.len());
+    let order_ok = match order {
+        RoundOrder::ComponentWise => {
+            for (t, r) in tag.iter().zip(round.iter()) {
+                if t < r {
+                    return false;
+                }
+            }
+            true
+        }
+        RoundOrder::Lexicographic => matches_components_lexicographic(tag, round),
+    };
+    if !order_ok {
+        return false;
+    }
+    for (index, _) in levels.iter().enumerate() {
+        let cmp = cmp_overrides[index].unwrap_or(base_matches[index]);
+        let ok = match cmp {
+            DefaultMatch::Eq => tag[index] == round[index],
+            DefaultMatch::Gte => tag[index] >= round[index],
+            DefaultMatch::Any => true,
+        };
+        if !ok {
+            return false;
+        }
+    }
+    true
+}
+
+fn matches_components_lexicographic(tag: &[u32], round: &[u32]) -> bool {
+    ensure_len("tag", round.len(), tag.len());
+    ensure_len("round", tag.len(), round.len());
+    for (t, r) in tag.iter().zip(round.iter()) {
+        if t > r {
+            return true;
+        } else if t < r {
+            return false;
+        }
+    }
+    true
+}
+
+fn ensure_len(label: &str, expected: usize, actual: usize) {
+    if expected != actual {
+        panic!(
+            "{} length {} does not match scheme levels {}",
+            label, actual, expected
+        );
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 struct TaggedVal {
-    round: RoundId,
+    stamp: RoundStamp,
     payload: Val,
 }
 
 impl TaggedVal {
-    fn new(round: RoundId, payload: Val) -> Self {
-        Self { round, payload }
+    fn new(stamp: RoundStamp, payload: Val) -> Self {
+        Self { stamp, payload }
     }
 }
 
@@ -314,8 +385,7 @@ fn expect_tagged_val(val: Val) -> TaggedVal {
         Ok(v) => *v,
         Err(_) => {
             panic!(
-                "wrong message return type; expecting {} but got {}",
-                type_name::<TaggedVal>(),
+                "wrong message return type; expecting TaggedVal but got {}",
                 val.type_name
             );
         }
