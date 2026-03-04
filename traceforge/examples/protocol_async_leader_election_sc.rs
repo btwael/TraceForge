@@ -273,7 +273,7 @@ fn start_node(scheme: RoundScheme, num_ballots: u32, mode: ReceiveMode) -> Vec<L
 }
 
 fn assert_log_consistency(logs: &[Vec<LogEntry>], num_ballots: u32) {
-    for ballot in 1..=num_ballots {
+    for ballot in 0..=num_ballots {
         let mut chosen: Option<ThreadId> = None;
         for log in logs {
             for entry in log.iter().filter(|entry| entry.ballot == ballot) {
