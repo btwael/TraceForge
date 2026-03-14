@@ -10,6 +10,7 @@ use syn::token::{Comma, PathSep};
 use syn::{DeriveInput, Generics, PathSegment, TypePath};
 
 mod comm_close;
+mod new_comm_close;
 
 struct MsgTypes {
     types: Vec<MsgVariant>,
@@ -258,4 +259,14 @@ pub fn round_key_derive(input: proc_macro::TokenStream) -> proc_macro::TokenStre
 #[proc_macro_derive(RoundEnum)]
 pub fn round_enum_derive(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
     comm_close::round_enum_derive(input)
+}
+
+#[proc_macro_derive(DimensionEnum)]
+pub fn dimension_enum_derive(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
+    new_comm_close::dimension_enum_derive(input)
+}
+
+#[proc_macro_derive(Round, attributes(dimension))]
+pub fn round_derive(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
+    new_comm_close::round_derive(input)
 }

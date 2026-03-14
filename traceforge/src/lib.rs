@@ -1,7 +1,8 @@
 // #![doc = include_str!("../../README.md")]
 pub mod channel;
 pub use comm_close::{RoundEnum, RoundKey};
-pub use traceforge_macros::{RoundEnum, RoundKey};
+pub use new_comm_close::DimensionEnum;
+pub use traceforge_macros::{DimensionEnum, Round, RoundEnum, RoundKey};
 mod cons;
 pub mod coverage;
 pub use coverage::{CoverageInfo, ExecutionId};
@@ -29,9 +30,10 @@ mod testmode;
 use future::spawn_receive;
 pub use testmode::{parallel_test, test};
 
+pub mod comm_close;
+pub mod new_comm_close;
 pub mod thread;
 mod vector_clock;
-pub mod comm_close;
 
 pub use crate::msg::Val; // `Val` is used by monitors.
 
