@@ -9,7 +9,6 @@ use syn::spanned::Spanned;
 use syn::token::{Comma, PathSep};
 use syn::{DeriveInput, Generics, PathSegment, TypePath};
 
-mod comm_close;
 mod new_comm_close;
 
 struct MsgTypes {
@@ -249,16 +248,6 @@ fn impl_into(name: &Ident, vname: &Ident, ty: &TypePath) -> TokenStream {
             }
         }
     }
-}
-
-#[proc_macro_derive(RoundKey)]
-pub fn round_key_derive(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
-    comm_close::round_key_derive(input)
-}
-
-#[proc_macro_derive(RoundEnum)]
-pub fn round_enum_derive(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
-    comm_close::round_enum_derive(input)
 }
 
 #[proc_macro_derive(DimensionEnum)]
