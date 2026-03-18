@@ -1,4 +1,4 @@
-use traceforge::new_comm_close::{MatchKind, RoundStamp, Rounds};
+use traceforge::comm_close::{MatchKind, RoundStamp, Rounds};
 use traceforge::thread::ThreadId;
 use traceforge::{thread, Nondet};
 
@@ -175,7 +175,7 @@ impl Node {
         }
     }
 
-    fn next_round(&mut self) -> traceforge::new_comm_close::Round<LeaderRound> {
+    fn next_round(&mut self) -> traceforge::comm_close::Round<LeaderRound> {
         if self.started {
             self.rounds.advance(LeaderRound::ballot())
         } else {
@@ -216,7 +216,7 @@ impl Node {
     fn collect_messages(
         &self,
         mode: ReceiveMode,
-        filter: Option<&traceforge::new_comm_close::RoundFilter<LeaderRound>>,
+        filter: Option<&traceforge::comm_close::RoundFilter<LeaderRound>>,
         min: usize,
         max: usize,
     ) -> Vec<(Message, RoundStamp<LeaderRound>)> {

@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use traceforge::new_comm_close::{RoundFilter, RoundStamp, Rounds};
+use traceforge::comm_close::{RoundFilter, RoundStamp, Rounds};
 use traceforge::thread::ThreadId;
 use traceforge::{thread, Nondet};
 
@@ -275,7 +275,7 @@ impl Node {
         self.apply_committed(applied);
     }
 
-    fn next_term_round(&mut self) -> traceforge::new_comm_close::Round<RaftRound> {
+    fn next_term_round(&mut self) -> traceforge::comm_close::Round<RaftRound> {
         if self.started {
             self.rounds.advance(RaftRound::term())
         } else {
@@ -284,7 +284,7 @@ impl Node {
         }
     }
 
-    fn ensure_phase(&mut self, target: Phase) -> traceforge::new_comm_close::Round<RaftRound> {
+    fn ensure_phase(&mut self, target: Phase) -> traceforge::comm_close::Round<RaftRound> {
         let mut round = self.rounds.current();
         let current = round.phase();
         if current == target {

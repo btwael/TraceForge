@@ -40,7 +40,7 @@ pub fn dimension_enum_derive(input: TokenStream) -> TokenStream {
     let name_str = name.to_string();
 
     let gen = quote! {
-        impl ::traceforge::new_comm_close::DimensionEnum for #name {
+        impl ::traceforge::comm_close::DimensionEnum for #name {
             const NAME: &'static str = #name_str;
             const LOW: Self = #name::#first;
             const SIZE: u32 = #count;
@@ -117,21 +117,21 @@ pub fn round_derive(input: TokenStream) -> TokenStream {
             Err(err) => return err.to_compile_error().into(),
         };
         let match_tokens = match match_kind {
-            ParsedMatchKind::Eq => quote!(::traceforge::new_comm_close::MatchKind::Eq),
-            ParsedMatchKind::Gt => quote!(::traceforge::new_comm_close::MatchKind::Gt),
-            ParsedMatchKind::Gte => quote!(::traceforge::new_comm_close::MatchKind::Gte),
-            ParsedMatchKind::Any => quote!(::traceforge::new_comm_close::MatchKind::Any),
+            ParsedMatchKind::Eq => quote!(::traceforge::comm_close::MatchKind::Eq),
+            ParsedMatchKind::Gt => quote!(::traceforge::comm_close::MatchKind::Gt),
+            ParsedMatchKind::Gte => quote!(::traceforge::comm_close::MatchKind::Gte),
+            ParsedMatchKind::Any => quote!(::traceforge::comm_close::MatchKind::Any),
         };
 
         let dimension = match &field.ty {
             Type::Path(ty) if is_u32(ty) => {
                 quote! {
-                    ::traceforge::new_comm_close::DimensionSpec::u32(#field_name, #match_tokens)
+                    ::traceforge::comm_close::DimensionSpec::u32(#field_name, #match_tokens)
                 }
             }
             Type::Path(ty) => {
                 quote! {
-                    ::traceforge::new_comm_close::DimensionSpec::enumeration::<#ty>(#field_name, #match_tokens)
+                    ::traceforge::comm_close::DimensionSpec::enumeration::<#ty>(#field_name, #match_tokens)
                 }
             }
             other => {
@@ -145,8 +145,8 @@ pub fn round_derive(input: TokenStream) -> TokenStream {
         };
         dimensions.push(dimension);
         marker_constructors.push(quote! {
-            pub fn #field_ident() -> ::traceforge::new_comm_close::Dimension<Self> {
-                ::traceforge::new_comm_close::Dimension::new(#index)
+            pub fn #field_ident() -> ::traceforge::comm_close::Dimension<Self> {
+                ::traceforge::comm_close::Dimension::new(#index)
             }
         });
 
@@ -177,7 +177,7 @@ pub fn round_derive(input: TokenStream) -> TokenStream {
                 quote! {
                     fn #field_ident(&self) -> #ty {
                         let raw = self.component(#name::#field_ident());
-                        <#ty as ::traceforge::new_comm_close::DimensionEnum>::try_from_u32(raw)
+                        <#ty as ::traceforge::comm_close::DimensionEnum>::try_from_u32(raw)
                             .unwrap_or_else(|| {
                                 panic!(
                                     "invalid value {} for dimension {}",
@@ -203,7 +203,7 @@ pub fn round_derive(input: TokenStream) -> TokenStream {
                 quote! {
                     fn #field_ident(&self) -> #ty {
                         let raw = self.components()[#index];
-                        <#ty as ::traceforge::new_comm_close::DimensionEnum>::try_from_u32(raw)
+                        <#ty as ::traceforge::comm_close::DimensionEnum>::try_from_u32(raw)
                             .unwrap_or_else(|| {
                                 panic!(
                                     "invalid value {} for dimension {}",
@@ -219,16 +219,16 @@ pub fn round_derive(input: TokenStream) -> TokenStream {
         stamp_accessor_impls.push(stamp_accessor_impl);
 
         filter_signatures.push(quote! {
-            fn #field_ident<C>(self, cmp: C) -> ::traceforge::new_comm_close::RoundFilter<#name>
+            fn #field_ident<C>(self, cmp: C) -> ::traceforge::comm_close::RoundFilter<#name>
             where
-                C: ::core::convert::Into<::traceforge::new_comm_close::MatchKind>;
+                C: ::core::convert::Into<::traceforge::comm_close::MatchKind>;
         });
         filter_impls.push(quote! {
-            fn #field_ident<C>(self, cmp: C) -> ::traceforge::new_comm_close::RoundFilter<#name>
+            fn #field_ident<C>(self, cmp: C) -> ::traceforge::comm_close::RoundFilter<#name>
             where
-                C: ::core::convert::Into<::traceforge::new_comm_close::MatchKind>,
+                C: ::core::convert::Into<::traceforge::comm_close::MatchKind>,
             {
-                let kind: ::traceforge::new_comm_close::MatchKind = cmp.into();
+                let kind: ::traceforge::comm_close::MatchKind = cmp.into();
                 self.with_match(#name::#field_ident(), kind)
             }
         });
@@ -252,7 +252,7 @@ pub fn round_derive(input: TokenStream) -> TokenStream {
                     fn #advance_to_name(&mut self, target: #ty) {
                         self.advance_to(
                             #name::#field_ident(),
-                            <#ty as ::traceforge::new_comm_close::DimensionEnum>::to_u32(target),
+                            <#ty as ::traceforge::comm_close::DimensionEnum>::to_u32(target),
                         );
                     }
                 });
@@ -262,9 +262,9 @@ pub fn round_derive(input: TokenStream) -> TokenStream {
     }
 
     let gen = quote! {
-        impl ::traceforge::new_comm_close::RoundDescriptor for #name {
-            fn scheme() -> ::traceforge::new_comm_close::Scheme {
-                ::traceforge::new_comm_close::Scheme::from_dimensions(vec![
+        impl ::traceforge::comm_close::RoundDescriptor for #name {
+            fn scheme() -> ::traceforge::comm_close::Scheme {
+                ::traceforge::comm_close::Scheme::from_dimensions(vec![
                     #(#dimensions),*
                 ])
             }
@@ -278,7 +278,7 @@ pub fn round_derive(input: TokenStream) -> TokenStream {
             #(#accessor_signatures)*
         }
 
-        impl #access_trait for ::traceforge::new_comm_close::Round<#name> {
+        impl #access_trait for ::traceforge::comm_close::Round<#name> {
             #(#accessor_impls)*
         }
 
@@ -286,7 +286,7 @@ pub fn round_derive(input: TokenStream) -> TokenStream {
             #(#accessor_signatures)*
         }
 
-        impl #stamp_access_trait for ::traceforge::new_comm_close::RoundStamp<#name> {
+        impl #stamp_access_trait for ::traceforge::comm_close::RoundStamp<#name> {
             #(#stamp_accessor_impls)*
         }
 
@@ -294,7 +294,7 @@ pub fn round_derive(input: TokenStream) -> TokenStream {
             #(#filter_signatures)*
         }
 
-        impl #filter_access_trait for ::traceforge::new_comm_close::RoundFilter<#name> {
+        impl #filter_access_trait for ::traceforge::comm_close::RoundFilter<#name> {
             #(#filter_impls)*
         }
 
@@ -302,7 +302,7 @@ pub fn round_derive(input: TokenStream) -> TokenStream {
             #(#advance_to_signatures)*
         }
 
-        impl #advance_to_trait for ::traceforge::new_comm_close::Rounds<#name> {
+        impl #advance_to_trait for ::traceforge::comm_close::Rounds<#name> {
             #(#advance_to_impls)*
         }
     };

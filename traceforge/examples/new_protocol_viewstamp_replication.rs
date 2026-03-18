@@ -1,4 +1,4 @@
-use traceforge::new_comm_close::{MatchKind, RoundFilter, RoundStamp, Rounds};
+use traceforge::comm_close::{MatchKind, RoundFilter, RoundStamp, Rounds};
 use traceforge::thread::ThreadId;
 use traceforge::{thread, Nondet};
 
@@ -308,7 +308,7 @@ impl Node {
         stable
     }
 
-    fn next_view_round(&mut self) -> traceforge::new_comm_close::Round<ViewstampRound> {
+    fn next_view_round(&mut self) -> traceforge::comm_close::Round<ViewstampRound> {
         if !self.started {
             self.started = true;
         }

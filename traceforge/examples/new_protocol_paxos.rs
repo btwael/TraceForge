@@ -1,4 +1,4 @@
-use traceforge::new_comm_close::{MatchKind, Rounds};
+use traceforge::comm_close::{MatchKind, Rounds};
 use traceforge::thread::ThreadId;
 use traceforge::{thread, Nondet};
 
@@ -197,7 +197,7 @@ impl Node {
         }
     }
 
-    fn enter_next_ballot(&mut self) -> traceforge::new_comm_close::Round<PaxosRound> {
+    fn enter_next_ballot(&mut self) -> traceforge::comm_close::Round<PaxosRound> {
         if self.started {
             self.rounds.advance(PaxosRound::ballot())
         } else {

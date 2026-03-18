@@ -1,4 +1,4 @@
-use traceforge::new_comm_close::Rounds;
+use traceforge::comm_close::Rounds;
 use traceforge::thread;
 use traceforge::thread::ThreadId;
 

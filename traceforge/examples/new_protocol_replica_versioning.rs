@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 
-use traceforge::new_comm_close::{MatchKind, RoundFilter, Rounds};
+use traceforge::comm_close::{MatchKind, RoundFilter, Rounds};
 use traceforge::thread::ThreadId;
 use traceforge::thread;
 use traceforge::Nondet;

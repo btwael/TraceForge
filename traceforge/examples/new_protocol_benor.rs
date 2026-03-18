@@ -1,4 +1,4 @@
-use traceforge::new_comm_close::{MatchKind, RoundFilter, Rounds};
+use traceforge::comm_close::{MatchKind, RoundFilter, Rounds};
 use traceforge::thread::ThreadId;
 use traceforge::thread;
 use traceforge::Nondet;
@@ -187,7 +187,7 @@ impl Node {
         }
     }
 
-    fn next_round(&mut self) -> traceforge::new_comm_close::Round<BenOrRound> {
+    fn next_round(&mut self) -> traceforge::comm_close::Round<BenOrRound> {
         if self.started {
             self.rounds.advance(BenOrRound::round())
         } else {
@@ -261,7 +261,7 @@ impl Node {
         &self,
         filter: &RoundFilter<BenOrRound>,
         max_expected: usize,
-    ) -> Vec<traceforge::new_comm_close::RoundMsg<Message, BenOrRound>> {
+    ) -> Vec<traceforge::comm_close::RoundMsg<Message, BenOrRound>> {
         match self.mode {
             ReceiveMode::Recv => {
                 let mut out = Vec::new();

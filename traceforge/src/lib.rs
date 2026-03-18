@@ -1,6 +1,6 @@
 // #![doc = include_str!("../../README.md")]
 pub mod channel;
-pub use new_comm_close::DimensionEnum;
+pub use comm_close::DimensionEnum;
 pub use traceforge_macros::{DimensionEnum, Round};
 mod cons;
 pub mod coverage;
@@ -29,7 +29,7 @@ mod testmode;
 use future::spawn_receive;
 pub use testmode::{parallel_test, test};
 
-pub mod new_comm_close;
+pub mod comm_close;
 pub mod thread;
 mod vector_clock;
 
