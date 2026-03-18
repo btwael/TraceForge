@@ -280,6 +280,7 @@ impl<S> RoundFilter<S> {
 #[derive(Clone, Debug)]
 pub struct Rounds<S> {
     scheme: Scheme,
+    use_tags: bool,
     _marker: PhantomData<S>,
 }
 
@@ -289,6 +290,21 @@ impl<S: RoundDescriptor> Rounds<S> {
         with_shared_cursor::<S, _, _>(&scheme, |_| ());
         Self {
             scheme,
+            use_tags: true,
+            _marker: PhantomData,
+        }
+    }
+
+    pub fn new_wo_tags(stash: bool) -> Self {
+        assert!(
+            !stash,
+            "new_wo_tags(stash=true) is not supported; no-tag mode currently drops non-matching messages"
+        );
+        let scheme = S::scheme();
+        with_shared_cursor::<S, _, _>(&scheme, |_| ());
+        Self {
+            scheme,
+            use_tags: false,
             _marker: PhantomData,
         }
     }
@@ -448,7 +464,8 @@ impl<S: RoundDescriptor> Rounds<S> {
         let components = with_shared_cursor::<S, _, _>(&self.scheme, |current| current.clone());
         let tagged = TaggedVal::new(components.clone(), Val::new(msg));
         let (loc, comm) = thread_loc_comm(tid);
-        crate::send_msg_with_tag_vec(tagged, Some(components), &loc, comm, false);
+        let tag = if self.use_tags { Some(components) } else { None };
+        crate::send_msg_with_tag_vec(tagged, tag, &loc, comm, false);
     }
 
     pub fn recv<T: Message + 'static>(&self) -> Option<RoundMsg<T, S>> {
@@ -463,17 +480,43 @@ impl<S: RoundDescriptor> Rounds<S> {
                 "filter is stale; build a fresh filter from rounds.filter() before recv_with"
             );
         });
-        let predicate = filter_tag_predicate(&self.scheme, &filter.base, &filter.overrides);
         let (loc, comm) = self_loc_comm();
-        let tagged: Option<TaggedVal> =
-            crate::recv_msg_with_tag(iter::once(&loc), comm, Some(predicate)).map(|x| x.0);
-        tagged.map(|tagged| RoundMsg {
-            payload: expect_payload::<T>(tagged.payload),
-            stamp: RoundStamp {
-                components: tagged.components,
-                _marker: PhantomData,
-            },
-        })
+        if self.use_tags {
+            let predicate = filter_tag_predicate(&self.scheme, &filter.base, &filter.overrides);
+            let tagged: Option<TaggedVal> =
+                crate::recv_msg_with_tag(iter::once(&loc), comm, Some(predicate)).map(|x| x.0);
+            tagged.map(|tagged| RoundMsg {
+                payload: expect_payload::<T>(tagged.payload),
+                stamp: RoundStamp {
+                    components: tagged.components,
+                    _marker: PhantomData,
+                },
+            })
+        } else {
+            loop {
+                let tagged: Option<TaggedVal> =
+                    crate::recv_msg_with_tag(iter::once(&loc), comm, None).map(|x| x.0);
+                let tagged = match tagged {
+                    Some(tagged) => tagged,
+                    None => return None,
+                };
+                if !matches_scheme_with_filter(
+                    &self.scheme,
+                    &tagged.components,
+                    &filter.base,
+                    &filter.overrides,
+                ) {
+                    continue;
+                }
+                return Some(RoundMsg {
+                    payload: expect_payload::<T>(tagged.payload),
+                    stamp: RoundStamp {
+                        components: tagged.components,
+                        _marker: PhantomData,
+                    },
+                });
+            }
+        }
     }
 
     pub fn recv_block<T: Message + 'static>(&self) -> RoundMsg<T, S> {
@@ -488,16 +531,37 @@ impl<S: RoundDescriptor> Rounds<S> {
                 "filter is stale; build a fresh filter from rounds.filter() before recv_block_with"
             );
         });
-        let predicate = filter_tag_predicate(&self.scheme, &filter.base, &filter.overrides);
         let (loc, comm) = self_loc_comm();
-        let tagged: TaggedVal =
-            crate::recv_msg_block_with_tag(iter::once(&loc), comm, Some(predicate)).0;
-        RoundMsg {
-            payload: expect_payload::<T>(tagged.payload),
-            stamp: RoundStamp {
-                components: tagged.components,
-                _marker: PhantomData,
-            },
+        if self.use_tags {
+            let predicate = filter_tag_predicate(&self.scheme, &filter.base, &filter.overrides);
+            let tagged: TaggedVal =
+                crate::recv_msg_block_with_tag(iter::once(&loc), comm, Some(predicate)).0;
+            RoundMsg {
+                payload: expect_payload::<T>(tagged.payload),
+                stamp: RoundStamp {
+                    components: tagged.components,
+                    _marker: PhantomData,
+                },
+            }
+        } else {
+            loop {
+                let tagged: TaggedVal = crate::recv_msg_block_with_tag(iter::once(&loc), comm, None).0;
+                if !matches_scheme_with_filter(
+                    &self.scheme,
+                    &tagged.components,
+                    &filter.base,
+                    &filter.overrides,
+                ) {
+                    continue;
+                }
+                return RoundMsg {
+                    payload: expect_payload::<T>(tagged.payload),
+                    stamp: RoundStamp {
+                        components: tagged.components,
+                        _marker: PhantomData,
+                    },
+                };
+            }
         }
     }
 
@@ -524,6 +588,11 @@ impl<S: RoundDescriptor> Rounds<S> {
         min: usize,
         max: Option<usize>,
     ) -> Vec<Option<RoundMsg<T, S>>> {
+        if !self.use_tags {
+            panic!(
+                "inbox/inbox_with_bounds/inbox_with_bounds_with are not supported in Rounds::new_wo_tags mode"
+            );
+        }
         with_shared_cursor::<S, _, _>(&self.scheme, |current| {
             assert!(
                 filter.base == *current,
