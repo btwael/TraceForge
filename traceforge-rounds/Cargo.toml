@@ -1,0 +1,8 @@
+[package]
+name = "traceforge-rounds"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
+[dependencies]
+traceforge-rounds-macros = { path = "../traceforge-rounds-macros", version = "0.1.0" }
