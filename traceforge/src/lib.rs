@@ -1,5 +1,6 @@
 // #![doc = include_str!("../../README.md")]
 pub mod channel;
+pub mod comm_close;
 mod cons;
 pub mod coverage;
 pub use coverage::{CoverageInfo, ExecutionId};

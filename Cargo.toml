@@ -1,10 +1,10 @@
 [workspace]
 resolver = "2"
 members = [
-    "traceforge-rounds-macros",
-    "traceforge-rounds",
     "traceforge-macros",
     "traceforge",
+    "traceforge-rounds-macros",
+    "traceforge-rounds",
 ]
 
 [profile.dev]

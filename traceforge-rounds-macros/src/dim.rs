@@ -49,7 +49,7 @@ fn expand(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
         .map(|variant| &variant.ident)
         .collect::<Vec<_>>();
     let first = variant_idents[0];
-    let indexes = 0u32..variant_idents.len() as u32;
+    let indexes = (0u32..variant_idents.len() as u32).collect::<Vec<_>>();
     let next_arms = variant_idents
         .iter()
         .enumerate()
@@ -71,6 +71,17 @@ fn expand(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
             fn next(self) -> Option<Self> {
                 match self {
                     #(#next_arms)*
+                }
+            }
+
+            fn to_index(self) -> u32 {
+                self.__traceforge_rounds_dim_index()
+            }
+
+            fn from_index(index: u32) -> Option<Self> {
+                match index {
+                    #(#indexes => Some(Self::#variant_idents),)*
+                    _ => None,
                 }
             }
         }

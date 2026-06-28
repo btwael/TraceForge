@@ -8,5 +8,19 @@ pub trait Transport<R: Round, M> {
 
     fn recv<F>(&mut self, current: &R, filter: F) -> Result<Option<Envelope<R, M>>, Self::Error>
     where
-        F: Fn(&R, &R) -> bool;
+        F: Fn(&R, &R) -> bool + Send + Sync + 'static;
+
+    fn recv_block<F>(&mut self, current: &R, filter: F) -> Result<Envelope<R, M>, Self::Error>
+    where
+        F: Fn(&R, &R) -> bool + Send + Sync + 'static;
+
+    fn inbox<F>(
+        &mut self,
+        current: &R,
+        filter: F,
+        min: usize,
+        max: Option<usize>,
+    ) -> Result<Vec<Option<Envelope<R, M>>>, Self::Error>
+    where
+        F: Fn(&R, &R) -> bool + Send + Sync + 'static;
 }

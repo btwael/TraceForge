@@ -68,6 +68,7 @@ impl<R: crate::Round, T> Comm<R, T> {
     pub fn recv<M>(&mut self) -> Result<Option<M>, CommError<R, M, <T as Transport<R, M>>::Error>>
     where
         T: Transport<R, M>,
+        M: 'static,
     {
         self.recv_with(|_, _| true)
     }
@@ -78,17 +79,18 @@ impl<R: crate::Round, T> Comm<R, T> {
     ) -> Result<Option<M>, CommError<R, M, <T as Transport<R, M>>::Error>>
     where
         T: Transport<R, M>,
-        F: Fn(&R, &R) -> bool,
+        M: 'static,
+        F: Fn(&R, &R) -> bool + Send + Sync + 'static,
     {
         let current = self.rounds.current();
-        let envelope = self
+        let received = self
             .transport
-            .recv(current, |stamp, current| {
-                is_not_past(stamp, current) && filter(stamp, current)
+            .recv(current, move |local, remote| {
+                is_not_past(remote, local) && filter(local, remote)
             })
             .map_err(CommError::Transport)?;
 
-        match envelope {
+        match received {
             Some(envelope) if is_not_past(envelope.stamp(), self.rounds.current()) => {
                 Ok(Some(envelope.msg()))
             }
@@ -98,5 +100,115 @@ impl<R: crate::Round, T> Comm<R, T> {
             ))),
             None => Ok(None),
         }
+    }
+
+    pub fn recv_block<M>(&mut self) -> Result<M, CommError<R, M, <T as Transport<R, M>>::Error>>
+    where
+        T: Transport<R, M>,
+        M: 'static,
+    {
+        self.recv_block_with(|_, _| true)
+    }
+
+    pub fn recv_block_with<M, F>(
+        &mut self,
+        filter: F,
+    ) -> Result<M, CommError<R, M, <T as Transport<R, M>>::Error>>
+    where
+        T: Transport<R, M>,
+        M: 'static,
+        F: Fn(&R, &R) -> bool + Send + Sync + 'static,
+    {
+        let current = self.rounds.current();
+        let envelope = self
+            .transport
+            .recv_block(current, move |local, remote| {
+                is_not_past(remote, local) && filter(local, remote)
+            })
+            .map_err(CommError::Transport)?;
+
+        if is_not_past(envelope.stamp(), self.rounds.current()) {
+            Ok(envelope.msg())
+        } else {
+            Err(CommError::Stale(StaleEnvelope::new(
+                self.rounds.current().clone(),
+                envelope,
+            )))
+        }
+    }
+
+    pub fn inbox<M>(
+        &mut self,
+    ) -> Result<Vec<Option<M>>, CommError<R, M, <T as Transport<R, M>>::Error>>
+    where
+        T: Transport<R, M>,
+        M: 'static,
+    {
+        self.inbox_with_bounds_with(0, None, |_, _| true)
+    }
+
+    pub fn inbox_with<M, F>(
+        &mut self,
+        filter: F,
+    ) -> Result<Vec<Option<M>>, CommError<R, M, <T as Transport<R, M>>::Error>>
+    where
+        T: Transport<R, M>,
+        M: 'static,
+        F: Fn(&R, &R) -> bool + Send + Sync + 'static,
+    {
+        self.inbox_with_bounds_with(0, None, filter)
+    }
+
+    pub fn inbox_with_bounds<M>(
+        &mut self,
+        min: usize,
+        max: Option<usize>,
+    ) -> Result<Vec<Option<M>>, CommError<R, M, <T as Transport<R, M>>::Error>>
+    where
+        T: Transport<R, M>,
+        M: 'static,
+    {
+        self.inbox_with_bounds_with(min, max, |_, _| true)
+    }
+
+    pub fn inbox_with_bounds_with<M, F>(
+        &mut self,
+        min: usize,
+        max: Option<usize>,
+        filter: F,
+    ) -> Result<Vec<Option<M>>, CommError<R, M, <T as Transport<R, M>>::Error>>
+    where
+        T: Transport<R, M>,
+        M: 'static,
+        F: Fn(&R, &R) -> bool + Send + Sync + 'static,
+    {
+        let current = self.rounds.current();
+        let received = self
+            .transport
+            .inbox(
+                current,
+                move |local, remote| is_not_past(remote, local) && filter(local, remote),
+                min,
+                max,
+            )
+            .map_err(CommError::Transport)?;
+
+        let mut msgs = Vec::with_capacity(received.len());
+        for entry in received {
+            match entry {
+                Some(envelope) if is_not_past(envelope.stamp(), self.rounds.current()) => {
+                    msgs.push(Some(envelope.msg()));
+                }
+                Some(envelope) => {
+                    return Err(CommError::Stale(StaleEnvelope::new(
+                        self.rounds.current().clone(),
+                        envelope,
+                    )));
+                }
+                None => msgs.push(None),
+            }
+        }
+
+        Ok(msgs)
     }
 }

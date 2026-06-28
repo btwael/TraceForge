@@ -4,6 +4,7 @@ mod envelope;
 mod error;
 mod round;
 mod rounds;
+mod scheme;
 mod transport;
 
 pub use comm::{Comm, CommError};
@@ -12,6 +13,7 @@ pub use envelope::Envelope;
 pub use error::{PastRound, StaleEnvelope};
 pub use round::Round;
 pub use rounds::Rounds;
+pub use scheme::RoundScheme;
 pub use traceforge_rounds_macros::{Dim, Round};
 pub use transport::Transport;
 

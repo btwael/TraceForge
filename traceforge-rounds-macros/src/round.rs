@@ -107,6 +107,19 @@ fn expand(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
         .iter()
         .map(|field| field.kind.initial(&field.ty))
         .collect::<Vec<_>>();
+    let field_count = round_fields.len();
+    let encode_steps = round_fields
+        .iter()
+        .map(|field| {
+            let ident = &field.ident;
+            field.kind.encode(&field.ty, ident)
+        })
+        .collect::<Vec<_>>();
+    let decode_values = round_fields
+        .iter()
+        .enumerate()
+        .map(|(index, field)| field.kind.decode(&field.ty, index))
+        .collect::<Vec<_>>();
 
     let advance_arms = round_fields
         .iter()
@@ -299,6 +312,24 @@ fn expand(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
             }
         }
 
+        impl ::traceforge_rounds::RoundScheme for #struct_ident {
+            const LEN: usize = #field_count;
+
+            fn encode(round: &Self, out: &mut Vec<u32>) {
+                #(#encode_steps)*
+            }
+
+            fn decode(raw: &[u32]) -> Option<Self> {
+                if raw.len() != Self::LEN {
+                    return None;
+                }
+
+                Some(Self {
+                    #(#field_idents: #decode_values,)*
+                })
+            }
+        }
+
         const _: fn() = || {
             fn assert_copy<T: Copy>() {}
             #(assert_copy::<#field_tys>();)*
@@ -355,6 +386,22 @@ impl FieldKind {
         match self {
             Self::Counter => quote! { current.#ident.checked_add(1) },
             Self::Dim => quote! { <#ty as ::traceforge_rounds::Dim>::next(current.#ident) },
+        }
+    }
+
+    fn encode(&self, ty: &Type, ident: &Ident) -> proc_macro2::TokenStream {
+        match self {
+            Self::Counter => quote! { out.push(round.#ident); },
+            Self::Dim => {
+                quote! { out.push(<#ty as ::traceforge_rounds::Dim>::to_index(round.#ident)); }
+            }
+        }
+    }
+
+    fn decode(&self, ty: &Type, index: usize) -> proc_macro2::TokenStream {
+        match self {
+            Self::Counter => quote! { raw[#index] },
+            Self::Dim => quote! { <#ty as ::traceforge_rounds::Dim>::from_index(raw[#index])? },
         }
     }
 }

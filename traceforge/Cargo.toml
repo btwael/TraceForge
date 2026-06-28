@@ -26,6 +26,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 paste = "1.0"
 traceforge-macros = { path = "../traceforge-macros", version = "0.1" }
+traceforge-rounds = { path = "../traceforge-rounds", version = "0.1.0" }
 log = { version = "0.4", features = ["release_max_level_off"] }
 dyn-hash = "0.2.0"
 dyn-eq = "0.1.3"
