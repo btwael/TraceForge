@@ -102,6 +102,45 @@ impl<R: crate::Round, T> Comm<R, T> {
         }
     }
 
+    pub fn recv_stamped<M>(
+        &mut self,
+    ) -> Result<Option<(R, M)>, CommError<R, M, <T as Transport<R, M>>::Error>>
+    where
+        T: Transport<R, M>,
+        M: 'static,
+    {
+        self.recv_stamped_with(|_, _| true)
+    }
+
+    pub fn recv_stamped_with<M, F>(
+        &mut self,
+        filter: F,
+    ) -> Result<Option<(R, M)>, CommError<R, M, <T as Transport<R, M>>::Error>>
+    where
+        T: Transport<R, M>,
+        M: 'static,
+        F: Fn(&R, &R) -> bool + Send + Sync + 'static,
+    {
+        let current = self.rounds.current();
+        let received = self
+            .transport
+            .recv(current, move |local, remote| {
+                is_not_past(remote, local) && filter(local, remote)
+            })
+            .map_err(CommError::Transport)?;
+
+        match received {
+            Some(envelope) if is_not_past(envelope.stamp(), self.rounds.current()) => {
+                Ok(Some(envelope.into_parts()))
+            }
+            Some(envelope) => Err(CommError::Stale(StaleEnvelope::new(
+                self.rounds.current().clone(),
+                envelope,
+            ))),
+            None => Ok(None),
+        }
+    }
+
     pub fn recv_block<M>(&mut self) -> Result<M, CommError<R, M, <T as Transport<R, M>>::Error>>
     where
         T: Transport<R, M>,
@@ -129,6 +168,43 @@ impl<R: crate::Round, T> Comm<R, T> {
 
         if is_not_past(envelope.stamp(), self.rounds.current()) {
             Ok(envelope.msg())
+        } else {
+            Err(CommError::Stale(StaleEnvelope::new(
+                self.rounds.current().clone(),
+                envelope,
+            )))
+        }
+    }
+
+    pub fn recv_block_stamped<M>(
+        &mut self,
+    ) -> Result<(R, M), CommError<R, M, <T as Transport<R, M>>::Error>>
+    where
+        T: Transport<R, M>,
+        M: 'static,
+    {
+        self.recv_block_stamped_with(|_, _| true)
+    }
+
+    pub fn recv_block_stamped_with<M, F>(
+        &mut self,
+        filter: F,
+    ) -> Result<(R, M), CommError<R, M, <T as Transport<R, M>>::Error>>
+    where
+        T: Transport<R, M>,
+        M: 'static,
+        F: Fn(&R, &R) -> bool + Send + Sync + 'static,
+    {
+        let current = self.rounds.current();
+        let envelope = self
+            .transport
+            .recv_block(current, move |local, remote| {
+                is_not_past(remote, local) && filter(local, remote)
+            })
+            .map_err(CommError::Transport)?;
+
+        if is_not_past(envelope.stamp(), self.rounds.current()) {
+            Ok(envelope.into_parts())
         } else {
             Err(CommError::Stale(StaleEnvelope::new(
                 self.rounds.current().clone(),
@@ -198,6 +274,81 @@ impl<R: crate::Round, T> Comm<R, T> {
             match entry {
                 Some(envelope) if is_not_past(envelope.stamp(), self.rounds.current()) => {
                     msgs.push(Some(envelope.msg()));
+                }
+                Some(envelope) => {
+                    return Err(CommError::Stale(StaleEnvelope::new(
+                        self.rounds.current().clone(),
+                        envelope,
+                    )));
+                }
+                None => msgs.push(None),
+            }
+        }
+
+        Ok(msgs)
+    }
+
+    pub fn inbox_stamped<M>(
+        &mut self,
+    ) -> Result<Vec<Option<(R, M)>>, CommError<R, M, <T as Transport<R, M>>::Error>>
+    where
+        T: Transport<R, M>,
+        M: 'static,
+    {
+        self.inbox_stamped_with_bounds_with(0, None, |_, _| true)
+    }
+
+    pub fn inbox_stamped_with<M, F>(
+        &mut self,
+        filter: F,
+    ) -> Result<Vec<Option<(R, M)>>, CommError<R, M, <T as Transport<R, M>>::Error>>
+    where
+        T: Transport<R, M>,
+        M: 'static,
+        F: Fn(&R, &R) -> bool + Send + Sync + 'static,
+    {
+        self.inbox_stamped_with_bounds_with(0, None, filter)
+    }
+
+    pub fn inbox_stamped_with_bounds<M>(
+        &mut self,
+        min: usize,
+        max: Option<usize>,
+    ) -> Result<Vec<Option<(R, M)>>, CommError<R, M, <T as Transport<R, M>>::Error>>
+    where
+        T: Transport<R, M>,
+        M: 'static,
+    {
+        self.inbox_stamped_with_bounds_with(min, max, |_, _| true)
+    }
+
+    pub fn inbox_stamped_with_bounds_with<M, F>(
+        &mut self,
+        min: usize,
+        max: Option<usize>,
+        filter: F,
+    ) -> Result<Vec<Option<(R, M)>>, CommError<R, M, <T as Transport<R, M>>::Error>>
+    where
+        T: Transport<R, M>,
+        M: 'static,
+        F: Fn(&R, &R) -> bool + Send + Sync + 'static,
+    {
+        let current = self.rounds.current();
+        let received = self
+            .transport
+            .inbox(
+                current,
+                move |local, remote| is_not_past(remote, local) && filter(local, remote),
+                min,
+                max,
+            )
+            .map_err(CommError::Transport)?;
+
+        let mut msgs = Vec::with_capacity(received.len());
+        for entry in received {
+            match entry {
+                Some(envelope) if is_not_past(envelope.stamp(), self.rounds.current()) => {
+                    msgs.push(Some(envelope.into_parts()));
                 }
                 Some(envelope) => {
                     return Err(CommError::Stale(StaleEnvelope::new(
