@@ -1,7 +1,10 @@
+use std::collections::{BTreeMap, HashMap};
+use std::sync::{Arc, Mutex};
+
 use traceforge::comm_close::{self, TraceForgeTransportMode};
 use traceforge::thread;
 use traceforge::thread::ThreadId;
-use traceforge::{BranchingStrategy, Nondet};
+use traceforge::{BranchingStrategy, Config, Nondet};
 use traceforge_rounds::{Comm, Dim, Round};
 
 const DEFAULT_NUM_NODES: usize = 3;
@@ -9,6 +12,7 @@ const DEFAULT_NUM_BALLOTS: u32 = 1;
 const DEFAULT_MODE: ReceiveMode = ReceiveMode::Inbox;
 const DEFAULT_USE_TAGS: bool = true;
 const INIT_TAG: u32 = 1;
+const PROPOSER_CHOICE: &str = "async_leader_proposer";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ReceiveMode {
@@ -48,6 +52,32 @@ impl Participants {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+struct SymmetryPlan {
+    proposers_by_ballot: Vec<Vec<bool>>,
+}
+
+impl SymmetryPlan {
+    fn to_predetermined_choices(&self) -> HashMap<String, Vec<Vec<bool>>> {
+        let Some(first_ballot) = self.proposers_by_ballot.first() else {
+            return HashMap::from([(PROPOSER_CHOICE.to_string(), Vec::new())]);
+        };
+        let mut by_node =
+            vec![Vec::with_capacity(self.proposers_by_ballot.len()); first_ballot.len()];
+        for ballot in &self.proposers_by_ballot {
+            for (node_index, is_proposer) in ballot.iter().copied().enumerate() {
+                by_node[node_index].push(is_proposer);
+            }
+        }
+        HashMap::from([(PROPOSER_CHOICE.to_string(), by_node)])
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct InitMsg {
+    participants: Participants,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct NewBallotMsg {
     leader: ThreadId,
     sender: ThreadId,
@@ -61,7 +91,7 @@ struct AckBallotMsg {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Message {
-    Init(Participants),
+    Init(InitMsg),
     NewBallot(NewBallotMsg),
     AckBallot(AckBallotMsg),
 }
@@ -178,7 +208,7 @@ impl Node {
     }
 
     fn coord(&self) -> bool {
-        traceforge::nondet()
+        traceforge::named_nondet(PROPOSER_CHOICE)
     }
 
     fn broadcast(&mut self, msg: Message) {
@@ -260,11 +290,11 @@ fn start_node(num_ballots: u32, mode: ReceiveMode, use_tags: bool) -> Vec<LogEnt
     } else {
         traceforge::recv_tagged_msg_block(|_, tag| tag == Some(INIT_TAG))
     };
-    let nodes = match init {
-        Message::Init(nodes) => nodes,
+    let init = match init {
+        Message::Init(init) => init,
         _ => panic!("expected init message"),
     };
-    Node::new(nodes, num_ballots, mode, use_tags).run()
+    Node::new(init.participants, num_ballots, mode, use_tags).run()
 }
 
 fn assert_log_consistency(logs: &[Vec<LogEntry>], num_ballots: u32) {
@@ -282,14 +312,127 @@ fn assert_log_consistency(logs: &[Vec<LogEntry>], num_ballots: u32) {
     }
 }
 
-fn run_protocol(
+fn partition_by_signature(signatures: &[Vec<bool>]) -> Vec<Vec<usize>> {
+    let mut by_signature: BTreeMap<Vec<bool>, Vec<usize>> = BTreeMap::new();
+    for (node_index, signature) in signatures.iter().enumerate() {
+        by_signature
+            .entry(signature.clone())
+            .or_default()
+            .push(node_index);
+    }
+    by_signature.into_values().collect()
+}
+
+fn build_ballot_options(num_nodes: usize, classes: &[Vec<usize>]) -> Vec<Vec<bool>> {
+    fn rec(
+        class_idx: usize,
+        classes: &[Vec<usize>],
+        ballot_proposers: &mut [bool],
+        out: &mut Vec<Vec<bool>>,
+    ) {
+        if class_idx == classes.len() {
+            out.push(ballot_proposers.to_vec());
+            return;
+        }
+        let class = &classes[class_idx];
+        for node in class {
+            ballot_proposers[*node] = false;
+        }
+        for count in 0..=class.len() {
+            if count > 0 {
+                ballot_proposers[class[count - 1]] = true;
+            }
+            rec(class_idx + 1, classes, ballot_proposers, out);
+        }
+    }
+
+    let mut out = Vec::new();
+    let mut ballot_proposers = vec![false; num_nodes];
+    rec(0, classes, &mut ballot_proposers, &mut out);
+    out
+}
+
+fn enumerate_symmetry_reduced_plans<F>(num_nodes: usize, num_ballots: u32, on_plan: &mut F) -> usize
+where
+    F: FnMut(SymmetryPlan) -> bool,
+{
+    fn rec<F>(
+        ballot_idx: usize,
+        num_nodes: usize,
+        num_ballots: usize,
+        proposer_signatures: &mut [Vec<bool>],
+        proposers_by_ballot: &mut Vec<Vec<bool>>,
+        produced: &mut usize,
+        on_plan: &mut F,
+    ) -> bool
+    where
+        F: FnMut(SymmetryPlan) -> bool,
+    {
+        if ballot_idx == num_ballots {
+            *produced += 1;
+            let plan = SymmetryPlan {
+                proposers_by_ballot: proposers_by_ballot.clone(),
+            };
+            return on_plan(plan);
+        }
+
+        let classes = partition_by_signature(proposer_signatures);
+        for ballot_proposers in build_ballot_options(num_nodes, &classes) {
+            for node_index in 0..num_nodes {
+                proposer_signatures[node_index].push(ballot_proposers[node_index]);
+            }
+            proposers_by_ballot.push(ballot_proposers);
+
+            if !rec(
+                ballot_idx + 1,
+                num_nodes,
+                num_ballots,
+                proposer_signatures,
+                proposers_by_ballot,
+                produced,
+                on_plan,
+            ) {
+                proposers_by_ballot.pop();
+                for node_index in 0..num_nodes {
+                    proposer_signatures[node_index].pop();
+                }
+                return false;
+            }
+
+            proposers_by_ballot.pop();
+            for node_index in 0..num_nodes {
+                proposer_signatures[node_index].pop();
+            }
+        }
+        true
+    }
+
+    let num_ballots = usize::try_from(num_ballots).expect("num_ballots does not fit usize");
+    let mut proposer_signatures = vec![Vec::<bool>::new(); num_nodes];
+    let mut proposers_by_ballot = Vec::new();
+    let mut produced = 0;
+    let _ = rec(
+        0,
+        num_nodes,
+        num_ballots,
+        &mut proposer_signatures,
+        &mut proposers_by_ballot,
+        &mut produced,
+        on_plan,
+    );
+    produced
+}
+
+fn run_protocol_for_plan(
     num_nodes: usize,
     num_ballots: u32,
     mode: ReceiveMode,
     use_tags: bool,
     parallel: ParallelMode,
+    proposer_plan: SymmetryPlan,
 ) -> traceforge::Stats {
-    let mut config = traceforge::Config::builder();
+    let mut config =
+        Config::builder().with_predetermined_choices(proposer_plan.to_predetermined_choices());
     match parallel {
         ParallelMode::Sequential => {}
         ParallelMode::Shared(workers) => {
@@ -314,12 +457,19 @@ fn run_protocol(
         let nodes = Participants::from_vec(handles.iter().map(|h| h.thread().id()).collect());
         for handle in &handles {
             if use_tags {
-                traceforge::send_msg(handle.thread().id(), Message::Init(nodes.clone()));
+                traceforge::send_msg(
+                    handle.thread().id(),
+                    Message::Init(InitMsg {
+                        participants: nodes.clone(),
+                    }),
+                );
             } else {
                 traceforge::send_tagged_msg(
                     handle.thread().id(),
                     INIT_TAG,
-                    Message::Init(nodes.clone()),
+                    Message::Init(InitMsg {
+                        participants: nodes.clone(),
+                    }),
                 );
             }
         }
@@ -330,6 +480,113 @@ fn run_protocol(
         }
         assert_log_consistency(&logs, num_ballots);
     })
+}
+
+#[derive(Default)]
+struct AggregatedStats {
+    execs: usize,
+    block: usize,
+    plans: usize,
+}
+
+impl AggregatedStats {
+    fn add(&mut self, stats: traceforge::Stats) {
+        self.execs += stats.execs;
+        self.block += stats.block;
+    }
+
+    fn merge(&mut self, other: AggregatedStats) {
+        self.execs += other.execs;
+        self.block += other.block;
+        self.plans += other.plans;
+    }
+}
+
+fn run_protocol(
+    num_nodes: usize,
+    num_ballots: u32,
+    mode: ReceiveMode,
+    use_tags: bool,
+    parallel: ParallelMode,
+    plan_workers: usize,
+) -> AggregatedStats {
+    if plan_workers > 1 {
+        return run_protocol_with_plan_workers(
+            num_nodes,
+            num_ballots,
+            mode,
+            use_tags,
+            parallel,
+            plan_workers,
+        );
+    }
+
+    let mut out = AggregatedStats::default();
+    let mut run_plan = |plan: SymmetryPlan| {
+        let stats = run_protocol_for_plan(num_nodes, num_ballots, mode, use_tags, parallel, plan);
+        out.add(stats);
+        out.plans += 1;
+        true
+    };
+    let _ = enumerate_symmetry_reduced_plans(num_nodes, num_ballots, &mut run_plan);
+    out
+}
+
+fn run_protocol_with_plan_workers(
+    num_nodes: usize,
+    num_ballots: u32,
+    mode: ReceiveMode,
+    use_tags: bool,
+    parallel: ParallelMode,
+    plan_workers: usize,
+) -> AggregatedStats {
+    if parallel != ParallelMode::Sequential {
+        panic!("--workers cannot be combined with --parallel or --rayon");
+    }
+
+    let mut plans = Vec::new();
+    let _ = enumerate_symmetry_reduced_plans(num_nodes, num_ballots, &mut |plan| {
+        plans.push(plan);
+        true
+    });
+
+    let plan_count = plans.len();
+    if plan_count == 0 {
+        return AggregatedStats::default();
+    }
+
+    let plans = Arc::new(Mutex::new(plans));
+    let worker_count = plan_workers.min(plan_count);
+    let mut handles = Vec::new();
+
+    for _ in 0..worker_count {
+        let plans = Arc::clone(&plans);
+        handles.push(std::thread::spawn(move || {
+            let mut out = AggregatedStats::default();
+            loop {
+                let plan = plans.lock().unwrap().pop();
+                let Some(plan) = plan else {
+                    return out;
+                };
+                let stats = run_protocol_for_plan(
+                    num_nodes,
+                    num_ballots,
+                    mode,
+                    use_tags,
+                    ParallelMode::Sequential,
+                    plan,
+                );
+                out.add(stats);
+                out.plans += 1;
+            }
+        }));
+    }
+
+    let mut out = AggregatedStats::default();
+    for handle in handles {
+        out.merge(handle.join().unwrap());
+    }
+    out
 }
 
 fn transport_mode(mode: ReceiveMode, use_tags: bool) -> TraceForgeTransportMode {
@@ -350,13 +607,14 @@ enum ParallelMode {
     Rayon(usize),
 }
 
-fn parse_args() -> (usize, u32, ReceiveMode, bool, ParallelMode) {
+fn parse_args() -> (usize, u32, ReceiveMode, bool, ParallelMode, usize) {
     let mut num_nodes = DEFAULT_NUM_NODES;
     let mut num_ballots = DEFAULT_NUM_BALLOTS;
     let mut mode = DEFAULT_MODE;
     let mut use_tags = DEFAULT_USE_TAGS;
     let mut explicit_wo_tags = false;
     let mut parallel = ParallelMode::Sequential;
+    let mut plan_workers = 1;
     let mut args = std::env::args().skip(1);
 
     while let Some(arg) = args.next() {
@@ -397,15 +655,32 @@ fn parse_args() -> (usize, u32, ReceiveMode, bool, ParallelMode) {
                 }
                 parallel = ParallelMode::Rayon(workers);
             }
+            "--workers" => {
+                if plan_workers != 1 {
+                    panic!("--workers can only be specified once");
+                }
+                plan_workers = parse_workers(&mut args, "--workers");
+            }
             _ => {
                 panic!(
-                    "unknown argument: {arg} (expected --nodes <n>, --ballots <n>, --mode <full|rounds|dpor>, --wo-tags, --parallel <n>, --rayon <n>)",
+                    "unknown argument: {arg} (expected --nodes <n>, --ballots <n>, --mode <full|rounds|dpor>, --wo-tags, --parallel <n>, --rayon <n>, --workers <n>)",
                 );
             }
         }
     }
 
-    (num_nodes, num_ballots, mode, use_tags, parallel)
+    if plan_workers > 1 && parallel != ParallelMode::Sequential {
+        panic!("--workers cannot be combined with --parallel or --rayon");
+    }
+
+    (
+        num_nodes,
+        num_ballots,
+        mode,
+        use_tags,
+        parallel,
+        plan_workers,
+    )
 }
 
 fn parse_workers(args: &mut impl Iterator<Item = String>, flag: &str) -> usize {
@@ -434,10 +709,18 @@ fn parse_mode(value: &str) -> (ReceiveMode, bool) {
 }
 
 fn main() {
-    let (num_nodes, num_ballots, mode, use_tags, parallel) = parse_args();
+    let (num_nodes, num_ballots, mode, use_tags, parallel, plan_workers) = parse_args();
     if !use_tags && mode == ReceiveMode::Inbox {
         panic!("--wo-tags is only supported with --mode rounds/recv");
     }
-    let stats = run_protocol(num_nodes, num_ballots, mode, use_tags, parallel);
+    let stats = run_protocol(
+        num_nodes,
+        num_ballots,
+        mode,
+        use_tags,
+        parallel,
+        plan_workers,
+    );
+    println!("Plans = {}", stats.plans);
     println!("Stats = {}, {}", stats.execs, stats.block);
 }

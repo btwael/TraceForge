@@ -278,7 +278,8 @@ fn run_protocol(
             config = config
                 .with_partitioned_parallelization(true)
                 .with_partitioned_num_threads(workers)
-                .with_partitioned_branching(BranchingStrategy::RevisitQueueRayon);
+                .with_partitioned_branching(BranchingStrategy::RevisitQueueRayon)
+                .with_iterations_until_split(5000);
         }
     }
 
@@ -327,7 +328,7 @@ fn transport_mode(mode: ReceiveMode, use_tags: bool) -> TraceForgeTransportMode 
         (ReceiveMode::Recv, true) => TraceForgeTransportMode::TaggedRepeatedRecv,
         (ReceiveMode::Recv, false) => TraceForgeTransportMode::UntaggedRepeatedRecv,
         (ReceiveMode::Inbox, false) => {
-            panic!("--wo-tags is only supported with --mode recv");
+            panic!("--wo-tags is only supported with --mode rounds/recv");
         }
     }
 }
@@ -344,6 +345,7 @@ fn parse_args() -> (usize, u32, ReceiveMode, bool, ParallelMode) {
     let mut num_rounds = DEFAULT_NUM_ROUNDS;
     let mut mode = DEFAULT_MODE;
     let mut use_tags = DEFAULT_USE_TAGS;
+    let mut explicit_wo_tags = false;
     let mut parallel = ParallelMode::Sequential;
     let mut args = std::env::args().skip(1);
 
@@ -363,13 +365,12 @@ fn parse_args() -> (usize, u32, ReceiveMode, bool, ParallelMode) {
             }
             "--mode" => {
                 let value = next_arg_value(&mut args, "--mode");
-                mode = match value.as_str() {
-                    "recv" => ReceiveMode::Recv,
-                    "inbox" => ReceiveMode::Inbox,
-                    _ => panic!("invalid --mode value: {value} (expected recv or inbox)"),
-                };
+                let parsed = parse_mode(&value);
+                mode = parsed.0;
+                use_tags = parsed.1 && !explicit_wo_tags;
             }
             "--wo-tags" => {
+                explicit_wo_tags = true;
                 use_tags = false;
             }
             "--parallel" => {
@@ -400,13 +401,22 @@ fn parse_args() -> (usize, u32, ReceiveMode, bool, ParallelMode) {
             }
             _ => {
                 panic!(
-                    "unknown argument: {arg} (expected only --participants <n>, --rounds <n>, --mode <recv|inbox>, --wo-tags, --parallel <n>, --rayon <n>)",
+                    "unknown argument: {arg} (expected only --participants <n>, --rounds <n>, --mode <full|rounds|dpor>, --wo-tags, --parallel <n>, --rayon <n>)",
                 );
             }
         }
     }
 
     (num_participants, num_rounds, mode, use_tags, parallel)
+}
+
+fn parse_mode(value: &str) -> (ReceiveMode, bool) {
+    match value {
+        "full" | "inbox" => (ReceiveMode::Inbox, true),
+        "rounds" | "recv" => (ReceiveMode::Recv, true),
+        "dpor" => (ReceiveMode::Recv, false),
+        _ => panic!("invalid --mode value: {value} (expected full, rounds, dpor, inbox, or recv)"),
+    }
 }
 
 fn next_arg_value(args: &mut impl Iterator<Item = String>, flag: &str) -> String {
@@ -417,7 +427,7 @@ fn next_arg_value(args: &mut impl Iterator<Item = String>, flag: &str) -> String
 fn main() {
     let (num_participants, num_rounds, mode, use_tags, parallel) = parse_args();
     if !use_tags && mode == ReceiveMode::Inbox {
-        panic!("--wo-tags is only supported with --mode recv");
+        panic!("--wo-tags is only supported with --mode rounds/recv");
     }
     let stats = run_protocol(num_participants, num_rounds, mode, use_tags, parallel);
     println!("Stats = {}, {}", stats.execs, stats.block);

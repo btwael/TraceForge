@@ -1,0 +1,245 @@
+[settings]
+bin_dir = "./target/release"
+results_dir = "results"
+available_cores = 16
+timeout_hours = 51
+snapshot_interval_hours = 1
+jobs = 4
+
+[protocol.two_pc]
+binary = "protocol_two_pc"
+
+[protocol.three_pc]
+binary = "protocol_three_pc"
+
+[protocol.replica_versioning]
+binary = "protocol_replica_versioning"
+
+[protocol.async_leader_election]
+binary = "protocol_async_leader_election"
+
+[protocol.async_leader_election_sym]
+binary = "protocol_async_leader_election_sym"
+supports_workers = true
+
+[protocol.last_voting]
+binary = "protocol_last_voting"
+
+[protocol.paxos]
+binary = "protocol_paxos"
+
+[protocol.raft]
+binary = "protocol_raft"
+
+[protocol.viewstamp_replication]
+binary = "protocol_viewstamp_replication"
+
+[[run]]
+protocol = "two_pc"
+rounds = 1
+participants = 3
+modes = ["full", "rounds"]
+
+[[run]]
+protocol = "two_pc"
+rounds = 1
+participants = 4
+modes = ["full", "rounds"]
+
+[[run]]
+protocol = "two_pc"
+rounds = 1
+participants = 5
+modes = ["full", "rounds"]
+
+[[run]]
+protocol = "two_pc"
+rounds = 1
+participants = 6
+modes = ["full", "rounds"]
+
+[[run]]
+protocol = "two_pc"
+rounds = 1
+participants = 7
+modes = ["full", "rounds"]
+
+[[run]]
+protocol = "two_pc"
+rounds = 1
+participants = 8
+modes = ["full", "rounds"]
+
+[[run]]
+protocol = "two_pc"
+rounds = 1
+participants = 9
+modes = ["full", "rounds"]
+
+[[run]]
+protocol = "two_pc"
+rounds = 1
+participants = 10
+modes = ["full", "rounds"]
+
+[[run]]
+protocol = "replica_versioning"
+versions = 2
+nodes = 3
+modes = ["full", "rounds", "dpor"]
+
+[[run]]
+protocol = "replica_versioning"
+versions = 2
+nodes = 4
+modes = ["full", "rounds", "dpor"]
+
+[[run]]
+protocol = "replica_versioning"
+versions = 2
+nodes = 5
+modes = ["full", "rounds", "dpor"]
+
+[[run]]
+protocol = "replica_versioning"
+versions = 2
+nodes = 6
+modes = ["full", "rounds", "dpor"]
+
+[[run]]
+protocol = "async_leader_election"
+ballots = 1
+nodes = 3
+modes = ["full", "rounds", "dpor"]
+
+[[run]]
+protocol = "async_leader_election"
+ballots = 1
+nodes = 4
+modes = ["full", "rounds", "dpor"]
+
+[[run]]
+protocol = "async_leader_election"
+ballots = 2
+nodes = 3
+modes = ["full", "rounds", "dpor"]
+
+[[run]]
+protocol = "paxos"
+ballots = 1
+nodes = 3
+modes = ["full", "rounds", "dpor"]
+
+[[run]]
+protocol = "paxos"
+ballots = 2
+nodes = 3
+modes = ["full", "rounds", "dpor"]
+
+[[run]]
+protocol = "last_voting"
+phases = 1
+nodes = 3
+modes = ["full", "rounds", "dpor"]
+
+[[run]]
+protocol = "last_voting"
+phases = 2
+nodes = 4
+modes = ["full", "rounds", "dpor"]
+
+[[run]]
+protocol = "raft"
+terms = 1
+nodes = 3
+modes = ["full", "rounds", "dpor"]
+
+[[run]]
+protocol = "raft"
+terms = 2
+nodes = 3
+modes = ["full", "rounds", "dpor"]
+
+[[run]]
+protocol = "viewstamp_replication"
+views = 1
+ops = 2
+nodes = 3
+modes = ["full", "rounds", "dpor"]
+
+[[run]]
+protocol = "viewstamp_replication"
+views = 2
+ops = 2
+nodes = 3
+modes = ["full", "rounds", "dpor"]
+
+[[run]]
+protocol = "three_pc"
+rounds = 1
+participants = 5
+modes = ["full", "rounds", "dpor"]
+
+[[run]]
+protocol = "three_pc"
+rounds = 1
+participants = 6
+modes = ["full", "rounds", "dpor"]
+
+[[run]]
+protocol = "three_pc"
+rounds = 1
+participants = 7
+modes = ["full", "rounds", "dpor"]
+
+[[run]]
+protocol = "three_pc"
+rounds = 1
+participants = 8
+modes = ["full", "rounds", "dpor"]
+
+[[run]]
+protocol = "three_pc"
+rounds = 2
+participants = 3
+modes = ["full", "rounds", "dpor"]
+
+[[run]]
+protocol = "three_pc"
+rounds = 2
+participants = 4
+modes = ["full", "rounds", "dpor"]
+
+[[run]]
+protocol = "three_pc"
+rounds = 2
+participants = 5
+modes = ["full", "rounds", "dpor"]
+
+[[run]]
+protocol = "async_leader_election_sym"
+ballots = 1
+nodes = 3
+modes = ["full", "rounds", "dpor"]
+workers = 57
+
+[[run]]
+protocol = "async_leader_election_sym"
+ballots = 1
+nodes = 4
+modes = ["full", "rounds", "dpor"]
+workers = 57
+
+[[run]]
+protocol = "async_leader_election_sym"
+ballots = 2
+nodes = 3
+modes = ["full", "rounds", "dpor"]
+workers = 57
+
+[[run]]
+protocol = "async_leader_election_sym"
+ballots = 2
+nodes = 5
+modes = ["dpor"]
+workers = 230
