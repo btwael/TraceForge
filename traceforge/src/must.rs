@@ -1269,12 +1269,12 @@ impl Must {
             debug!("[DEBUG] All events were replayed.");
         }
         let elapsed = Instant::now() - self.started_at;
+        let graph_events = self.current.graph.event_count();
         if maybe_block.is_some() {
             if self.is_consistent() {
                 self.telemetry.counter(BLOCKED.to_owned()); // increment BLOCKED
-                let event_count: usize = self.current.graph.threads.iter().map(|t| t.labels.len()).sum();
-                if event_count > self.max_graph_events {
-                    self.max_graph_events = event_count;
+                if graph_events > self.max_graph_events {
+                    self.max_graph_events = graph_events;
                 }
                 if self.config.verbose >= 2 {
                     println!("One more blocked execution");
@@ -1284,9 +1284,8 @@ impl Must {
             }
         } else if self.is_consistent() {
             self.telemetry.counter(EXECS.to_owned()); // increment EXECS
-            let event_count: usize = self.current.graph.threads.iter().map(|t| t.labels.len()).sum();
-            if event_count > self.max_graph_events {
-                self.max_graph_events = event_count;
+            if graph_events > self.max_graph_events {
+                self.max_graph_events = graph_events;
             }
             self.print_turmoil_trace();
             if self.config.verbose >= 1 {
@@ -1304,8 +1303,8 @@ impl Must {
             format!(" ({:.2}/sec)", num_total as f64 / elapsed.as_secs() as f64)
         };
         let progress_desc = format!(
-            "Executions attempted so far: {} total {} finished normally {} blocked{}.",
-            num_total, num_execs, num_blocked, speed
+            "Executions attempted so far: {} total {} finished normally {} blocked{}. graph_events={} max_graph_events={}.",
+            num_total, num_execs, num_blocked, speed, graph_events, self.max_graph_events
         );
 
         if self.config.progress_report > 0 {

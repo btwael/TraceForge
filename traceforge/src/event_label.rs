@@ -1151,7 +1151,13 @@ as_label!(CToss);
 impl fmt::Display for CToss {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if let Some(ref name) = self.name {
-            write!(f, "{}: NONDET({}) {}", self.as_event_label(), name, self.result())
+            write!(
+                f,
+                "{}: NONDET({}) {}",
+                self.as_event_label(),
+                name,
+                self.result()
+            )
         } else {
             write!(f, "{}: NONDET {}", self.as_event_label(), self.result())
         }

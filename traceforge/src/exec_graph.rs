@@ -386,6 +386,10 @@ impl ExecutionGraph {
         self.get_thr(&t).labels.len()
     }
 
+    pub(crate) fn event_count(&self) -> usize {
+        self.threads.iter().map(|thread| thread.labels.len()).sum()
+    }
+
     pub(crate) fn thread_last(&self, t: ThreadId) -> Option<&LabelEnum> {
         self.get_thr(&t).labels.last()
     }

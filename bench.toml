@@ -1,10 +1,10 @@
 [settings]
 bin_dir = "./target/release"
 results_dir = "results"
-available_cores = 16
+available_cores = 250
 timeout_hours = 51
 snapshot_interval_hours = 1
-jobs = 4
+jobs = 250
 
 [protocol.two_pc]
 binary = "protocol_two_pc"
