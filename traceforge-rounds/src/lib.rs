@@ -5,6 +5,7 @@ mod error;
 mod round;
 mod rounds;
 mod scheme;
+pub mod set;
 mod transport;
 
 pub use comm::{Comm, CommError};

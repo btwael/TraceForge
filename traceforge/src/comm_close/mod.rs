@@ -1,5 +1,10 @@
 use std::{any::type_name, convert::Infallible, sync::Arc};
 
+#[path = "set.rs"]
+mod set_impl;
+
+pub use set_impl::{set, set_with, Set, TraceForgeSetTransport, TraceForgeSetTransportError};
+
 use traceforge_rounds::{Envelope, RoundScheme, Transport};
 
 use crate::{msg::Message, thread::ThreadId, Nondet};
@@ -241,7 +246,7 @@ where
     messages
 }
 
-fn repeated_recv_count(min: usize, max: Option<usize>) -> usize {
+pub(crate) fn repeated_recv_count(min: usize, max: Option<usize>) -> usize {
     let Some(max) = max else {
         assert!(
             min > 0,
