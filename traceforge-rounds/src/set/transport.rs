@@ -26,6 +26,10 @@ pub trait SetTransport<K, R: Round, M> {
     where
         F: Fn(&R, &R) -> bool + Send + Sync + 'static;
 
+    fn recv_keyed<F>(&mut self, filter: F) -> Result<Option<SetEnvelope<K, R, M>>, Self::Error>
+    where
+        F: Fn(&K, &R) -> bool + Send + Sync + 'static;
+
     fn inbox<F>(
         &mut self,
         key: &K,

@@ -44,6 +44,47 @@ where
     fn rounds_for_mut(&mut self, key: &K) -> &mut Rounds<R> {
         self.rounds.entry(key.clone()).or_default()
     }
+
+    pub fn recv_stamped_keyed_with<M, F>(
+        &mut self,
+        filter: F,
+    ) -> Result<Option<(K, R, M)>, SetCommError<K, R, M, <T as SetTransport<K, R, M>>::Error>>
+    where
+        T: SetTransport<K, R, M>,
+        K: Send + Sync + 'static,
+        R: Send + Sync,
+        M: 'static,
+        F: Fn(&K, &R, &R) -> bool + Send + Sync + 'static,
+    {
+        let local_rounds = self
+            .rounds
+            .iter()
+            .map(|(key, rounds)| (key.clone(), rounds.current().clone()))
+            .collect::<HashMap<_, _>>();
+        let received = self
+            .transport
+            .recv_keyed(move |key, remote| {
+                let current = local_rounds.get(key).cloned().unwrap_or_else(R::initial);
+                is_not_past(remote, &current) && filter(key, &current, remote)
+            })
+            .map_err(SetCommError::Transport)?;
+
+        match received {
+            Some(envelope) => {
+                let key = envelope.key().clone();
+                let current = self.rounds_for_mut(&key).current().clone();
+                if is_not_past(envelope.stamp(), &current) {
+                    let (key, stamp, msg) = envelope.into_parts();
+                    Ok(Some((key, stamp, msg)))
+                } else {
+                    Err(SetCommError::Stale(StaleSetEnvelope::new(
+                        key, current, envelope,
+                    )))
+                }
+            }
+            None => Ok(None),
+        }
+    }
 }
 
 pub struct SetLane<'a, K, R: Round, T> {
@@ -535,6 +576,20 @@ mod tests {
                 .expect("test transport has no matching message"))
         }
 
+        fn recv_keyed<F>(
+            &mut self,
+            filter: F,
+        ) -> Result<Option<SetEnvelope<Slot, TestRound, Msg>>, Self::Error>
+        where
+            F: Fn(&Slot, &TestRound) -> bool + Send + Sync + 'static,
+        {
+            let pos = self
+                .queue
+                .iter()
+                .position(|entry| filter(entry.key(), entry.stamp()));
+            Ok(pos.and_then(|pos| self.queue.remove(pos)))
+        }
+
         fn inbox<F>(
             &mut self,
             key: &Slot,
@@ -615,5 +670,22 @@ mod tests {
 
         let slot6 = comm.on(Slot(6)).recv::<Msg>().unwrap();
         assert_eq!(slot6, Some(Msg::B));
+    }
+
+    #[test]
+    fn keyed_receive_uses_the_matching_keys_local_round() {
+        let mut comm = SetComm::<Slot, TestRound, TestTransport>::new(TestTransport::default());
+
+        comm.on(Slot(5)).rounds().advance(TestDim::Step);
+        comm.transport_mut()
+            .push(SetEnvelope::new(Slot(5), TestRound { step: 0 }, Msg::A));
+        comm.transport_mut()
+            .push(SetEnvelope::new(Slot(6), TestRound { step: 0 }, Msg::B));
+
+        let received = comm
+            .recv_stamped_keyed_with::<Msg, _>(|_key, local, remote| remote.step == local.step)
+            .unwrap();
+
+        assert_eq!(received, Some((Slot(6), TestRound { step: 0 }, Msg::B)));
     }
 }

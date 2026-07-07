@@ -163,6 +163,13 @@ modes = ["full", "rounds", "dpor"]
 [[run]]
 protocol = "viewstamp_replication"
 views = 1
+ops = 1
+nodes = 3
+modes = ["full", "rounds", "dpor"]
+
+[[run]]
+protocol = "viewstamp_replication"
+views = 1
 ops = 2
 nodes = 3
 modes = ["full", "rounds", "dpor"]
@@ -170,6 +177,27 @@ modes = ["full", "rounds", "dpor"]
 [[run]]
 protocol = "viewstamp_replication"
 views = 2
+ops = 1
+nodes = 3
+modes = ["full", "rounds", "dpor"]
+
+[[run]]
+protocol = "viewstamp_replication"
+views = 2
+ops = 2
+nodes = 3
+modes = ["full", "rounds", "dpor"]
+
+[[run]]
+protocol = "viewstamp_replication"
+views = 3
+ops = 1
+nodes = 3
+modes = ["full", "rounds", "dpor"]
+
+[[run]]
+protocol = "viewstamp_replication"
+views = 3
 ops = 2
 nodes = 3
 modes = ["full", "rounds", "dpor"]

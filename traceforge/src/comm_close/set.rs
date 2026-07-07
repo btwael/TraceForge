@@ -137,6 +137,21 @@ where
         }
     }
 
+    fn recv_keyed<F>(&mut self, filter: F) -> Result<Option<SetEnvelope<K, R, M>>, Self::Error>
+    where
+        F: Fn(&K, &R) -> bool + Send + Sync + 'static,
+    {
+        match self.mode {
+            TraceForgeTransportMode::TaggedNativeInbox
+            | TraceForgeTransportMode::TaggedRepeatedRecv => Ok(recv_set_keyed(filter)),
+            TraceForgeTransportMode::UntaggedRepeatedRecv => {
+                Err(TraceForgeSetTransportError::UnsupportedMode(
+                    TraceForgeTransportMode::UntaggedRepeatedRecv,
+                ))
+            }
+        }
+    }
+
     fn inbox<F>(
         &mut self,
         key: &K,
@@ -178,6 +193,21 @@ where
             return false;
         };
         remote_key == local_key && filter(&local_round, &remote_round)
+    })
+}
+
+fn recv_set_keyed<K, R, M, F>(filter: F) -> Option<SetEnvelope<K, R, M>>
+where
+    K: KeyScheme + Send + Sync,
+    R: RoundScheme + Send + Sync,
+    M: Message + Clone + PartialEq + std::fmt::Debug + 'static,
+    F: Fn(&K, &R) -> bool + Send + Sync + 'static,
+{
+    crate::recv_vec_tagged_msg(move |_, tag| {
+        let Some((remote_key, remote_round)) = decode_set_remote::<K, R>(tag) else {
+            return false;
+        };
+        filter(&remote_key, &remote_round)
     })
 }
 
