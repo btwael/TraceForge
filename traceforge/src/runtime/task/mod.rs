@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::fmt::Debug;
 use std::rc::Rc;
+use crate::summarizable::SummarizableCallId;
 
 // A note on terminology: we have competing notions of threads floating around. Here's the
 // convention for disambiguating them:
@@ -34,6 +35,9 @@ pub(crate) struct Task {
     pub(super) continuation: Rc<RefCell<PooledContinuation>>,
     pub(crate) instructions: usize,
     name: Option<String>,
+
+    // The active summarizable call provides communication closure for its messages.
+    summarizable_call: Option<SummarizableCallId>,
 }
 
 impl Task {
@@ -52,6 +56,7 @@ impl Task {
             continuation,
             instructions: 0,
             name,
+            summarizable_call: None,
         }
     }
 
@@ -101,6 +106,26 @@ impl Task {
 
     pub(crate) fn name(&self) -> Option<String> {
         self.name.clone()
+    }
+
+    pub(crate) fn summarizable_call(&self) -> Option<&SummarizableCallId> {
+        self.summarizable_call.as_ref()
+    }
+
+    pub(crate) fn enter_summarizable_call(&mut self, call: SummarizableCallId) {
+        assert!(
+            self.summarizable_call.is_none(),
+            "nested summarizable function calls are not supported"
+        );
+        self.summarizable_call = Some(call);
+    }
+
+    pub(crate) fn leave_summarizable_call(&mut self) {
+        assert!(
+            self.summarizable_call.is_some(),
+            "task left a summarizable function without entering one"
+        );
+        self.summarizable_call = None;
     }
 }
 

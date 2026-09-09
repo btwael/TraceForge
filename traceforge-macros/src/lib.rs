@@ -7,7 +7,7 @@ use syn::parse::{Parse, ParseStream, Result};
 use syn::punctuated::Punctuated;
 use syn::spanned::Spanned;
 use syn::token::{Comma, PathSep};
-use syn::{DeriveInput, Generics, PathSegment, TypePath};
+use syn::{DeriveInput, FnArg, Generics, ItemFn, Pat, PathSegment, TypePath};
 
 struct MsgTypes {
     types: Vec<MsgVariant>,
@@ -124,6 +124,145 @@ fn intos(name: &Ident, types: &MsgTypes) -> TokenStream {
     quote! {
         #(#intos)*
     }
+}
+
+/// Mark a synchronous collective function as summarizable.
+#[proc_macro_attribute]
+pub fn summarizable(
+    attr: proc_macro::TokenStream,
+    input: proc_macro::TokenStream,
+) -> proc_macro::TokenStream {
+    if !attr.is_empty() {
+        return syn::Error::new(
+            proc_macro2::Span::call_site(),
+            "#[summarizable] does not accept arguments",
+        )
+        .to_compile_error()
+        .into();
+    }
+
+    let function = syn::parse_macro_input!(input as ItemFn);
+
+    expand_summarizable(function)
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
+
+fn expand_summarizable(function: ItemFn) -> syn::Result<TokenStream> {
+    let ItemFn {
+        attrs,
+        vis,
+        sig,
+        block,
+    } = function;
+
+    if sig.asyncness.is_some() {
+        return Err(syn::Error::new(
+            sig.span(),
+            "#[summarizable] functions cannot be async",
+        ));
+    }
+
+    if sig.constness.is_some() || sig.unsafety.is_some() || sig.abi.is_some() {
+        return Err(syn::Error::new(
+            sig.span(),
+            "#[summarizable] supports only ordinary safe Rust functions",
+        ));
+    }
+
+    if !sig.generics.params.is_empty() || sig.generics.where_clause.is_some() {
+        return Err(syn::Error::new(
+            sig.generics.span(),
+            "#[summarizable] does not yet support generic functions",
+        ));
+    }
+
+    let mut arguments = Vec::new();
+
+    for input in &sig.inputs {
+        let FnArg::Typed(argument) = input else {
+            return Err(syn::Error::new(
+                input.span(),
+                "#[summarizable] can annotate only free functions",
+            ));
+        };
+
+        let Pat::Ident(identifier) = argument.pat.as_ref() else {
+            return Err(syn::Error::new(
+                argument.pat.span(),
+                "#[summarizable] parameters must use simple identifiers",
+            ));
+        };
+
+        if identifier.by_ref.is_some() || identifier.subpat.is_some() {
+            return Err(syn::Error::new(
+                identifier.span(),
+                "#[summarizable] parameters cannot use ref or subpatterns",
+            ));
+        }
+
+        arguments.push(identifier.ident.clone());
+    }
+
+    let function_name = &sig.ident;
+    let body_name = syn::Ident::new(
+        &format!("__traceforge_summarizable_body_{}", function_name,),
+        function_name.span(),
+    );
+
+    let mut body_signature = sig.clone();
+    body_signature.ident = body_name.clone();
+
+    Ok(quote! {
+        // Private function containing exactly the user's original body.
+        #body_signature #block
+
+        // User-visible function retaining the original name and signature.
+        #(#attrs)*
+        #vis #sig {
+            const __TRACEFORGE_SUMMARIZABLE:
+                ::traceforge::summarizable::SummarizableFunctionDescriptor =
+                ::traceforge::summarizable::SummarizableFunctionDescriptor::new(
+                    concat!(
+                        module_path!(),
+                        "::",
+                        stringify!(#function_name),
+                    ),
+                );
+
+            // Clone only for the summary key. The originals are still moved
+            // into the body when no summary exists.
+            let __traceforge_arguments = ::traceforge::Val::new((
+                #(#arguments.clone(),)*
+            ));
+
+            match ::traceforge::summarizable::__enter(
+                __TRACEFORGE_SUMMARIZABLE,
+                __traceforge_arguments,
+            ) {
+                ::traceforge::summarizable::SummaryDispatch::ExecuteBody(
+                    __traceforge_call,
+                ) => {
+                    let __traceforge_return_value = #body_name(
+                        #(#arguments),*
+                    );
+
+                    ::traceforge::summarizable::__complete_body(
+                        __traceforge_call,
+                        ::traceforge::Val::new(__traceforge_return_value),
+                    )
+                }
+
+                ::traceforge::summarizable::SummaryDispatch::ApplySummary(
+                    __traceforge_call,
+                ) => {
+                    ::traceforge::summarizable::__apply_summary(
+                        __traceforge_call,
+                    )
+                }
+            }
+        }
+    })
 }
 
 fn monitor_code(aname: &Ident, gen: &Generics, name: &Ident, types: &MsgTypes) -> TokenStream {

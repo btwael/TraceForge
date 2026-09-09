@@ -16,6 +16,8 @@ use log::debug;
 #[cfg(feature = "symbolic")]
 use crate::symbolic::{SymExpr, SymSort, SymVarId};
 
+use crate::summarizable::SummarizableCallId;
+
 #[derive(Clone, Serialize, Deserialize)]
 pub(crate) enum LabelEnum {
     Begin(Begin),
@@ -324,6 +326,7 @@ impl LabelEnum {
             // If ever needed, return true since we can compare neither locations
             // (they are lost during deserialization) nor tags (they are predicates)
             (BlockType::Value(_, _), BlockType::Value(_, _)) => unreachable!(),
+            (BlockType::SummaryOutcome(left), BlockType::SummaryOutcome(right)) => left == right,
             _ => false,
         }
     }
@@ -331,7 +334,9 @@ impl LabelEnum {
     // Only compare sender and tag, since the location is lost during (de)serialization
     // and will be constructed from the new one
     fn slocs_are_compatible(loc1: &SendLoc, loc2: &SendLoc) -> bool {
-        loc1.sender_tid == loc2.sender_tid && loc1.tag == loc2.tag
+        loc1.sender_tid == loc2.sender_tid
+            && loc1.tag == loc2.tag
+            && loc1.summarizable_call() == loc2.summarizable_call()
     }
 
     pub(crate) fn get_action_descr(&self) -> String {
@@ -1151,7 +1156,13 @@ as_label!(CToss);
 impl fmt::Display for CToss {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if let Some(ref name) = self.name {
-            write!(f, "{}: NONDET({}) {}", self.as_event_label(), name, self.result())
+            write!(
+                f,
+                "{}: NONDET({}) {}",
+                self.as_event_label(),
+                name,
+                self.result()
+            )
         } else {
             write!(f, "{}: NONDET {}", self.as_event_label(), self.result())
         }
@@ -1256,6 +1267,9 @@ pub(crate) enum BlockType {
     // Internal blocking
     Value(RecvLoc, usize),
     Join(ThreadId),
+
+    // The selected summary outcome blocks internally.
+    SummaryOutcome(SummarizableCallId),
 }
 
 // Block events are used in two different ways:

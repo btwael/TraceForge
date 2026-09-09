@@ -2,9 +2,9 @@ use crate::cons::Consistency;
 use crate::event::Event;
 use crate::exec_graph::{ExecutionGraph, RecvLike};
 use crate::exec_pool::ExecutionPool;
-use crate::revisit::{Revisit, RevisitEnum, RevisitPlacement};
 use crate::future::PollerMsg;
 use crate::loc::{Loc, WakeMsg};
+use crate::revisit::{Revisit, RevisitEnum, RevisitPlacement};
 use crate::runtime::failure::init_panic_hook;
 use crate::runtime::task::TaskId;
 use crate::telemetry::{Recorder, Telemetry};
@@ -37,6 +37,11 @@ use std::any::TypeId;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs::File;
 use std::io::Write;
+
+use crate::summarizable::{
+    EntryAction, ParticipantValues, SummarizableCallHandle, SummarizableCallId,
+    SummarizableFunctionId, SummarizationRuntime, SummaryOutcome,
+};
 
 const EXECS: &str = "execs";
 const BLOCKED: &str = "blocked";
@@ -112,6 +117,21 @@ pub(crate) struct MonitorInfo {
 
 type ExecutionGraphEnqueuePair = (Arc<Mutex<VecDeque<Option<ExecutionGraph>>>>, Arc<Condvar>);
 
+/// State for exploring one exact summary case.
+struct SummaryExplorationFrame {
+    call: SummarizableCallId,
+    function: SummarizableFunctionId,
+    inputs: ParticipantValues,
+
+    // State of the caller at the collective entry cut.
+    entry_graph: ExecutionGraph,
+    caller_rqueue: RQueue,
+    caller_states: StateStack,
+
+    // Distinct completed/blocked body results found so far.
+    outcomes: Vec<SummaryOutcome>,
+}
+
 // No getters so that the borrow checker does not get confused
 pub(crate) struct Must {
     states: StateStack,
@@ -148,6 +168,11 @@ pub(crate) struct Must {
     pub(crate) global_named_choices: HashMap<String, bool>,
     // Maximum number of events across all complete (non-blocked) execution graphs
     max_graph_events: usize,
+
+    // Persistent summaries and per-execution collective-call state.
+    summarization: SummarizationRuntime,
+    // Active exploration of one exact summary case.
+    active_summary_exploration: Option<SummaryExplorationFrame>,
 }
 
 impl Must {
@@ -185,6 +210,8 @@ impl Must {
             symbolic_solver: SymbolicSolver::new(),
             global_named_choices: HashMap::new(),
             max_graph_events: 0,
+            summarization: SummarizationRuntime::new(),
+            active_summary_exploration: None,
         }
     }
 
@@ -212,6 +239,8 @@ impl Must {
         #[cfg(feature = "symbolic")]
         self.symbolic_solver.reset();
         self.global_named_choices.clear();
+        self.summarization = SummarizationRuntime::new();
+        self.active_summary_exploration = None;
     }
 
     pub(crate) fn gen_bool(&mut self) -> bool {
@@ -233,6 +262,7 @@ impl Must {
         #[cfg(feature = "symbolic")]
         must.symbolic_solver.reset();
         must.current.graph.initialize_for_execution();
+        must.summarization.begin_execution();
         must.telemetry.coverage.new_eid();
 
         // Reset per-execution state for named choices
@@ -349,6 +379,8 @@ impl Must {
         // Note: frozen_thread_index_map, thread_index_map, next_thread_index,
         // config, rng are intentionally NOT reset — they are either set
         // explicitly by the caller (frozen map) or persist across tasks.
+        self.summarization = SummarizationRuntime::new();
+        self.active_summary_exploration = None;
     }
 
     /// Drain only the saved states (not current). Returns them as work items.
@@ -489,10 +521,10 @@ impl Must {
                         // from a PollerMsg::Cancel.
                         assert!(
                             slab.is_monitored_from(&pos.thread)
-                            || slab.is_monitored_from(&reader.thread)
-                            || (slab.val.as_any_ref().downcast_ref::<PollerMsg>().is_none()
-                            && slab.val.as_any_ref().downcast_ref::<WakeMsg>().is_none()
-                            && g.get_thr(&reader.thread).labels[(reader.index as usize + 1)..]
+                                || slab.is_monitored_from(&reader.thread)
+                                || (slab.val.as_any_ref().downcast_ref::<PollerMsg>().is_none()
+                                && slab.val.as_any_ref().downcast_ref::<WakeMsg>().is_none()
+                                && g.get_thr(&reader.thread).labels[(reader.index as usize + 1)..]
                                 .iter()
                                 .any(|lab| {
                                     if let LabelEnum::RecvMsg(recv) = lab {
@@ -655,12 +687,20 @@ impl Must {
 
     /// Returns the filtered_origination_vec for the given thread.
     pub(crate) fn thread_filtered_origination_vec_from_tid(&self, tid: ThreadId) -> Vec<u32> {
-        self.current.graph.get_thread_tclab(tid).filtered_origination_vec()
+        self.current
+            .graph
+            .get_thread_tclab(tid)
+            .filtered_origination_vec()
     }
 
     /// Counts the number of TCreate events in the given thread up to and including
     /// the specified event index, excluding those whose names contain the filter pattern.
-    fn count_filtered_tcreate_events(&self, thread: ThreadId, up_to_index: u32, filter_pattern: &str) -> u32 {
+    fn count_filtered_tcreate_events(
+        &self,
+        thread: ThreadId,
+        up_to_index: u32,
+        filter_pattern: &str,
+    ) -> u32 {
         let mut count = 0;
         let thread_size = self.current.graph.thread_size(thread) as u32;
 
@@ -697,6 +737,12 @@ impl Must {
         name: Option<String>,
         is_daemon: bool,
     ) {
+        assert!(
+            // TODO: Remove this restriction once summarization no longer requires a sealed set.
+            !self.summarization.participants_are_sealed(),
+            "threads cannot be spawned after seal_summarization_participants()"
+        );
+
         let parent_tclab: TCreate = self.current.graph.get_thread_tclab(pos.thread);
         let mut origination_vec = parent_tclab.origination_vec();
         origination_vec.push(pos.index);
@@ -706,11 +752,19 @@ impl Must {
         let filtered_count = self.count_filtered_tcreate_events(
             pos.thread,
             pos.index,
-            crate::FILTERED_THREAD_NAME_PATTERN
+            crate::FILTERED_THREAD_NAME_PATTERN,
         );
         filtered_origination_vec.push(filtered_count);
 
-        let tclab = TCreate::new(pos, tid, name, is_daemon, sym_cid, origination_vec, filtered_origination_vec);
+        let tclab = TCreate::new(
+            pos,
+            tid,
+            name,
+            is_daemon,
+            sym_cid,
+            origination_vec,
+            filtered_origination_vec,
+        );
 
         if self.is_replay(pos) {
             info!("| Replay Mode for {}", tclab);
@@ -1135,7 +1189,9 @@ impl Must {
                 // at least *2* instructions before it (see event_label::Block)
                 BlockType::Join(_) | BlockType::Value(_, _) => (*i as u32) < blab.pos().index - 1,
                 // it's a user blocking and the instruction points before it
-                BlockType::Assume | BlockType::Assert => (*i as u32) < blab.pos().index,
+                BlockType::Assume | BlockType::Assert | BlockType::SummaryOutcome(_) => {
+                    (*i as u32) < blab.pos().index
+                }
             },
             // or the last event is not Block
             _ => true,
@@ -1231,6 +1287,9 @@ impl Must {
     /// the ability to call into Must model code (the monitor on_stop) while
     /// not holding a reference to entire Must object.
     pub(crate) fn complete_execution(must: &Rc<RefCell<Must>>) -> bool {
+        if must.borrow().active_summary_exploration.is_some() {
+            return must.borrow_mut().complete_summary_body_execution();
+        }
         let maybe_block = must.borrow_mut().check_blocked();
         let exceeded_max_executions = must.borrow_mut().record_ending_telemetry(&maybe_block);
 
@@ -1238,7 +1297,9 @@ impl Must {
             None => EndCondition::AllThreadsCompleted,
             Some(block) => match block {
                 BlockType::Assume | BlockType::Assert => EndCondition::FailedAssumption,
-                BlockType::Value(_, _) | BlockType::Join(_) => EndCondition::Deadlock,
+                BlockType::Value(_, _) | BlockType::Join(_) | BlockType::SummaryOutcome(_) => {
+                    EndCondition::Deadlock
+                }
             },
         };
 
@@ -1272,7 +1333,13 @@ impl Must {
         if maybe_block.is_some() {
             if self.is_consistent() {
                 self.telemetry.counter(BLOCKED.to_owned()); // increment BLOCKED
-                let event_count: usize = self.current.graph.threads.iter().map(|t| t.labels.len()).sum();
+                let event_count: usize = self
+                    .current
+                    .graph
+                    .threads
+                    .iter()
+                    .map(|t| t.labels.len())
+                    .sum();
                 if event_count > self.max_graph_events {
                     self.max_graph_events = event_count;
                 }
@@ -1284,7 +1351,13 @@ impl Must {
             }
         } else if self.is_consistent() {
             self.telemetry.counter(EXECS.to_owned()); // increment EXECS
-            let event_count: usize = self.current.graph.threads.iter().map(|t| t.labels.len()).sum();
+            let event_count: usize = self
+                .current
+                .graph
+                .threads
+                .iter()
+                .map(|t| t.labels.len())
+                .sum();
             if event_count > self.max_graph_events {
                 self.max_graph_events = event_count;
             }
@@ -1955,7 +2028,10 @@ impl Must {
 
     pub(crate) fn try_revisit(&mut self) -> bool {
         loop {
-            debug!("Finished execution with current rqueue {:?}", self.current.rqueue.clone());
+            debug!(
+                "Finished execution with current rqueue {:?}",
+                self.current.rqueue.clone()
+            );
             if self.current.rqueue.is_empty() {
                 if self.try_pop_state() {
                     continue;
@@ -2507,6 +2583,192 @@ impl Must {
             RevisitPlacement::Default(ev) => ev.to_string(),
             RevisitPlacement::Inbox(v) => self.fmt_event_set(v),
         }
+    }
+
+    pub(crate) fn seal_summarization_participants(&mut self, participants: Vec<ThreadId>) {
+        assert!(
+            !self.config.parallel && !self.config.partitioned_parallelization,
+            "function summarization supports serial verification only"
+        );
+
+        assert_eq!(
+            self.config.mode,
+            ExplorationMode::Verification,
+            "function summarization supports verification mode only"
+        );
+
+        assert!(
+            self.monitors.is_empty(),
+            "function summarization does not yet support monitors"
+        );
+
+        #[cfg(feature = "symbolic")]
+        assert!(
+            !self.config.symbolic,
+            "function summarization does not yet support symbolic execution"
+        );
+
+        // This flag means replay from a serialized error artifact. It does not
+        // mean ordinary execution-graph replay during verification.
+        assert!(
+            !self.replay_info.replay_mode(),
+            "function summarization does not yet support serialized counterexample replay"
+        );
+
+        self.summarization.seal_participants(participants);
+    }
+
+    pub(crate) fn arrive_at_summarizable_entry(
+        &mut self,
+        tid: ThreadId,
+        function: SummarizableFunctionId,
+        arguments: Val,
+    ) -> (EntryAction, Vec<ThreadId>) {
+        // Clone the key so SummarizationRuntime can be borrowed mutably below.
+        let active_summary_key = self
+            .active_summary_exploration
+            .as_ref()
+            .map(|frame| (frame.function.clone(), frame.inputs.clone()));
+
+        let active_summary_key_ref = active_summary_key
+            .as_ref()
+            .map(|(function, inputs)| (function, inputs));
+
+        let (action, wake, inputs_to_summarize) = self.summarization.arrive_at_entry(
+            tid,
+            function,
+            arguments,
+            active_summary_key_ref,
+        );
+
+        if let Some(inputs) = inputs_to_summarize {
+            assert!(
+                self.active_summary_exploration.is_none(),
+                "a second summary exploration started while another was active"
+            );
+
+            let EntryAction::ExecuteBody(handle) = &action else {
+                unreachable!("a missing summary must execute the body");
+            };
+
+            self.active_summary_exploration = Some(SummaryExplorationFrame {
+                call: handle.call.clone(),
+                function: handle.call.function.clone(),
+                inputs,
+                entry_graph: self.current.graph.clone(),
+                caller_rqueue: std::mem::take(&mut self.current.rqueue),
+                caller_states: std::mem::take(&mut self.states),
+                outcomes: Vec::new(),
+            });
+        }
+
+        (action, wake)
+    }
+
+    pub(crate) fn select_summary_outcome(
+        &mut self,
+        handle: &SummarizableCallHandle,
+        index: usize,
+        choice: Event,
+    ) -> Vec<ThreadId> {
+        self.summarization
+            .select_summary_outcome(handle, index, choice)
+    }
+
+    pub(crate) fn selected_summary_outcome(
+        &self,
+        handle: &SummarizableCallHandle,
+    ) -> (SummaryOutcome, Event) {
+        self.summarization.selected_summary_outcome(handle)
+    }
+
+    pub(crate) fn record_body_return(
+        &mut self,
+        tid: ThreadId,
+        handle: &SummarizableCallHandle,
+        value: Val,
+    ) -> bool {
+        let all_participants_returned =
+            self.summarization.record_body_return(tid, handle, value);
+        if all_participants_returned {
+            self.stop();
+        }
+        all_participants_returned
+    }
+
+    pub(crate) fn finish_summarizable_call(&mut self, tid: ThreadId) {
+        self.summarization.finish_participant_call(tid);
+    }
+
+    pub(crate) fn block_on_summary_outcome(&mut self, call: SummarizableCallId, pos: Event) {
+        self.handle_block(Block::new(pos, BlockType::SummaryOutcome(call)));
+        self.stop();
+    }
+
+    fn complete_summary_body_execution(&mut self) -> bool {
+        let call = self
+            .active_summary_exploration
+            .as_ref()
+            .expect("summary body execution completed without an exploration frame")
+            .call
+            .clone();
+
+        let outcome = if let Some(returns) = self.summarization.completed_body_returns(&call) {
+            SummaryOutcome::Returned(returns)
+        } else {
+            // At this point Execution::run stopped because no task could make
+            // progress. A missing return must correspond to an actual graph block.
+            let blocked = self
+                .check_blocked()
+                .expect("summarizable body stopped before all returns but graph is not blocked");
+
+            match blocked {
+                BlockType::Value(_, _) | BlockType::Join(_) => SummaryOutcome::Blocked,
+
+                BlockType::Assume => {
+                    panic!("traceforge::assume is not supported inside #[summarizable]");
+                }
+
+                BlockType::Assert => {
+                    panic!("recoverable traceforge::assert is not supported inside #[summarizable]");
+                }
+
+                BlockType::SummaryOutcome(_) => {
+                    unreachable!("nested summarizable calls are rejected at entry");
+                }
+            }
+        };
+
+        let frame = self.active_summary_exploration.as_mut().unwrap();
+        if !frame.outcomes.contains(&outcome) {
+            frame.outcomes.push(outcome);
+        }
+
+        self.unstop();
+
+        // Only summary-body revisits and states are currently installed.
+        if self.try_revisit() {
+            return false;
+        }
+
+        // Local state space exhausted: publish the completed summary.
+        let frame = self.active_summary_exploration.take().unwrap();
+        assert!(
+            !frame.outcomes.is_empty(),
+            "summary exploration produced no outcomes"
+        );
+
+        self.summarization
+            .store_summary_case(frame.function, frame.inputs, frame.outcomes);
+
+        // Reinstall exactly the caller state that was suspended for exploration.
+        self.current.graph = frame.entry_graph;
+        self.current.rqueue = frame.caller_rqueue;
+        self.states = frame.caller_states;
+
+        // false tells the global explore loop to rerun. On that rerun, the new
+        // summary is found and the body is replaced by summary-outcome selection.
+        false
     }
 }
 

@@ -6,6 +6,8 @@ use crate::{
 
 use std::fmt::{Debug, Display};
 
+use crate::summarizable::SummarizableCallId;
+
 // Distinct unit type for async logic
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct WakeMsg;
@@ -48,13 +50,19 @@ pub(crate) struct RecvLoc {
     locs: Option<Vec<Loc>>,
     // Option for the fast case where the predicate would be always true
     tag: Option<PredicateType>,
+    summarizable_call: Option<SummarizableCallId>,
 }
 
 impl RecvLoc {
-    pub(crate) fn new(locs: Vec<&Loc>, tag: Option<PredicateType>) -> Self {
+    pub(crate) fn new(
+        locs: Vec<&Loc>,
+        tag: Option<PredicateType>,
+        summarizable_call: Option<SummarizableCallId>,
+    ) -> Self {
         RecvLoc {
             locs: Some(locs.into_iter().cloned().collect()),
             tag,
+            summarizable_call,
         }
     }
 
@@ -65,7 +73,10 @@ impl RecvLoc {
     /// Returns whether the receive's tag matches the send's tag
     pub(crate) fn matches_tag(&self, send: &SendMsg) -> bool {
         let send_loc = send.send_loc();
-        self.tag.is_none() || self.tag.as_ref().unwrap().0(send_loc.sender_tid, send_loc.tag.clone())
+
+        self.summarizable_call == send_loc.summarizable_call
+            && (self.tag.is_none()
+                || self.tag.as_ref().unwrap().0(send_loc.sender_tid, send_loc.tag.clone()))
     }
 
     /// Return whether the receive's tag and any of it's locations matches the send
@@ -88,6 +99,7 @@ pub(crate) struct SendLoc {
     loc: Option<Loc>,
     pub(crate) sender_tid: ThreadId,
     pub(crate) tag: Option<Vec<u32>>,
+    summarizable_call: Option<SummarizableCallId>,
 }
 
 impl SendLoc {
@@ -98,14 +110,21 @@ impl SendLoc {
             loc: None,
             sender_tid,
             tag: None,
+            summarizable_call: None,
         }
     }
 
-    pub(crate) fn new(loc: &Loc, sender_tid: ThreadId, tag: Option<Vec<u32>>) -> Self {
+    pub(crate) fn new(
+        loc: &Loc,
+        sender_tid: ThreadId,
+        tag: Option<Vec<u32>>,
+        summarizable_call: Option<SummarizableCallId>,
+    ) -> Self {
         SendLoc {
             loc: Some(loc.clone()),
             sender_tid,
             tag,
+            summarizable_call,
         }
     }
 
@@ -115,6 +134,10 @@ impl SendLoc {
 
     pub(crate) fn loc_opt(&self) -> Option<&Loc> {
         self.loc.as_ref()
+    }
+
+    pub(crate) fn summarizable_call(&self) -> Option<&SummarizableCallId> {
+        self.summarizable_call.as_ref()
     }
 }
 

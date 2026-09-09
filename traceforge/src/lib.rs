@@ -29,10 +29,13 @@ mod testmode;
 use future::spawn_receive;
 pub use testmode::{parallel_test, test};
 
+pub mod summarizable;
 #[cfg(feature = "symbolic")]
 pub mod symbolic;
 pub mod thread;
 mod vector_clock;
+pub use summarizable::seal_summarization_participants;
+pub use traceforge_macros::summarizable;
 
 pub use crate::msg::Val;
 // `Val` is used by monitors.
@@ -56,11 +59,11 @@ use smallvec::alloc::sync::Arc;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::future::Future;
+use std::io::Write;
 use std::iter;
 use std::rc::Rc;
 use std::time::Instant;
 use thread::{spawn_without_switch, JoinHandle, ThreadId};
-use std::io::Write;
 
 use crate::event_label::*;
 use crate::exec_pool::ExecutionPool;
@@ -315,7 +318,7 @@ impl ConfigBuilder {
             iterations_until_split: 100,
             state_batch_size: 1,
             keep_per_execution_coverage: false,
-	        predetermined_choices: HashMap::new(),
+            predetermined_choices: HashMap::new(),
             predetermined_global_choices: HashMap::new(),
             pretty_graph_printing: false,
             callbacks: Arc::new(Mutex::new(Vec::new())),
@@ -799,7 +802,13 @@ where
 {
     ExecutionState::with(|s| s.must.borrow().validate_monitor_spawn(&s.curr_pos()));
 
-    let jh = spawn_without_switch(monitor_function, Some("traceforge_runtime::monitor".to_string()), true, None, None);
+    let jh = spawn_without_switch(
+        monitor_function,
+        Some("traceforge_runtime::monitor".to_string()),
+        true,
+        None,
+        None,
+    );
 
     // Register the monitor before calling switch(). You need to register it before
     // calling switch() because during replay, the replay execute the monitor first, find the monitor to
@@ -1050,6 +1059,7 @@ fn send_msg_with_vec_tag<T: Message + 'static>(
         let sender_tid = pos.thread;
         let val = Val::new(v);
         let mut monitor_msgs = MonitorSends::new();
+        let summarizable_call = s.current().summarizable_call().cloned();
 
         // Monitors can also observe explicit-channel messages.
         for (thread_id, mon) in s.must.borrow_mut().monitors().iter() {
@@ -1073,7 +1083,7 @@ fn send_msg_with_vec_tag<T: Message + 'static>(
 
         let slab = SendMsg::new(
             pos,
-            SendLoc::new(loc, sender_tid, tag),
+            SendLoc::new(loc, sender_tid, tag, summarizable_call),
             comm,
             val,
             monitor_msgs,
@@ -1155,8 +1165,15 @@ fn recv_val_with_tag<'a>(
         let tag = tag.clone();
         let (val, ind) = ExecutionState::with(|s| {
             let pos = s.next_pos();
+            let summarizable_call = s.current().summarizable_call().cloned();
             s.must.borrow_mut().handle_recv(
-                RecvMsg::new(pos, RecvLoc::new(locs, tag), comm, None, true),
+                RecvMsg::new(
+                    pos,
+                    RecvLoc::new(locs, tag, summarizable_call),
+                    comm,
+                    None,
+                    true,
+                ),
                 false,
             )
         });
@@ -1230,8 +1247,15 @@ fn recv_val_block_with_tag<'a>(
         let locs = locs.clone();
         let (val, ind) = ExecutionState::with(|s| {
             let pos = s.next_pos();
+            let summarizable_call = s.current().summarizable_call().cloned();
             s.must.borrow_mut().handle_recv(
-                RecvMsg::new(pos, RecvLoc::new(locs, tag.clone()), comm, None, false),
+                RecvMsg::new(
+                    pos,
+                    RecvLoc::new(locs, tag.clone(), summarizable_call),
+                    comm,
+                    None,
+                    false,
+                ),
                 true,
             )
         });
@@ -1313,9 +1337,10 @@ fn inbox_internal(tag: Option<PredicateType>, min: usize, max: Option<usize>) ->
         let tag = tag.clone();
         let (vals, blocked, _pos) = ExecutionState::with(|s| {
             let pos = s.next_pos();
+            let summarizable_call = s.current().summarizable_call().cloned();
             let (vals, _inds, blocked) = s.must.borrow_mut().handle_inbox(Inbox::new(
                 pos,
-                RecvLoc::new(locs, tag),
+                RecvLoc::new(locs, tag, summarizable_call),
                 comm,
                 None,
                 min,
@@ -1408,12 +1433,18 @@ pub fn named_nondet(name: &str) -> bool {
         if must.config.predetermined_global_choices.contains_key(name) {
             if let Some(&value) = must.global_named_choices.get(name) {
                 // Already resolved — reuse cached value
-                return must.handle_ctoss_predetermined(CToss::new(pos, value).with_name(name.to_string()), value);
+                return must.handle_ctoss_predetermined(
+                    CToss::new(pos, value).with_name(name.to_string()),
+                    value,
+                );
             }
             // First call — use the predetermined global value and cache it
             let value = must.config.predetermined_global_choices[name];
             must.global_named_choices.insert(name.to_string(), value);
-            return must.handle_ctoss_predetermined(CToss::new(pos, value).with_name(name.to_string()), value);
+            return must.handle_ctoss_predetermined(
+                CToss::new(pos, value).with_name(name.to_string()),
+                value,
+            );
         }
 
         // Use the thread's filtered_origination_vec as the map key instead of ThreadId.
@@ -1487,7 +1518,12 @@ pub fn named_nondet(name: &str) -> bool {
                 "[named_nondet] Index assignment for choice '{}': \
                  thread_idx={}, filtered_origination_vec={:?}, origination_vec={:?}, thread={}\n\
                  Graph:\n{}",
-                name, idx, filtered_origination_vec, origination_vec, pos.thread, must.print_graph(None)
+                name,
+                idx,
+                filtered_origination_vec,
+                origination_vec,
+                pos.thread,
+                must.print_graph(None)
             );
 
             idx
@@ -1516,7 +1552,10 @@ pub fn named_nondet(name: &str) -> bool {
                 value, name, thread_idx, current_occurrence
             );
             // Use handle_ctoss_predetermined which now handles both replay and handle modes
-            return must.handle_ctoss_predetermined(CToss::new(pos, value).with_name(name.to_string()), value);
+            return must.handle_ctoss_predetermined(
+                CToss::new(pos, value).with_name(name.to_string()),
+                value,
+            );
         }
 
         // Fallback to nondeterministic exploration (handles both replay and handle modes)
@@ -1531,7 +1570,8 @@ pub fn named_nondet(name: &str) -> bool {
         // assigned a new index beyond the configured predetermined range.
         if let Some(thread_choices) = must.config.predetermined_choices.get(name) {
             if thread_choices.get(thread_idx).is_none() {
-                let frozen_map_str = must.frozen_thread_index_map
+                let frozen_map_str = must
+                    .frozen_thread_index_map
                     .as_ref()
                     .map(|fm| format!("{:#?}", fm))
                     .unwrap_or_else(|| "None".to_string());
@@ -1545,7 +1585,10 @@ pub fn named_nondet(name: &str) -> bool {
                      Origination vec: {:?}\n\
                      Frozen thread index map:\n{}\n\
                      Graph:\n{}",
-                    name, thread_choices.len(), thread_idx, current_occurrence,
+                    name,
+                    thread_choices.len(),
+                    thread_idx,
+                    current_occurrence,
                     pos.thread,
                     filtered_origination_vec,
                     origination_vec,
@@ -1558,7 +1601,9 @@ pub fn named_nondet(name: &str) -> bool {
         // Release the mutable borrow so gen_bool() and handle_ctoss() can each borrow independently.
         drop(must);
         let toss = s.must.borrow_mut().gen_bool();
-        s.must.borrow_mut().handle_ctoss(CToss::new(pos, toss).with_name(name.to_string()))
+        s.must
+            .borrow_mut()
+            .handle_ctoss(CToss::new(pos, toss).with_name(name.to_string()))
     })
 }
 
