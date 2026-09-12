@@ -1,9 +1,9 @@
 use crate::runtime::thread::continuation::{ContinuationPool, PooledContinuation};
+use crate::summarizable::SummarizableCallId;
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::fmt::Debug;
 use std::rc::Rc;
-use crate::summarizable::SummarizableCallId;
 
 // A note on terminology: we have competing notions of threads floating around. Here's the
 // convention for disambiguating them:
@@ -36,8 +36,9 @@ pub(crate) struct Task {
     pub(crate) instructions: usize,
     name: Option<String>,
 
-    // The active summarizable call provides communication closure for its messages.
-    summarizable_call: Option<SummarizableCallId>,
+    // Dynamic nesting path of summarizable bodies for this task, the last element is the
+    // communication scope of newly created events
+    summarizable_calls: Vec<SummarizableCallId>,
 }
 
 impl Task {
@@ -56,7 +57,7 @@ impl Task {
             continuation,
             instructions: 0,
             name,
-            summarizable_call: None,
+            summarizable_calls: Vec::new(),
         }
     }
 
@@ -108,24 +109,32 @@ impl Task {
         self.name.clone()
     }
 
+    // Return the call whose body currently provides communication closure
     pub(crate) fn summarizable_call(&self) -> Option<&SummarizableCallId> {
-        self.summarizable_call.as_ref()
+        self.summarizable_calls.last()
     }
 
+    // Return the nesting depth at which the next summarizable call will enter
+    pub(crate) fn summarizable_call_depth(&self) -> usize {
+        self.summarizable_calls.len()
+    }
+
+    // Enter a body or summary application at the next nesting depth.
     pub(crate) fn enter_summarizable_call(&mut self, call: SummarizableCallId) {
-        assert!(
-            self.summarizable_call.is_none(),
-            "nested summarizable function calls are not supported"
-        );
-        self.summarizable_call = Some(call);
+        self.summarizable_calls.push(call);
     }
 
-    pub(crate) fn leave_summarizable_call(&mut self) {
-        assert!(
-            self.summarizable_call.is_some(),
-            "task left a summarizable function without entering one"
+    // Leave the current summarizable call and validate well-nested execution
+    pub(crate) fn leave_summarizable_call(&mut self, expected: &SummarizableCallId) {
+        let actual = self
+            .summarizable_calls
+            .pop()
+            .expect("task left a summarizable function without entering one"); // unreachable
+
+        assert_eq!(
+            &actual, expected,
+            "task left summarizable calls out of nesting order" // unreachable
         );
-        self.summarizable_call = None;
     }
 }
 

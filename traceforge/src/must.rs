@@ -171,8 +171,8 @@ pub(crate) struct Must {
 
     // Persistent summaries and per-execution collective-call state.
     summarization: SummarizationRuntime,
-    // Active exploration of one exact summary case.
-    active_summary_exploration: Option<SummaryExplorationFrame>,
+    // Active summary exploration stack
+    summary_explorations: Vec<SummaryExplorationFrame>,
 }
 
 impl Must {
@@ -211,7 +211,7 @@ impl Must {
             global_named_choices: HashMap::new(),
             max_graph_events: 0,
             summarization: SummarizationRuntime::new(),
-            active_summary_exploration: None,
+            summary_explorations: Vec::new(),
         }
     }
 
@@ -240,7 +240,7 @@ impl Must {
         self.symbolic_solver.reset();
         self.global_named_choices.clear();
         self.summarization = SummarizationRuntime::new();
-        self.active_summary_exploration = None;
+        self.summary_explorations.clear();
     }
 
     pub(crate) fn gen_bool(&mut self) -> bool {
@@ -380,7 +380,7 @@ impl Must {
         // config, rng are intentionally NOT reset — they are either set
         // explicitly by the caller (frozen map) or persist across tasks.
         self.summarization = SummarizationRuntime::new();
-        self.active_summary_exploration = None;
+        self.summary_explorations.clear();
     }
 
     /// Drain only the saved states (not current). Returns them as work items.
@@ -1287,7 +1287,7 @@ impl Must {
     /// the ability to call into Must model code (the monitor on_stop) while
     /// not holding a reference to entire Must object.
     pub(crate) fn complete_execution(must: &Rc<RefCell<Must>>) -> bool {
-        if must.borrow().active_summary_exploration.is_some() {
+        if !must.borrow().summary_explorations.is_empty() {
             return must.borrow_mut().complete_summary_body_execution();
         }
         let maybe_block = must.borrow_mut().check_blocked();
@@ -2621,37 +2621,47 @@ impl Must {
     pub(crate) fn arrive_at_summarizable_entry(
         &mut self,
         tid: ThreadId,
+        depth: usize,
         function: SummarizableFunctionId,
         arguments: Val,
     ) -> (EntryAction, Vec<ThreadId>) {
-        // Clone the key so SummarizationRuntime can be borrowed mutably below.
-        let active_summary_key = self
-            .active_summary_exploration
-            .as_ref()
-            .map(|frame| (frame.function.clone(), frame.inputs.clone()));
+        assert!(
+            depth <= self.summary_explorations.len(),
+            "summarizable entry skipped an active exploration depth"
+        );
 
-        let active_summary_key_ref = active_summary_key
+        // During whole-model replay, a frame may already exist at this exact nesting depth.
+        // Clone its key so the runtime can be borrowed mutably.
+        let expected_exploration = self
+            .summary_explorations
+            .get(depth)
+            .map(|frame| (frame.call.clone(), frame.inputs.clone()));
+
+        let expected_exploration_ref = expected_exploration
             .as_ref()
-            .map(|(function, inputs)| (function, inputs));
+            .map(|(call, inputs)| (call, inputs));
 
         let (action, wake, inputs_to_summarize) = self.summarization.arrive_at_entry(
             tid,
+            depth,
             function,
             arguments,
-            active_summary_key_ref,
+            expected_exploration_ref,
         );
 
         if let Some(inputs) = inputs_to_summarize {
-            assert!(
-                self.active_summary_exploration.is_none(),
-                "a second summary exploration started while another was active"
+            // A new miss may only extend the current exploration nesting path.
+            assert_eq!(
+                depth,
+                self.summary_explorations.len(),
+                "a summary miss attempted to replace an active exploration frame"
             );
 
             let EntryAction::ExecuteBody(handle) = &action else {
                 unreachable!("a missing summary must execute the body");
             };
 
-            self.active_summary_exploration = Some(SummaryExplorationFrame {
+            self.summary_explorations.push(SummaryExplorationFrame {
                 call: handle.call.clone(),
                 function: handle.call.function.clone(),
                 inputs,
@@ -2688,16 +2698,19 @@ impl Must {
         handle: &SummarizableCallHandle,
         value: Val,
     ) -> bool {
-        let all_participants_returned =
-            self.summarization.record_body_return(tid, handle, value);
+        let all_participants_returned = self.summarization.record_body_return(tid, handle, value);
         if all_participants_returned {
             self.stop();
         }
         all_participants_returned
     }
 
-    pub(crate) fn finish_summarizable_call(&mut self, tid: ThreadId) {
-        self.summarization.finish_participant_call(tid);
+    pub(crate) fn finish_summarizable_call(
+        &mut self,
+        tid: ThreadId,
+        handle: &SummarizableCallHandle,
+    ) {
+        self.summarization.finish_participant_call(tid, handle);
     }
 
     pub(crate) fn block_on_summary_outcome(&mut self, call: SummarizableCallId, pos: Event) {
@@ -2707,8 +2720,8 @@ impl Must {
 
     fn complete_summary_body_execution(&mut self) -> bool {
         let call = self
-            .active_summary_exploration
-            .as_ref()
+            .summary_explorations
+            .last()
             .expect("summary body execution completed without an exploration frame")
             .call
             .clone();
@@ -2716,43 +2729,63 @@ impl Must {
         let outcome = if let Some(returns) = self.summarization.completed_body_returns(&call) {
             SummaryOutcome::Returned(returns)
         } else {
-            // At this point Execution::run stopped because no task could make
-            // progress. A missing return must correspond to an actual graph block.
-            let blocked = self
-                .check_blocked()
-                .expect("summarizable body stopped before all returns but graph is not blocked");
+            match self.check_blocked() {
+                Some(BlockType::Value(_, _))
+                | Some(BlockType::Join(_))
+                | Some(BlockType::SummaryOutcome(_)) => SummaryOutcome::Blocked,
 
-            match blocked {
-                BlockType::Value(_, _) | BlockType::Join(_) => SummaryOutcome::Blocked,
-
-                BlockType::Assume => {
+                Some(BlockType::Assume) => {
                     panic!("traceforge::assume is not supported inside #[summarizable]");
                 }
 
-                BlockType::Assert => {
-                    panic!("recoverable traceforge::assert is not supported inside #[summarizable]");
+                Some(BlockType::Assert) => {
+                    panic!(
+                        "recoverable traceforge::assert is not supported inside #[summarizable]"
+                    );
                 }
 
-                BlockType::SummaryOutcome(_) => {
-                    unreachable!("nested summarizable calls are rejected at entry");
+                None if self.summarization.has_incomplete_entry() => {
+                    // Entry waiting is represented by stuck tasks
+                    SummaryOutcome::Blocked
+                }
+
+                None => {
+                    panic!(
+                        "summarizable body stopped before all returns, but neither the graph nor a nested entry barrier is blocked"
+                    );
                 }
             }
         };
 
-        let frame = self.active_summary_exploration.as_mut().unwrap();
+        let frame = self
+            .summary_explorations
+            .last_mut()
+            .expect("summary exploration stack became empty while recording an outcome");
+
+        assert_eq!(
+            frame.call, call,
+            "summary outcome was attributed to the wrong nesting depth"
+        );
+
         if !frame.outcomes.contains(&outcome) {
             frame.outcomes.push(outcome);
         }
 
         self.unstop();
 
-        // Only summary-body revisits and states are currently installed.
+        // Only the innermost body's revisits and saved states are installed, the caller's queues
+        // are suspended in the top frame
         if self.try_revisit() {
             return false;
         }
 
-        // Local state space exhausted: publish the completed summary.
-        let frame = self.active_summary_exploration.take().unwrap();
+        // The innermost local state space is exhausted. Record that summary and restore the exact
+        // caller cut saved when this frame was pushed
+        let frame = self
+            .summary_explorations
+            .pop()
+            .expect("summary exploration stack became empty before completion");
+
         assert!(
             !frame.outcomes.is_empty(),
             "summary exploration produced no outcomes"
@@ -2761,13 +2794,12 @@ impl Must {
         self.summarization
             .store_summary_case(frame.function, frame.inputs, frame.outcomes);
 
-        // Reinstall exactly the caller state that was suspended for exploration.
         self.current.graph = frame.entry_graph;
         self.current.rqueue = frame.caller_rqueue;
         self.states = frame.caller_states;
 
-        // false tells the global explore loop to rerun. On that rerun, the new
-        // summary is found and the body is replaced by summary-outcome selection.
+        // The global exploration loop now replays the restored caller. At the completed boundary
+        // it finds the summary just stored above and applies it.
         false
     }
 }

@@ -156,6 +156,14 @@ pub(crate) enum EntryAction {
     ApplySummary(SummarizableCallHandle),
 }
 
+// One collective entry currently gathering participants.
+#[derive(Clone, Debug)]
+struct AssemblingCall {
+    call: SummarizableCallId,
+    depth: usize,
+    parent: Option<SummarizableCallId>,
+}
+
 /// Function-summarization metadata owned by the model checker.
 pub(crate) struct SummarizationRuntime {
     // Persistent across stateless executions
@@ -165,12 +173,11 @@ pub(crate) struct SummarizationRuntime {
     // Reconstructed within each stateless execution
     participants_sealed_this_execution: bool,
     next_call_index: HashMap<SummarizableFunctionId, u64>,
-    active_call_by_participant: HashMap<ThreadId, SummarizableCallId>,
+    call_stack_by_participant: HashMap<ThreadId, Vec<SummarizableCallId>>, // Assigned collective calls for each participant, indexed by nesting depth
     call_states: HashMap<SummarizableCallId, SummarizableCallState>,
 
-    // The collective currently collecting entry arrivals. This makes a
-    // mismatch such as `A enters f` and `B enters g` fail immediately.
-    assembling_call: Option<SummarizableCallId>,
+    // The one collective entry currently gathering participants.
+    assembling_call: Option<AssemblingCall>,
 }
 
 impl SummarizationRuntime {
@@ -180,7 +187,7 @@ impl SummarizationRuntime {
             expected_participants: None,
             participants_sealed_this_execution: false,
             next_call_index: HashMap::new(),
-            active_call_by_participant: HashMap::new(),
+            call_stack_by_participant: HashMap::new(),
             call_states: HashMap::new(),
             assembling_call: None,
         }
@@ -190,7 +197,7 @@ impl SummarizationRuntime {
     pub(crate) fn begin_execution(&mut self) {
         self.participants_sealed_this_execution = false;
         self.next_call_index.clear();
-        self.active_call_by_participant.clear();
+        self.call_stack_by_participant.clear();
         self.call_states.clear();
         self.assembling_call = None;
     }
@@ -262,36 +269,73 @@ impl SummarizationRuntime {
     fn assign_call(
         &mut self,
         tid: ThreadId,
+        depth: usize,
         function: SummarizableFunctionId,
     ) -> SummarizableCallId {
-        // __enter loops while a task waits. Repeated arrival by the same task
-        // must reuse its previously assigned call.
-        if let Some(call) = self.active_call_by_participant.get(&tid) {
+        // A waiting participant calls __enter repeatedly. At that point the runtime stack contains
+        // the pending call at `depth`, while the task body stack still contains only its parent calls
+        let existing = {
+            let stack = self.call_stack_by_participant.entry(tid).or_default();
+
+            assert!(
+                stack.len() == depth || stack.len() == depth + 1,
+                "participant entered a summarizable call at an invalid nesting depth"
+            );
+
+            stack.get(depth).cloned()
+        };
+
+        // invariant: `stack.len() == depth` => this is the participant's first arrival at the call
+        // invariant: `stack.len() == depth + 1` => this participant arrived earlier, waited, woke, and is repeating `__enter` for the same call
+        // invariant: otherwise => error
+
+        if let Some(call) = existing {
             assert_eq!(
                 call.function, function,
                 "a participant changed summarizable function while waiting"
             );
-            return call.clone();
+            return call;
         }
+
+        let parent = self
+            .call_stack_by_participant
+            .get(&tid)
+            .and_then(|stack| stack.last())
+            .cloned();
 
         let call = if let Some(assembling) = &self.assembling_call {
             assert_eq!(
-                assembling.function, function,
+                assembling.depth, depth,
+                "summarization participants entered different nesting depths"
+            );
+            assert_eq!(
+                assembling.parent, parent,
+                "summarization participants entered calls under different parents"
+            );
+            assert_eq!(
+                assembling.call.function, function,
                 "summarization participants entered different collective functions"
             );
-            assembling.clone()
+            assembling.call.clone()
         } else {
             let call_index = *self.next_call_index.entry(function.clone()).or_insert(0);
-
             let call = SummarizableCallId {
                 function,
                 call_index,
             };
-            self.assembling_call = Some(call.clone());
+
+            self.assembling_call = Some(AssemblingCall {
+                call: call.clone(),
+                depth,
+                parent,
+            });
             call
         };
 
-        self.active_call_by_participant.insert(tid, call.clone());
+        self.call_stack_by_participant
+            .get_mut(&tid)
+            .unwrap()
+            .push(call.clone());
         call
     }
 
@@ -299,9 +343,10 @@ impl SummarizationRuntime {
     pub(crate) fn arrive_at_entry(
         &mut self,
         tid: ThreadId,
+        depth: usize,
         function: SummarizableFunctionId,
         arguments: Val,
-        active_summary_key: Option<(&SummarizableFunctionId, &ParticipantValues)>,
+        expected_exploration: Option<(&SummarizableCallId, &ParticipantValues)>,
     ) -> (EntryAction, Vec<ThreadId>, Option<ParticipantValues>) {
         assert!(
             self.participants_sealed_this_execution,
@@ -315,7 +360,7 @@ impl SummarizationRuntime {
             "thread {tid} is not a sealed summarization participant"
         );
 
-        let call = self.assign_call(tid, function);
+        let call = self.assign_call(tid, depth, function);
         let participant_count = self.participant_count();
         let outcome_selector = self.outcome_selector();
 
@@ -330,7 +375,6 @@ impl SummarizationRuntime {
             .or_insert(arguments.clone())
             .clone();
 
-        // __enter may call this repeatedly while the participant is waiting.
         assert_eq!(
             previous_arguments, arguments,
             "a participant changed its arguments while waiting at a summarizable entry"
@@ -354,28 +398,50 @@ impl SummarizationRuntime {
                     .arguments_by_participant,
             );
 
-            // During summary exploration, every body revisit reruns the whole program and
-            // reaches this same boundary again. It must continue the existing
-            // exploration frame rather than create a second one.
-            let continuing_summary_exploration =
-                active_summary_key.is_some_and(|(active_function, active_inputs)| {
-                    active_function == &call.function && active_inputs == &inputs
-                });
+            let mode = match expected_exploration {
+                // we reached the exact boundary whose body is currently being explored
+                Some((expected_call, expected_inputs)) if expected_call == &call => {
+                    assert_eq!(
+                        expected_inputs, &inputs,
+                        "replay changed the arguments of the active summary exploration"
+                    );
 
-            let mode = if continuing_summary_exploration {
-                CallMode::ExploringBody
-            } else if let Some(outcomes) = self.lookup_summary_outcomes(&call.function, &inputs) {
-                CallMode::ApplyingSummary {
-                    outcomes,
-                    selection: None,
+                    CallMode::ExploringBody
                 }
-            } else {
-                inputs_to_summarize = Some(inputs);
-                CallMode::ExploringBody
+
+                // we are replaying a previously summarized call that occurs before the active
+                // boundary at the same nesting depth
+                Some((expected_call, _)) => {
+                    let outcomes = self
+                        .lookup_summary_outcomes(&call.function, &inputs)
+                        .unwrap_or_else(|| {
+                            panic!(
+                                "replay reached unsummarized call {:?} before active exploration {:?}",
+                                call, expected_call
+                            )
+                        });
+
+                    CallMode::ApplyingSummary {
+                        outcomes,
+                        selection: None,
+                    }
+                }
+
+                // there is no active exploration frame at this depth
+                None => {
+                    if let Some(outcomes) = self.lookup_summary_outcomes(&call.function, &inputs) {
+                        CallMode::ApplyingSummary {
+                            outcomes,
+                            selection: None,
+                        }
+                    } else {
+                        inputs_to_summarize = Some(inputs);
+                        CallMode::ExploringBody
+                    }
+                }
             };
 
-            // The call index advances once, only after the collective has
-            // assembled. Arrival order therefore cannot change it.
+            // advance once, only when the entire collective has assembled.
             *self
                 .next_call_index
                 .entry(call.function.clone())
@@ -509,8 +575,36 @@ impl SummarizationRuntime {
             .then(|| ParticipantValues::from_map(&call_state.returns_by_participant))
     }
 
-    pub(crate) fn finish_participant_call(&mut self, tid: ThreadId) {
-        self.active_call_by_participant.remove(&tid);
+    pub(crate) fn finish_participant_call(
+        &mut self,
+        tid: ThreadId,
+        handle: &SummarizableCallHandle,
+    ) {
+        let remove_stack = {
+            let stack = self
+                .call_stack_by_participant
+                .get_mut(&tid)
+                .expect("participant finished a summarizable call without entering one");
+
+            let finished = stack
+                .pop()
+                .expect("participant summarizable-call stack is empty");
+
+            assert_eq!(
+                finished, handle.call,
+                "participant finished summarizable calls out of nesting order"
+            );
+
+            stack.is_empty()
+        };
+
+        if remove_stack {
+            self.call_stack_by_participant.remove(&tid);
+        }
+    }
+
+    pub(crate) fn has_incomplete_entry(&self) -> bool {
+        self.assembling_call.is_some()
     }
 }
 
@@ -565,15 +659,12 @@ pub fn __enter(descriptor: SummarizableFunctionDescriptor, arguments: Val) -> Su
         switch();
 
         let action = ExecutionState::with(|state| {
-            assert!(
-                state.current().summarizable_call().is_none(),
-                "nested summarizable function calls are not supported"
-            );
-
             let tid = state.must.borrow().to_thread_id(state.current().id());
+            let depth = state.current().summarizable_call_depth();
 
             let (action, wake) = state.must.borrow_mut().arrive_at_summarizable_entry(
                 tid,
+                depth,
                 descriptor.id(),
                 arguments.clone(),
             );
@@ -585,13 +676,13 @@ pub fn __enter(descriptor: SummarizableFunctionDescriptor, arguments: Val) -> Su
                     state.current_mut().stuck();
                 }
 
-                EntryAction::ExecuteBody(handle) => {
+                EntryAction::ExecuteBody(handle) | EntryAction::ApplySummary(handle) => {
                     state
                         .current_mut()
                         .enter_summarizable_call(handle.call.clone());
                 }
 
-                EntryAction::SelectSummaryOutcome { .. } | EntryAction::ApplySummary(_) => {}
+                EntryAction::SelectSummaryOutcome { .. } => {}
             }
 
             action
@@ -620,8 +711,8 @@ pub fn __enter(descriptor: SummarizableFunctionDescriptor, arguments: Val) -> Su
                     let pos = state.next_pos();
                     let mut range = 0..=(outcome_count - 1);
 
-                    // handle_choice is already replay-aware and creates the
-                    // forward revisits for the remaining outcome indexes.
+                    // handle_choice is already replay-aware and creates the forward revisits for
+                    // the remaining outcome indexes
                     let selected = state
                         .must
                         .borrow_mut()
@@ -644,14 +735,17 @@ pub fn __complete_body(handle: SummarizableCallHandle, value: Val) -> ! {
     ExecutionState::with(|state| {
         let tid = state.must.borrow().to_thread_id(state.current().id());
 
-        state.current_mut().leave_summarizable_call();
+        state.current_mut().leave_summarizable_call(&handle.call);
 
         let all_participants_returned = state
             .must
             .borrow_mut()
             .record_body_return(tid, &handle, value);
 
-        state.must.borrow_mut().finish_summarizable_call(tid);
+        state
+            .must
+            .borrow_mut()
+            .finish_summarizable_call(tid, &handle);
 
         if !all_participants_returned {
             state.current_mut().stuck();
@@ -680,7 +774,11 @@ where
                 .unwrap_or_else(|| panic!("summary has no return value for thread {}", tid));
 
             ExecutionState::with(|state| {
-                state.must.borrow_mut().finish_summarizable_call(tid);
+                state.current_mut().leave_summarizable_call(&handle.call);
+                state
+                    .must
+                    .borrow_mut()
+                    .finish_summarizable_call(tid, &handle);
             });
 
             let actual_type = value.type_name.clone();
@@ -695,9 +793,11 @@ where
 
         SummaryOutcome::Blocked => {
             ExecutionState::with(|state| {
+                state.current_mut().leave_summarizable_call(&handle.call);
+
                 let pos = state.next_pos();
                 let mut must = state.must.borrow_mut();
-                must.finish_summarizable_call(tid);
+                must.finish_summarizable_call(tid, &handle);
                 must.block_on_summary_outcome(handle.call, pos);
             });
 
