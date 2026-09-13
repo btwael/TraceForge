@@ -39,8 +39,9 @@ use std::fs::File;
 use std::io::Write;
 
 use crate::summarizable::{
-    EntryAction, ParticipantValues, SummarizableCallHandle, SummarizableCallId,
-    SummarizableFunctionId, SummarizationRuntime, SummaryOutcome,
+    EntryAction, ParticipantValues, Participants, ParticipationOffer, ParticipationOfferId,
+    SummarizableCallHandle, SummarizableCallId, SummarizableFunctionId, SummarizationRuntime,
+    SummaryMiss, SummaryOutcome,
 };
 
 const EXECS: &str = "execs";
@@ -121,7 +122,11 @@ type ExecutionGraphEnqueuePair = (Arc<Mutex<VecDeque<Option<ExecutionGraph>>>>, 
 struct SummaryExplorationFrame {
     call: SummarizableCallId,
     function: SummarizableFunctionId,
+    participants: Vec<ThreadId>,
     inputs: ParticipantValues,
+
+    // Reset on every stateless execution and set once replay reaches this exact entry cut.
+    active_this_execution: bool,
 
     // State of the caller at the collective entry cut.
     entry_graph: ExecutionGraph,
@@ -263,6 +268,9 @@ impl Must {
         must.symbolic_solver.reset();
         must.current.graph.initialize_for_execution();
         must.summarization.begin_execution();
+        for frame in &mut must.summary_explorations {
+            frame.active_this_execution = false;
+        }
         must.telemetry.coverage.new_eid();
 
         // Reset per-execution state for named choices
@@ -737,12 +745,6 @@ impl Must {
         name: Option<String>,
         is_daemon: bool,
     ) {
-        assert!(
-            // TODO: Remove this restriction once summarization no longer requires a sealed set.
-            !self.summarization.participants_are_sealed(),
-            "threads cannot be spawned after seal_summarization_participants()"
-        );
-
         let parent_tclab: TCreate = self.current.graph.get_thread_tclab(pos.thread);
         let mut origination_vec = parent_tclab.origination_vec();
         origination_vec.push(pos.index);
@@ -1159,6 +1161,26 @@ impl Must {
                     .expect("task id not found in the execution graph!")
             });
         }
+
+        // Once replay has reached a summary body's exact entry cut, unrelated
+        // tasks are outside that local state space.
+        let active_summary = self
+            .summary_explorations
+            .iter()
+            .rev()
+            .find(|frame| frame.active_this_execution);
+        let eligible = runnable
+            .iter()
+            .copied()
+            .filter(|(task_id, _)| {
+                let Some(frame) = active_summary else {
+                    return true;
+                };
+                let tid = self.to_thread_id(*task_id);
+                frame.participants.contains(&tid)
+            })
+            .collect::<Vec<_>>();
+        let runnable = eligible.as_slice();
 
         let next = match self.config.schedule_policy {
             SchedulePolicy::LTR => runnable
@@ -2539,7 +2561,7 @@ impl Must {
             // Detect this, ensure it's waiting for the finished tid, and unblock it
             let tid = must.to_thread_id(task.id());
             let curr = Event::new(tid, task.instructions as u32);
-            if let LabelEnum::TJoin(jlab) = must.current.graph.label(curr.next()) {
+            if let Some(LabelEnum::TJoin(jlab)) = must.current.graph.label_opt(curr.next()) {
                 if jlab.cid() == finished {
                     task.unstuck();
                 }
@@ -2585,7 +2607,7 @@ impl Must {
         }
     }
 
-    pub(crate) fn seal_summarization_participants(&mut self, participants: Vec<ThreadId>) {
+    pub(crate) fn validate_summarization_configuration(&self) {
         assert!(
             !self.config.parallel && !self.config.partitioned_parallelization,
             "function summarization supports serial verification only"
@@ -2614,15 +2636,39 @@ impl Must {
             !self.replay_info.replay_mode(),
             "function summarization does not yet support serialized counterexample replay"
         );
+    }
 
-        self.summarization.seal_participants(participants);
+    pub(crate) fn allocate_summarizable_offer(
+        &mut self,
+        tid: ThreadId,
+        function: SummarizableFunctionId,
+    ) -> ParticipationOfferId {
+        self.summarization.allocate_offer_id(tid, function)
+    }
+
+    pub(crate) fn validate_nested_summarizable_specification(
+        &self,
+        parent: Option<&SummarizableCallId>,
+        caller: ThreadId,
+        specification: &Participants,
+    ) {
+        self.summarization
+            .validate_nested_specification(parent, caller, specification);
+    }
+
+    pub(crate) fn commit_summarizable_group(
+        &mut self,
+        function: SummarizableFunctionId,
+        offers: &[ParticipationOffer],
+    ) -> SummarizableCallId {
+        self.summarization.commit_group(function, offers)
     }
 
     pub(crate) fn arrive_at_summarizable_entry(
         &mut self,
         tid: ThreadId,
         depth: usize,
-        function: SummarizableFunctionId,
+        call: SummarizableCallId,
         arguments: Val,
     ) -> (EntryAction, Vec<ThreadId>) {
         assert!(
@@ -2632,24 +2678,37 @@ impl Must {
 
         // During whole-model replay, a frame may already exist at this exact nesting depth.
         // Clone its key so the runtime can be borrowed mutably.
-        let expected_exploration = self
-            .summary_explorations
-            .get(depth)
-            .map(|frame| (frame.call.clone(), frame.inputs.clone()));
-
+        let expected_exploration = self.summary_explorations.get(depth).map(|frame| {
+            (
+                frame.call.clone(),
+                frame.participants.clone(),
+                frame.inputs.clone(),
+            )
+        });
         let expected_exploration_ref = expected_exploration
             .as_ref()
-            .map(|(call, inputs)| (call, inputs));
+            .map(|(call, participants, inputs)| (call, participants.as_slice(), inputs));
 
-        let (action, wake, inputs_to_summarize) = self.summarization.arrive_at_entry(
+        let (action, wake, summary_miss) = self.summarization.arrive_at_resolved_entry(
             tid,
-            depth,
-            function,
+            call,
             arguments,
             expected_exploration_ref,
         );
 
-        if let Some(inputs) = inputs_to_summarize {
+        if let EntryAction::ExecuteBody(handle) = &action {
+            if let Some(frame) = self.summary_explorations.get_mut(depth) {
+                if frame.call == handle.call {
+                    frame.active_this_execution = true;
+                }
+            }
+        }
+
+        if let Some(SummaryMiss {
+            participants,
+            inputs,
+        }) = summary_miss
+        {
             // A new miss may only extend the current exploration nesting path.
             assert_eq!(
                 depth,
@@ -2664,7 +2723,9 @@ impl Must {
             self.summary_explorations.push(SummaryExplorationFrame {
                 call: handle.call.clone(),
                 function: handle.call.function.clone(),
+                participants,
                 inputs,
+                active_this_execution: true,
                 entry_graph: self.current.graph.clone(),
                 caller_rqueue: std::mem::take(&mut self.current.rqueue),
                 caller_states: std::mem::take(&mut self.states),
@@ -2705,14 +2766,6 @@ impl Must {
         all_participants_returned
     }
 
-    pub(crate) fn finish_summarizable_call(
-        &mut self,
-        tid: ThreadId,
-        handle: &SummarizableCallHandle,
-    ) {
-        self.summarization.finish_participant_call(tid, handle);
-    }
-
     pub(crate) fn block_on_summary_outcome(&mut self, call: SummarizableCallId, pos: Event) {
         self.handle_block(Block::new(pos, BlockType::SummaryOutcome(call)));
         self.stop();
@@ -2744,14 +2797,9 @@ impl Must {
                     );
                 }
 
-                None if self.summarization.has_incomplete_entry() => {
-                    // Entry waiting is represented by stuck tasks
-                    SummaryOutcome::Blocked
-                }
-
                 None => {
                     panic!(
-                        "summarizable body stopped before all returns, but neither the graph nor a nested entry barrier is blocked"
+                        "summarizable body stopped before all returns, but the graph is not blocked"
                     );
                 }
             }
@@ -2791,8 +2839,12 @@ impl Must {
             "summary exploration produced no outcomes"
         );
 
-        self.summarization
-            .store_summary_case(frame.function, frame.inputs, frame.outcomes);
+        self.summarization.store_summary_case(
+            frame.function,
+            frame.participants,
+            frame.inputs,
+            frame.outcomes,
+        );
 
         self.current.graph = frame.entry_graph;
         self.current.rqueue = frame.caller_rqueue;

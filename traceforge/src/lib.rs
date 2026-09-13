@@ -34,7 +34,6 @@ pub mod summarizable;
 pub mod symbolic;
 pub mod thread;
 mod vector_clock;
-pub use summarizable::seal_summarization_participants;
 pub use traceforge_macros::summarizable;
 
 pub use crate::msg::Val;

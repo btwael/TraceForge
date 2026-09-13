@@ -212,53 +212,70 @@ fn expand_summarizable(function: ItemFn) -> syn::Result<TokenStream> {
 
     let mut body_signature = sig.clone();
     body_signature.ident = body_name.clone();
+    let inputs = &sig.inputs;
+    let output = &sig.output;
 
     Ok(quote! {
-        // Private function containing exactly the user's original body.
+        // Private function containing exactly the user's original body in
+        // the original lexical module.
         #body_signature #block
 
-        // User-visible function retaining the original name and signature.
         #(#attrs)*
-        #vis #sig {
-            const __TRACEFORGE_SUMMARIZABLE:
-                ::traceforge::summarizable::SummarizableFunctionDescriptor =
-                ::traceforge::summarizable::SummarizableFunctionDescriptor::new(
-                    concat!(
-                        module_path!(),
-                        "::",
-                        stringify!(#function_name),
-                    ),
-                );
+        #vis mod #function_name {
+            use super::*;
 
-            // Clone only for the summary key. The originals are still moved
-            // into the body when no summary exists.
-            let __traceforge_arguments = ::traceforge::Val::new((
-                #(#arguments.clone(),)*
-            ));
+            pub struct CallBuilder {
+                participants: ::traceforge::summarizable::Participants,
+            }
 
-            match ::traceforge::summarizable::__enter(
-                __TRACEFORGE_SUMMARIZABLE,
-                __traceforge_arguments,
-            ) {
-                ::traceforge::summarizable::SummaryDispatch::ExecuteBody(
-                    __traceforge_call,
-                ) => {
-                    let __traceforge_return_value = #body_name(
-                        #(#arguments),*
-                    );
-
-                    ::traceforge::summarizable::__complete_body(
-                        __traceforge_call,
-                        ::traceforge::Val::new(__traceforge_return_value),
-                    )
+            pub fn with(
+                participants: impl Into<::traceforge::summarizable::Participants>,
+            ) -> CallBuilder {
+                CallBuilder {
+                    participants: participants.into(),
                 }
+            }
 
-                ::traceforge::summarizable::SummaryDispatch::ApplySummary(
-                    __traceforge_call,
-                ) => {
-                    ::traceforge::summarizable::__apply_summary(
-                        __traceforge_call,
-                    )
+            impl CallBuilder {
+                pub fn call(self, #inputs) #output {
+                    const __TRACEFORGE_SUMMARIZABLE:
+                        ::traceforge::summarizable::SummarizableFunctionDescriptor =
+                        ::traceforge::summarizable::SummarizableFunctionDescriptor::new(
+                            module_path!(),
+                        );
+
+                    // Clone only for the summary key. The originals are still
+                    // moved into the body on a summary miss.
+                    let __traceforge_arguments = ::traceforge::Val::new((
+                        #(#arguments.clone(),)*
+                    ));
+
+                    match ::traceforge::summarizable::__enter_with(
+                        __TRACEFORGE_SUMMARIZABLE,
+                        self.participants,
+                        __traceforge_arguments,
+                    ) {
+                        ::traceforge::summarizable::SummaryDispatch::ExecuteBody(
+                            __traceforge_call,
+                        ) => {
+                            let __traceforge_return_value = super::#body_name(
+                                #(#arguments),*
+                            );
+
+                            ::traceforge::summarizable::__complete_body(
+                                __traceforge_call,
+                                ::traceforge::Val::new(__traceforge_return_value),
+                            )
+                        }
+
+                        ::traceforge::summarizable::SummaryDispatch::ApplySummary(
+                            __traceforge_call,
+                        ) => {
+                            ::traceforge::summarizable::__apply_summary(
+                                __traceforge_call,
+                            )
+                        }
+                    }
                 }
             }
         }
