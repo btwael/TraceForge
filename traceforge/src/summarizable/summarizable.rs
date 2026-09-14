@@ -41,16 +41,36 @@ pub(crate) struct ParticipationOfferId {
 }
 
 /// Membership constraints supplied by one caller of a summarizable function.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Participants {
+    mode: ParticipationMode,
     required: Vec<ThreadId>,
     exactly_one: Vec<Vec<ThreadId>>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ParticipationMode {
+    Resolve,
+    Join(ThreadId),
+}
+
 impl Participants {
-    /// Start with the calling thread as the only implicit participant.
-    pub fn new() -> Self {
-        Self::default()
+    /// Make this invocation responsible for resolving and committing the call.
+    pub fn resolve() -> Self {
+        Self {
+            mode: ParticipationMode::Resolve,
+            required: Vec::new(),
+            exactly_one: Vec::new(),
+        }
+    }
+
+    /// Offer this invocation to the given resolver.
+    pub fn join(resolver: ThreadId) -> Self {
+        Self {
+            mode: ParticipationMode::Join(resolver),
+            required: Vec::new(),
+            exactly_one: Vec::new(),
+        }
     }
 
     /// Require every listed thread to join this call.
@@ -87,7 +107,24 @@ impl Participants {
         &self.exactly_one
     }
 
+    fn resolver(&self, caller: ThreadId) -> ThreadId {
+        match self.mode {
+            ParticipationMode::Resolve => caller,
+            ParticipationMode::Join(resolver) => resolver,
+        }
+    }
+
+    fn is_resolver(&self) -> bool {
+        matches!(self.mode, ParticipationMode::Resolve)
+    }
+
     fn normalize_for(&mut self, caller: ThreadId) {
+        if let ParticipationMode::Join(resolver) = self.mode {
+            assert_ne!(
+                resolver, caller,
+                "a summarizable invocation cannot join itself"
+            );
+        }
         self.required.retain(|candidate| *candidate != caller);
         self.required.sort();
         self.required.dedup();
@@ -97,18 +134,6 @@ impl Participants {
         }
         self.exactly_one.sort();
         self.exactly_one.dedup();
-    }
-}
-
-impl<const N: usize> From<[ThreadId; N]> for Participants {
-    fn from(participants: [ThreadId; N]) -> Self {
-        Self::new().require(participants)
-    }
-}
-
-impl From<Vec<ThreadId>> for Participants {
-    fn from(participants: Vec<ThreadId>) -> Self {
-        Self::new().require(participants)
     }
 }
 
@@ -249,6 +274,7 @@ pub(crate) struct SummaryMiss {
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct ParticipationOffer {
     id: ParticipationOfferId,
+    resolver: ThreadId,
     function: SummarizableFunctionId,
     depth: usize,
     parent: Option<SummarizableCallId>,
@@ -267,6 +293,7 @@ struct ParticipationDomain {
     function: SummarizableFunctionId,
     depth: usize,
     parent: Option<SummarizableCallId>,
+    resolver: ThreadId,
 }
 
 impl ParticipationOffer {
@@ -275,6 +302,7 @@ impl ParticipationOffer {
             function: self.function.clone(),
             depth: self.depth,
             parent: self.parent.clone(),
+            resolver: self.resolver,
         }
     }
 }
@@ -344,6 +372,12 @@ impl SummarizationRuntime {
             .get(parent)
             .expect("nested call refers to a missing parent call");
         assert!(parent_state.participants.contains(&caller));
+        if let ParticipationMode::Join(resolver) = specification.mode {
+            assert!(
+                parent_state.participants.contains(&resolver),
+                "a nested summarizable call cannot join a resolver outside its parent"
+            );
+        }
         for candidate in specification
             .required()
             .iter()
@@ -667,25 +701,12 @@ fn next_resolution_step(selected: &BTreeMap<ThreadId, ParticipationOffer>) -> Re
     ResolutionStep::Complete
 }
 
-fn resolves_own_group(offer: &ParticipationOffer) -> bool {
-    // A choice is resolved by the participant that declared it. A fixed group
-    // elects the smallest locally declared participant so replay never depends
-    // on which participant happened to reach the boundary last.
-    if !offer.specification.exactly_one().is_empty() || offer.specification.required().is_empty() {
-        return true;
-    }
-
-    offer
-        .specification
-        .required()
-        .iter()
-        .copied()
-        .chain(std::iter::once(offer.id.participant))
-        .min()
-        == Some(offer.id.participant)
-}
-
 fn resolve_group(root: ParticipationOffer) -> Vec<ParticipationOffer> {
+    assert!(
+        root.specification.is_resolver(),
+        "only an explicitly resolving invocation can resolve a group"
+    );
+    assert_eq!(root.id.participant, root.resolver);
     let domain = root.domain();
     let root_participant = root.id.participant;
     let mut selected = BTreeMap::from([(root_participant, root)]);
@@ -728,7 +749,11 @@ fn resolve_group(root: ParticipationOffer) -> Vec<ParticipationOffer> {
 
         assert!(
             offer_domain_matches(&offer, &domain),
-            "selected offer crosses function, depth, or parent boundary"
+            "selected offer crosses function, depth, parent, or resolver boundary"
+        );
+        assert!(
+            !offer.specification.is_resolver(),
+            "a resolver cannot be selected as another resolver's participant"
         );
         let participant = offer.id.participant;
         assert!(
@@ -751,7 +776,7 @@ fn assert_group_is_closed(offers: &[ParticipationOffer]) {
         offers
             .iter()
             .all(|offer| offer_domain_matches(offer, &domain)),
-        "resolved group crosses function, depth, or parent boundary"
+        "resolved group crosses function, depth, parent, or resolver boundary"
     );
     let participants = offers
         .iter()
@@ -762,19 +787,20 @@ fn assert_group_is_closed(offers: &[ParticipationOffer]) {
         participants.len(),
         "resolved group contains one participant more than once"
     );
-    if offers
-        .iter()
-        .all(|offer| offer.specification.exactly_one().is_empty())
-    {
-        assert_eq!(
-            offers
-                .iter()
-                .filter(|offer| resolves_own_group(offer))
-                .count(),
-            1,
-            "fixed participants disagree about the summarizable-call resolver"
-        );
-    }
+    assert_eq!(
+        offers
+            .iter()
+            .filter(|offer| offer.specification.is_resolver())
+            .count(),
+        1,
+        "a resolved group must contain exactly one explicit resolver"
+    );
+    assert_eq!(
+        offers.iter().find(|offer| offer.specification.is_resolver())
+            .unwrap().id.participant,
+        domain.resolver,
+        "the resolving participant does not match the rendezvous domain"
+    );
     for offer in offers {
         assert!(
             offer
@@ -955,7 +981,7 @@ fn enter_resolved_call(call: SummarizableCallId, arguments: Val) -> SummaryDispa
 #[doc(hidden)]
 pub fn __enter_with(
     descriptor: SummarizableFunctionDescriptor,
-    specification: impl Into<Participants>,
+    specification: Participants,
     arguments: Val,
 ) -> SummaryDispatch {
     ExecutionState::with(|state| {
@@ -965,8 +991,9 @@ pub fn __enter_with(
         let tid = state.must.borrow().to_thread_id(state.current().id());
         let depth = state.current().summarizable_call_depth();
         let parent = state.current().summarizable_call().cloned();
-        let mut specification = specification.into();
+        let mut specification = specification;
         specification.normalize_for(tid);
+        let resolver = specification.resolver(tid);
         let id = {
             let mut must = state.must.borrow_mut();
             must.validate_nested_summarizable_specification(parent.as_ref(), tid, &specification);
@@ -974,6 +1001,7 @@ pub fn __enter_with(
         };
         let offer = ParticipationOffer {
             id: id.clone(),
+            resolver,
             function: descriptor.id(),
             depth,
             parent,
@@ -983,7 +1011,7 @@ pub fn __enter_with(
         offer
     });
 
-    if resolves_own_group(&offer) {
+    if offer.specification.is_resolver() {
         let selected = resolve_group(offer.clone());
         let call = ExecutionState::with(|state| {
             state

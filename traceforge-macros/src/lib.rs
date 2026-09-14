@@ -229,10 +229,10 @@ fn expand_summarizable(function: ItemFn) -> syn::Result<TokenStream> {
             }
 
             pub fn with(
-                participants: impl Into<::traceforge::summarizable::Participants>,
+                participants: ::traceforge::summarizable::Participants,
             ) -> CallBuilder {
                 CallBuilder {
-                    participants: participants.into(),
+                    participants,
                 }
             }
 
