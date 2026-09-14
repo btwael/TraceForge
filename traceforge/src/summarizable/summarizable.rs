@@ -1,3 +1,6 @@
+use super::symmetry::{
+    ErasedSummarizableVal, ParticipantBijection, SummarizableArguments, SummarizableVal,
+};
 use crate::event::Event;
 use crate::event_label::{Choice, MonitorSends, RecvMsg, SendMsg};
 use crate::loc::{CommunicationModel, Loc, RecvLoc, SendLoc};
@@ -8,6 +11,8 @@ use crate::runtime::thread::switch;
 use crate::thread::ThreadId;
 use crate::Val;
 use serde::{Deserialize, Serialize};
+#[cfg(test)]
+use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
@@ -30,6 +35,24 @@ impl SummarizableFunctionId {
 pub struct SummarizableCallId {
     pub function: SummarizableFunctionId,
     pub call_index: u64,
+}
+
+/// Options controlling function-summary storage and reuse.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SummarizationOptions {
+    symmetry: bool,
+}
+
+impl SummarizationOptions {
+    /// Enable summary reuse across participant groups related by thread renaming.
+    pub fn with_symmetry(mut self, enabled: bool) -> Self {
+        self.symmetry = enabled;
+        self
+    }
+
+    pub(crate) fn symmetry(&self) -> bool {
+        self.symmetry
+    }
 }
 
 /// Identity of one thread's attempt to enter a summarizable function.
@@ -165,12 +188,12 @@ pub enum SummaryDispatch {
     ApplySummary(SummarizableCallHandle),
 }
 
-/// A stable vector of dynamically typed values indexed by participant thread.
-#[derive(Clone, Debug)]
-pub(crate) struct ParticipantValues(pub(crate) Vec<(ThreadId, Val)>);
+/// A stable vector of values indexed by participant thread.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct ParticipantValues<T>(pub(crate) Vec<(ThreadId, T)>);
 
-impl ParticipantValues {
-    pub(crate) fn from_map(values: &BTreeMap<ThreadId, Val>) -> Self {
+impl<T: Clone> ParticipantValues<T> {
+    pub(crate) fn from_map(values: &BTreeMap<ThreadId, T>) -> Self {
         Self(
             values
                 .iter()
@@ -179,23 +202,59 @@ impl ParticipantValues {
         )
     }
 
-    pub(crate) fn value_for(&self, tid: ThreadId) -> Option<Val> {
+    pub(crate) fn value_for(&self, tid: ThreadId) -> Option<T> {
         self.0
             .iter()
             .find_map(|(candidate, value)| (*candidate == tid).then(|| value.clone()))
     }
 }
 
-impl PartialEq for ParticipantValues {
-    fn eq(&self, other: &Self) -> bool {
-        self.0 == other.0
+pub(crate) type ParticipantArguments = ParticipantValues<SummarizableArguments>;
+pub(crate) type ParticipantReturns = ParticipantValues<ErasedSummarizableVal>;
+
+impl ParticipantValues<SummarizableArguments> {
+    fn equivalent_to_representative(
+        &self,
+        representative: &Self,
+        bijection: &ParticipantBijection,
+    ) -> bool {
+        if self.0.len() != representative.0.len() {
+            return false;
+        }
+
+        self.0.iter().all(|(actual_tid, actual_arguments)| {
+            let Some(representative_tid) = bijection.representative_for(*actual_tid) else {
+                return false;
+            };
+            representative
+                .value_for(representative_tid)
+                .is_some_and(|stored_arguments| {
+                    actual_arguments.equivalent_to_representative(&stored_arguments, bijection)
+                })
+        })
+    }
+}
+
+impl ParticipantValues<ErasedSummarizableVal> {
+    fn instantiate(&self, bijection: &ParticipantBijection) -> Self {
+        let mut actual = BTreeMap::new();
+        for (representative_tid, value) in &self.0 {
+            let actual_tid = bijection.instantiate_id(*representative_tid);
+            assert!(
+                actual
+                    .insert(actual_tid, value.instantiate(bijection))
+                    .is_none(),
+                "summary instantiation mapped two returns to one participant"
+            );
+        }
+        Self::from_map(&actual)
     }
 }
 
 /// One globally observable outcome of a summarizable function call.
 #[derive(Clone, Debug)]
 pub(crate) enum SummaryOutcome {
-    Returned(ParticipantValues),
+    Returned(ParticipantReturns),
     Blocked,
 }
 
@@ -209,11 +268,42 @@ impl PartialEq for SummaryOutcome {
     }
 }
 
+impl SummaryOutcome {
+    fn instantiate(&self, bijection: &ParticipantBijection) -> Self {
+        match self {
+            Self::Returned(values) => Self::Returned(values.instantiate(bijection)),
+            Self::Blocked => Self::Blocked,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct SummaryCase {
     participants: Vec<ThreadId>,
-    inputs: ParticipantValues,
+    inputs: ParticipantArguments,
     outcomes: Vec<SummaryOutcome>,
+}
+
+impl SummaryCase {
+    fn instantiate_for(
+        &self,
+        actual_participants: &[ThreadId],
+        actual_inputs: &ParticipantArguments,
+    ) -> Option<Vec<SummaryOutcome>> {
+        let mut outcomes = Vec::new();
+        for bijection in participant_bijections(actual_participants, &self.participants) {
+            if !actual_inputs.equivalent_to_representative(&self.inputs, &bijection) {
+                continue;
+            }
+            for outcome in &self.outcomes {
+                let instantiated = outcome.instantiate(&bijection);
+                if !outcomes.contains(&instantiated) {
+                    outcomes.push(instantiated);
+                }
+            }
+        }
+        (!outcomes.is_empty()).then_some(outcomes)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -228,16 +318,20 @@ enum CallMode {
 #[derive(Clone, Debug)]
 struct SummarizableCallState {
     participants: Vec<ThreadId>,
-    arguments: ParticipantValues,
+    arguments: ParticipantArguments,
     selector: ThreadId,
     arrived_participants: Vec<ThreadId>,
     waiting_participants: Vec<ThreadId>,
-    returns_by_participant: BTreeMap<ThreadId, Val>,
+    returns_by_participant: BTreeMap<ThreadId, ErasedSummarizableVal>,
     mode: Option<CallMode>,
 }
 
 impl SummarizableCallState {
-    fn new(participants: Vec<ThreadId>, arguments: ParticipantValues, selector: ThreadId) -> Self {
+    fn new(
+        participants: Vec<ThreadId>,
+        arguments: ParticipantArguments,
+        selector: ThreadId,
+    ) -> Self {
         Self {
             participants,
             arguments,
@@ -268,7 +362,7 @@ pub(crate) enum EntryAction {
 #[derive(Clone, Debug)]
 pub(crate) struct SummaryMiss {
     pub(crate) participants: Vec<ThreadId>,
-    pub(crate) inputs: ParticipantValues,
+    pub(crate) inputs: ParticipantArguments,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -279,7 +373,7 @@ pub(crate) struct ParticipationOffer {
     depth: usize,
     parent: Option<SummarizableCallId>,
     specification: Participants,
-    arguments: Val,
+    arguments: SummarizableArguments,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -313,8 +407,51 @@ enum SummarizationRendezvousLoc {
     Grant(ParticipationOfferId),
 }
 
+fn permutations<T: Copy>(values: &[T]) -> Vec<Vec<T>> {
+    fn visit<T: Copy>(values: &mut Vec<T>, at: usize, output: &mut Vec<Vec<T>>) {
+        if at == values.len() {
+            output.push(values.clone());
+            return;
+        }
+        for selected in at..values.len() {
+            values.swap(at, selected);
+            visit(values, at + 1, output);
+            values.swap(at, selected);
+        }
+    }
+
+    let mut values = values.to_vec();
+    let mut output = Vec::new();
+    visit(&mut values, 0, &mut output);
+    output
+}
+
+fn participant_bijections(
+    actual: &[ThreadId],
+    representatives: &[ThreadId],
+) -> Vec<ParticipantBijection> {
+    if actual.len() != representatives.len() {
+        return Vec::new();
+    }
+    permutations(representatives)
+        .into_iter()
+        .map(|permutation| {
+            let result = ParticipantBijection::from_pairs(actual.iter().copied().zip(permutation));
+            assert_eq!(result.len(), actual.len());
+            result
+        })
+        .collect()
+}
+
 /// Function-summarization metadata owned by the model checker.
 pub(crate) struct SummarizationRuntime {
+    options: SummarizationOptions,
+
+    #[cfg(test)]
+    summary_hits: Cell<usize>,
+    #[cfg(test)]
+    summary_stores: usize,
+
     // Persistent across stateless executions.
     summaries: HashMap<SummarizableFunctionId, Vec<SummaryCase>>,
 
@@ -325,8 +462,13 @@ pub(crate) struct SummarizationRuntime {
 }
 
 impl SummarizationRuntime {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(options: SummarizationOptions) -> Self {
         Self {
+            options,
+            #[cfg(test)]
+            summary_hits: Cell::new(0),
+            #[cfg(test)]
+            summary_stores: 0,
             summaries: HashMap::new(),
             next_call_index: HashMap::new(),
             next_offer_occurrence: HashMap::new(),
@@ -394,34 +536,70 @@ impl SummarizationRuntime {
         &self,
         function: &SummarizableFunctionId,
         participants: &[ThreadId],
-        inputs: &ParticipantValues,
+        inputs: &ParticipantArguments,
     ) -> Option<Vec<SummaryOutcome>> {
-        self.summaries
-            .get(function)?
+        let cases = self.summaries.get(function)?;
+        if !self.options.symmetry() {
+            let result = cases
+                .iter()
+                .find(|case| case.participants == participants && case.inputs == *inputs)
+                .map(|case| case.outcomes.clone());
+            #[cfg(test)]
+            if result.is_some() {
+                self.summary_hits.set(self.summary_hits.get() + 1);
+            }
+            return result;
+        }
+        let result = cases
             .iter()
-            .find(|case| case.participants == participants && case.inputs == *inputs)
-            .map(|case| case.outcomes.clone())
+            .find_map(|case| case.instantiate_for(participants, inputs));
+        #[cfg(test)]
+        if result.is_some() {
+            self.summary_hits.set(self.summary_hits.get() + 1);
+        }
+        result
+    }
+
+    fn contains_equivalent_case(
+        &self,
+        function: &SummarizableFunctionId,
+        participants: &[ThreadId],
+        inputs: &ParticipantArguments,
+    ) -> bool {
+        let Some(cases) = self.summaries.get(function) else {
+            return false;
+        };
+        if !self.options.symmetry() {
+            return cases
+                .iter()
+                .any(|case| case.participants == participants && case.inputs == *inputs);
+        }
+        cases
+            .iter()
+            .any(|case| case.instantiate_for(participants, inputs).is_some())
     }
 
     pub(crate) fn store_summary_case(
         &mut self,
         function: SummarizableFunctionId,
         participants: Vec<ThreadId>,
-        inputs: ParticipantValues,
+        inputs: ParticipantArguments,
         outcomes: Vec<SummaryOutcome>,
     ) {
-        let cases = self.summaries.entry(function).or_default();
         assert!(
-            !cases
-                .iter()
-                .any(|case| case.participants == participants && case.inputs == inputs),
+            !self.contains_equivalent_case(&function, &participants, &inputs),
             "attempted to store an existing summary case twice"
         );
+        let cases = self.summaries.entry(function).or_default();
         cases.push(SummaryCase {
             participants,
             inputs,
             outcomes,
         });
+        #[cfg(test)]
+        {
+            self.summary_stores += 1;
+        }
     }
 
     pub(crate) fn commit_group(
@@ -466,8 +644,8 @@ impl SummarizationRuntime {
         &mut self,
         tid: ThreadId,
         call: SummarizableCallId,
-        arguments: Val,
-        expected_exploration: Option<(&SummarizableCallId, &[ThreadId], &ParticipantValues)>,
+        arguments: SummarizableArguments,
+        expected_exploration: Option<(&SummarizableCallId, &[ThreadId], &ParticipantArguments)>,
     ) -> (EntryAction, Vec<ThreadId>, Option<SummaryMiss>) {
         let call_state = self
             .call_states
@@ -624,7 +802,7 @@ impl SummarizationRuntime {
         &mut self,
         tid: ThreadId,
         handle: &SummarizableCallHandle,
-        value: Val,
+        value: ErasedSummarizableVal,
     ) -> bool {
         let call_state = self
             .call_states
@@ -642,7 +820,7 @@ impl SummarizationRuntime {
     pub(crate) fn completed_body_returns(
         &self,
         call: &SummarizableCallId,
-    ) -> Option<ParticipantValues> {
+    ) -> Option<ParticipantReturns> {
         let call_state = self.call_states.get(call)?;
         (call_state.returns_by_participant.len() == call_state.participant_count())
             .then(|| ParticipantValues::from_map(&call_state.returns_by_participant))
@@ -651,7 +829,7 @@ impl SummarizationRuntime {
 
 impl Default for SummarizationRuntime {
     fn default() -> Self {
-        Self::new()
+        Self::new(SummarizationOptions::default())
     }
 }
 
@@ -796,8 +974,12 @@ fn assert_group_is_closed(offers: &[ParticipationOffer]) {
         "a resolved group must contain exactly one explicit resolver"
     );
     assert_eq!(
-        offers.iter().find(|offer| offer.specification.is_resolver())
-            .unwrap().id.participant,
+        offers
+            .iter()
+            .find(|offer| offer.specification.is_resolver())
+            .unwrap()
+            .id
+            .participant,
         domain.resolver,
         "the resolving participant does not match the rendezvous domain"
     );
@@ -927,7 +1109,10 @@ fn wake_participants(state: &mut ExecutionState, tids: Vec<ThreadId>) {
     }
 }
 
-fn enter_resolved_call(call: SummarizableCallId, arguments: Val) -> SummaryDispatch {
+fn enter_resolved_call(
+    call: SummarizableCallId,
+    arguments: SummarizableArguments,
+) -> SummaryDispatch {
     loop {
         switch();
         let action = ExecutionState::with(|state| {
@@ -982,7 +1167,7 @@ fn enter_resolved_call(call: SummarizableCallId, arguments: Val) -> SummaryDispa
 pub fn __enter_with(
     descriptor: SummarizableFunctionDescriptor,
     specification: Participants,
-    arguments: Val,
+    arguments: SummarizableArguments,
 ) -> SummaryDispatch {
     ExecutionState::with(|state| {
         state.must.borrow().validate_summarization_configuration();
@@ -1045,7 +1230,7 @@ pub fn __enter_with(
 
 /// Record one explored return. A summary-exploration run never returns to caller code.
 #[doc(hidden)]
-pub fn __complete_body(handle: SummarizableCallHandle, value: Val) -> ! {
+pub fn __complete_body(handle: SummarizableCallHandle, value: ErasedSummarizableVal) -> ! {
     ExecutionState::with(|state| {
         let tid = state.must.borrow().to_thread_id(state.current().id());
         state.current_mut().leave_summarizable_call(&handle.call);
@@ -1066,7 +1251,7 @@ pub fn __complete_body(handle: SummarizableCallHandle, value: Val) -> ! {
 #[doc(hidden)]
 pub fn __apply_summary<T>(handle: SummarizableCallHandle) -> T
 where
-    T: Message + 'static,
+    T: Message + SummarizableVal + Send + 'static,
 {
     let tid = ExecutionState::with(|state| state.must.borrow().to_thread_id(state.current().id()));
     let (outcome, _choice_event) =
@@ -1079,14 +1264,7 @@ where
             ExecutionState::with(|state| {
                 state.current_mut().leave_summarizable_call(&handle.call);
             });
-            let actual_type = value.type_name.clone();
-            *value.as_any().downcast::<T>().unwrap_or_else(|_| {
-                panic!(
-                    "summary return type mismatch: expected {}, got {}",
-                    std::any::type_name::<T>(),
-                    actual_type
-                )
-            })
+            value.into_typed::<T>()
         }
         SummaryOutcome::Blocked => {
             ExecutionState::with(|state| {

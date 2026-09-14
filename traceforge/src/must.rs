@@ -39,9 +39,9 @@ use std::fs::File;
 use std::io::Write;
 
 use crate::summarizable::{
-    EntryAction, ParticipantValues, Participants, ParticipationOffer, ParticipationOfferId,
-    SummarizableCallHandle, SummarizableCallId, SummarizableFunctionId, SummarizationRuntime,
-    SummaryMiss, SummaryOutcome,
+    EntryAction, ParticipantArguments, Participants, ParticipationOffer, ParticipationOfferId,
+    SummarizableArguments, SummarizableCallHandle, SummarizableCallId, SummarizableFunctionId,
+    ErasedSummarizableVal, SummarizationRuntime, SummaryMiss, SummaryOutcome,
 };
 
 const EXECS: &str = "execs";
@@ -123,7 +123,7 @@ struct SummaryExplorationFrame {
     call: SummarizableCallId,
     function: SummarizableFunctionId,
     participants: Vec<ThreadId>,
-    inputs: ParticipantValues,
+    inputs: ParticipantArguments,
 
     // Reset on every stateless execution and set once replay reaches this exact entry cut.
     active_this_execution: bool,
@@ -183,6 +183,7 @@ pub(crate) struct Must {
 impl Must {
     pub(crate) fn new(conf: Config, replay_mode: bool) -> Self {
         let seed = conf.seed;
+        let summarization_options = conf.summarization;
         if conf.schedule_policy == SchedulePolicy::Arbitrary
             || conf.mode == ExplorationMode::Estimation
         {
@@ -215,7 +216,7 @@ impl Must {
             symbolic_solver: SymbolicSolver::new(),
             global_named_choices: HashMap::new(),
             max_graph_events: 0,
-            summarization: SummarizationRuntime::new(),
+            summarization: SummarizationRuntime::new(summarization_options),
             summary_explorations: Vec::new(),
         }
     }
@@ -244,7 +245,7 @@ impl Must {
         #[cfg(feature = "symbolic")]
         self.symbolic_solver.reset();
         self.global_named_choices.clear();
-        self.summarization = SummarizationRuntime::new();
+        self.summarization = SummarizationRuntime::new(self.config.summarization);
         self.summary_explorations.clear();
     }
 
@@ -387,7 +388,7 @@ impl Must {
         // Note: frozen_thread_index_map, thread_index_map, next_thread_index,
         // config, rng are intentionally NOT reset — they are either set
         // explicitly by the caller (frozen map) or persist across tasks.
-        self.summarization = SummarizationRuntime::new();
+        self.summarization = SummarizationRuntime::new(self.config.summarization);
         self.summary_explorations.clear();
     }
 
@@ -2669,7 +2670,7 @@ impl Must {
         tid: ThreadId,
         depth: usize,
         call: SummarizableCallId,
-        arguments: Val,
+        arguments: SummarizableArguments,
     ) -> (EntryAction, Vec<ThreadId>) {
         assert!(
             depth <= self.summary_explorations.len(),
@@ -2757,7 +2758,7 @@ impl Must {
         &mut self,
         tid: ThreadId,
         handle: &SummarizableCallHandle,
-        value: Val,
+        value: ErasedSummarizableVal,
     ) -> bool {
         let all_participants_returned = self.summarization.record_body_return(tid, handle, value);
         if all_participants_returned {

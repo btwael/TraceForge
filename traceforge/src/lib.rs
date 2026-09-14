@@ -34,7 +34,7 @@ pub mod summarizable;
 pub mod symbolic;
 pub mod thread;
 mod vector_clock;
-pub use traceforge_macros::summarizable;
+pub use traceforge_macros::{summarizable, SummarizableVal};
 
 pub use crate::msg::Val;
 // `Val` is used by monitors.
@@ -229,6 +229,8 @@ pub struct Config {
     pub(crate) verbose: usize,
     pub(crate) seed: u64,
     pub(crate) symmetry: bool,
+    #[serde(default)]
+    pub(crate) summarization: summarizable::SummarizationOptions,
     pub(crate) vr: bool,
     pub(crate) lossy_budget: usize,
     pub(crate) dot_file: Option<String>,
@@ -302,6 +304,7 @@ impl ConfigBuilder {
             verbose: 0,
             seed: rand::rng().next_u64(),
             symmetry: false,
+            summarization: summarizable::SummarizationOptions::default(),
             vr: false,
             lossy_budget: 0,
             dot_file: None,
@@ -439,6 +442,15 @@ impl ConfigBuilder {
     /// Enables symmetry reduction
     pub fn with_symmetry(mut self, s: bool) -> Self {
         self.0.symmetry = s;
+        self
+    }
+
+    /// Configures function summarization.
+    pub fn with_summarization_options(
+        mut self,
+        options: summarizable::SummarizationOptions,
+    ) -> Self {
+        self.0.summarization = options;
         self
     }
 

@@ -2,7 +2,7 @@ extern crate proc_macro;
 
 use convert_case::{Case, Casing};
 use proc_macro2::{Ident, TokenStream};
-use quote::quote;
+use quote::{format_ident, quote};
 use syn::parse::{Parse, ParseStream, Result};
 use syn::punctuated::Punctuated;
 use syn::spanned::Spanned;
@@ -148,6 +148,172 @@ pub fn summarizable(
         .into()
 }
 
+#[proc_macro_derive(SummarizableVal)]
+pub fn derive_summarizable_val(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
+    let input = syn::parse_macro_input!(input as syn::DeriveInput);
+    expand_summarizable_val(input)
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
+
+fn symmetric_fields(
+    constructor: TokenStream,
+    fields: &syn::Fields,
+) -> (TokenStream, TokenStream, TokenStream, TokenStream) {
+    match fields {
+        syn::Fields::Named(fields) => {
+            let field_names = fields
+                .named
+                .iter()
+                .map(|field| field.ident.as_ref().unwrap().clone())
+                .collect::<Vec<_>>();
+            let actual = field_names
+                .iter()
+                .map(|name| format_ident!("__actual_{name}"))
+                .collect::<Vec<_>>();
+            let stored = field_names
+                .iter()
+                .map(|name| format_ident!("__stored_{name}"))
+                .collect::<Vec<_>>();
+
+            let actual_pattern = quote! {
+                #constructor { #(#field_names: #actual),* }
+            };
+            let stored_pattern = quote! {
+                #constructor { #(#field_names: #stored),* }
+            };
+            let equivalent = quote! {
+                true #(&& ::traceforge::summarizable::SummarizableVal::
+                    equivalent_to_representative(#actual, #stored, bijection))*
+            };
+            let instantiated = quote! {
+                #constructor { #(
+                    #field_names:
+                        ::traceforge::summarizable::SummarizableVal::instantiate(
+                            #actual, bijection,
+                        )
+                ),* }
+            };
+            (actual_pattern, stored_pattern, equivalent, instantiated)
+        }
+        syn::Fields::Unnamed(fields) => {
+            let actual = (0..fields.unnamed.len())
+                .map(|index| format_ident!("__actual_{index}"))
+                .collect::<Vec<_>>();
+            let stored = (0..fields.unnamed.len())
+                .map(|index| format_ident!("__stored_{index}"))
+                .collect::<Vec<_>>();
+
+            let actual_pattern = quote! { #constructor(#(#actual),*) };
+            let stored_pattern = quote! { #constructor(#(#stored),*) };
+            let equivalent = quote! {
+                true #(&& ::traceforge::summarizable::SummarizableVal::
+                    equivalent_to_representative(#actual, #stored, bijection))*
+            };
+            let instantiated = quote! {
+                #constructor(#(
+                    ::traceforge::summarizable::SummarizableVal::instantiate(
+                        #actual, bijection,
+                    )
+                ),*)
+            };
+            (actual_pattern, stored_pattern, equivalent, instantiated)
+        }
+        syn::Fields::Unit => (
+            constructor.clone(),
+            constructor.clone(),
+            quote! { true },
+            constructor,
+        ),
+    }
+}
+
+fn expand_summarizable_val(input: syn::DeriveInput) -> syn::Result<TokenStream> {
+    let name = input.ident;
+    let mut generics = input.generics;
+    for parameter in generics.type_params_mut() {
+        parameter.bounds.push(syn::parse_quote!(
+            ::traceforge::summarizable::SummarizableVal
+        ));
+    }
+    let (impl_generics, type_generics, where_clause) = generics.split_for_impl();
+
+    let (equivalent_body, instantiate_body) = match input.data {
+        syn::Data::Struct(data) => {
+            let (actual, stored, equivalent, instantiated) =
+                symmetric_fields(quote! { Self }, &data.fields);
+            (
+                quote! {
+                    match (self, representative) {
+                        (#actual, #stored) => #equivalent,
+                    }
+                },
+                quote! {
+                    match self {
+                        #actual => #instantiated,
+                    }
+                },
+            )
+        }
+        syn::Data::Enum(data) => {
+            let generated = data
+                .variants
+                .iter()
+                .map(|variant| {
+                    let variant_name = &variant.ident;
+                    symmetric_fields(quote! { Self::#variant_name }, &variant.fields)
+                })
+                .collect::<Vec<_>>();
+            let equivalent_arms = generated.iter().map(|(actual, stored, equivalent, _)| {
+                quote! { (#actual, #stored) => #equivalent }
+            });
+            let instantiate_arms = generated.iter().map(|(actual, _, _, instantiated)| {
+                quote! { #actual => #instantiated }
+            });
+            (
+                quote! {
+                    match (self, representative) {
+                        #(#equivalent_arms,)*
+                        _ => false,
+                    }
+                },
+                quote! {
+                    match self {
+                        #(#instantiate_arms,)*
+                    }
+                },
+            )
+        }
+        syn::Data::Union(data) => {
+            return Err(syn::Error::new(
+                data.union_token.span,
+                "SummarizableVal cannot be derived for unions",
+            ));
+        }
+    };
+
+    Ok(quote! {
+        impl #impl_generics ::traceforge::summarizable::SummarizableVal
+            for #name #type_generics #where_clause
+        {
+            fn equivalent_to_representative(
+                &self,
+                representative: &Self,
+                bijection: &::traceforge::summarizable::ParticipantBijection,
+            ) -> bool {
+                #equivalent_body
+            }
+
+            fn instantiate(
+                &self,
+                bijection: &::traceforge::summarizable::ParticipantBijection,
+            ) -> Self {
+                #instantiate_body
+            }
+        }
+    })
+}
+
 fn expand_summarizable(function: ItemFn) -> syn::Result<TokenStream> {
     let ItemFn {
         attrs,
@@ -246,9 +412,14 @@ fn expand_summarizable(function: ItemFn) -> syn::Result<TokenStream> {
 
                     // Clone only for the summary key. The originals are still
                     // moved into the body on a summary miss.
-                    let __traceforge_arguments = ::traceforge::Val::new((
-                        #(#arguments.clone(),)*
-                    ));
+                    let __traceforge_arguments =
+                        ::traceforge::summarizable::SummarizableArguments::new(vec![
+                            #(
+                                ::traceforge::summarizable::ErasedSummarizableVal::new(
+                                    #arguments.clone()
+                                ),
+                            )*
+                        ]);
 
                     match ::traceforge::summarizable::__enter_with(
                         __TRACEFORGE_SUMMARIZABLE,
@@ -264,7 +435,9 @@ fn expand_summarizable(function: ItemFn) -> syn::Result<TokenStream> {
 
                             ::traceforge::summarizable::__complete_body(
                                 __traceforge_call,
-                                ::traceforge::Val::new(__traceforge_return_value),
+                                ::traceforge::summarizable::ErasedSummarizableVal::new(
+                                    __traceforge_return_value
+                                ),
                             )
                         }
 
