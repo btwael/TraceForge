@@ -53,18 +53,6 @@ print_vals_custom = []
 name = "symbolic_echo"
 required-features = ["symbolic"]
 
-[[example]]
-name = "symbolic_summary"
-required-features = ["symbolic"]
-
-[[example]]
-name = "tpc_symbolic_summary"
-required-features = ["symbolic"]
-
 [[test]]
 name = "symbolic"
-required-features = ["symbolic"]
-
-[[test]]
-name = "symbolic_summarizable"
 required-features = ["symbolic"]
