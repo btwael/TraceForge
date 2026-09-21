@@ -30,7 +30,7 @@ use crate::msg::Message;
 use crate::thread::{main_thread_id, ThreadId};
 
 #[cfg(feature = "symbolic")]
-use crate::symbolic::SymbolicSolver;
+use crate::symbolic::{self, SymExpr, SymSort, SymVarId, SymbolicSolver};
 
 use crate::monitor_types::{EndCondition, ExecutionEnd, Monitor, MonitorResult};
 use std::any::TypeId;
@@ -38,10 +38,13 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs::File;
 use std::io::Write;
 
+#[cfg(feature = "symbolic")]
+use crate::summarizable::OutputNormalization;
 use crate::summarizable::{
-    EntryAction, ParticipantArguments, Participants, ParticipationOffer, ParticipationOfferId,
-    SummarizableArguments, SummarizableCallHandle, SummarizableCallId, SummarizableFunctionId,
-    ErasedSummarizableVal, SummarizationRuntime, SummaryMiss, SummaryOutcome,
+    insert_summary_outcome, EntryAction, ErasedSummarizableVal, ParticipantArguments, Participants,
+    ParticipationOffer, ParticipationOfferId, SummarizableArguments, SummarizableCallHandle,
+    SummarizableCallId, SummarizableFunctionId, SummarizationRuntime, SummaryCondition,
+    SummaryMiss, SummaryOutcome, SummaryResult,
 };
 
 const EXECS: &str = "execs";
@@ -123,7 +126,8 @@ struct SummaryExplorationFrame {
     call: SummarizableCallId,
     function: SummarizableFunctionId,
     participants: Vec<ThreadId>,
-    inputs: ParticipantArguments,
+    actual_inputs: ParticipantArguments,
+    summary_inputs: ParticipantArguments,
 
     // Reset on every stateless execution and set once replay reaches this exact entry cut.
     active_this_execution: bool,
@@ -1035,12 +1039,22 @@ impl Must {
             let lab = LabelEnum::ConstraintEval(lab.clone());
             self.current.graph.validate_replay_event(&lab);
             self.process_event(LabelEnum::ConstraintEval(stored.clone()));
-            self.add_constraint_to_path_solver(&stored);
+            if !self.constraint_owned_by_active_summary(&stored) {
+                self.add_constraint_to_path_solver(&stored);
+            }
             return stored.branch_taken();
         }
 
-        let true_sat = self.symbolic_solver.sat_with(lab.expr());
-        let false_sat = self.symbolic_solver.sat_with_not(lab.expr());
+        let owned_by_active_summary = self.constraint_owned_by_active_summary(&lab);
+        let (true_sat, false_sat) = if owned_by_active_summary {
+            let solver = self.symbolic_solver_for_owner(&self.current.graph, lab.owner());
+            (solver.sat_with(lab.expr()), solver.sat_with_not(lab.expr()))
+        } else {
+            (
+                self.symbolic_solver.sat_with(lab.expr()),
+                self.symbolic_solver.sat_with_not(lab.expr()),
+            )
+        };
 
         if !true_sat && !false_sat {
             panic!(
@@ -1053,9 +1067,11 @@ impl Must {
         lab.set_branch_taken(chosen);
 
         let pos = self.add_to_graph(LabelEnum::ConstraintEval(lab.clone()));
-        self.add_constraint_to_path_solver(&lab);
+        if !owned_by_active_summary {
+            self.add_constraint_to_path_solver(&lab);
+        }
 
-        if true_sat && false_sat {
+        if true_sat && false_sat && lab.kind() == ConstraintKind::Branch {
             push_worklist(
                 &mut self.current.rqueue,
                 self.current.graph.label(pos).stamp(),
@@ -1064,6 +1080,55 @@ impl Must {
         }
 
         chosen
+    }
+
+    #[cfg(feature = "symbolic")]
+    pub(crate) fn handle_fixed_constraint(&mut self, lab: ConstraintEval) {
+        assert_eq!(lab.kind(), ConstraintKind::FixedAssumption);
+        assert!(lab.branch_taken());
+
+        if self.is_replay(lab.pos()) {
+            let stored = match self.current.graph.label(lab.pos()).clone() {
+                LabelEnum::ConstraintEval(constraint) => constraint,
+                other => panic!("expected fixed constraint at {}, got {}", lab.pos(), other),
+            };
+            self.current
+                .graph
+                .validate_replay_event(&LabelEnum::ConstraintEval(lab));
+            self.process_event(LabelEnum::ConstraintEval(stored.clone()));
+            if !self.constraint_owned_by_active_summary(&stored) {
+                self.add_constraint_to_path_solver(&stored);
+            }
+            return;
+        }
+
+        let owned_by_active_summary = self.constraint_owned_by_active_summary(&lab);
+        let satisfiable = if owned_by_active_summary {
+            self.symbolic_solver_for_owner(&self.current.graph, lab.owner())
+                .sat_with(lab.expr())
+        } else {
+            self.symbolic_solver.sat_with(lab.expr())
+        };
+        assert!(satisfiable, "selected an infeasible summary guard");
+
+        self.add_to_graph(LabelEnum::ConstraintEval(lab.clone()));
+        if !owned_by_active_summary {
+            self.add_constraint_to_path_solver(&lab);
+        }
+    }
+
+    #[cfg(feature = "symbolic")]
+    fn summary_frame_is_active(&self, call: &SummarizableCallId) -> bool {
+        self.summary_explorations
+            .iter()
+            .any(|frame| frame.active_this_execution && &frame.call == call)
+    }
+
+    #[cfg(feature = "symbolic")]
+    fn constraint_owned_by_active_summary(&self, constraint: &ConstraintEval) -> bool {
+        constraint
+            .owner()
+            .is_some_and(|owner| self.summary_frame_is_active(owner))
     }
 
     #[cfg(feature = "symbolic")]
@@ -1100,6 +1165,35 @@ impl Must {
         solver
     }
 
+    #[cfg(feature = "symbolic")]
+    fn symbolic_solver_for_owner(
+        &self,
+        graph: &ExecutionGraph,
+        owner: Option<&SummarizableCallId>,
+    ) -> SymbolicSolver {
+        let mut solver = SymbolicSolver::new();
+        let mut labels = graph
+            .threads
+            .iter()
+            .flat_map(|thread| thread.labels.iter())
+            .collect::<Vec<_>>();
+        labels.sort_by_key(|label| label.stamp());
+        for label in labels {
+            let LabelEnum::ConstraintEval(constraint) = label else {
+                continue;
+            };
+            if constraint.owner() != owner {
+                continue;
+            }
+            if constraint.branch_taken() {
+                solver.assert(constraint.expr());
+            } else {
+                solver.assert_not(constraint.expr());
+            }
+        }
+        solver
+    }
+
     // TODO: This code is never run. Change it in the future.
     #[cfg(feature = "symbolic")]
     fn symbolic_backward_revisit_is_sat(&self, rev: &Revisit) -> bool {
@@ -1120,7 +1214,14 @@ impl Must {
         let mut g = self.current.graph.copy_to_view(&view);
         g.change_rf_placement(rev.pos, &rev.rev);
 
-        let solver = self.symbolic_solver_for_graph(&g);
+        let solver = if c
+            .owner()
+            .is_some_and(|owner| self.summary_frame_is_active(owner))
+        {
+            self.symbolic_solver_for_owner(&g, c.owner())
+        } else {
+            self.symbolic_solver_for_graph(&g)
+        };
 
         let true_sat = solver.sat_with(c.expr());
         if true_sat {
@@ -2625,12 +2726,6 @@ impl Must {
             "function summarization does not yet support monitors"
         );
 
-        #[cfg(feature = "symbolic")]
-        assert!(
-            !self.config.symbolic,
-            "function summarization does not yet support symbolic execution"
-        );
-
         // This flag means replay from a serialized error artifact. It does not
         // mean ordinary execution-graph replay during verification.
         assert!(
@@ -2683,12 +2778,15 @@ impl Must {
             (
                 frame.call.clone(),
                 frame.participants.clone(),
-                frame.inputs.clone(),
+                frame.actual_inputs.clone(),
+                frame.summary_inputs.clone(),
             )
         });
-        let expected_exploration_ref = expected_exploration
-            .as_ref()
-            .map(|(call, participants, inputs)| (call, participants.as_slice(), inputs));
+        let expected_exploration_ref = expected_exploration.as_ref().map(
+            |(call, participants, actual_inputs, summary_inputs)| {
+                (call, participants.as_slice(), actual_inputs, summary_inputs)
+            },
+        );
 
         let (action, wake, summary_miss) = self.summarization.arrive_at_resolved_entry(
             tid,
@@ -2697,7 +2795,7 @@ impl Must {
             expected_exploration_ref,
         );
 
-        if let EntryAction::ExecuteBody(handle) = &action {
+        if let EntryAction::ExecuteBody { handle, .. } = &action {
             if let Some(frame) = self.summary_explorations.get_mut(depth) {
                 if frame.call == handle.call {
                     frame.active_this_execution = true;
@@ -2707,7 +2805,8 @@ impl Must {
 
         if let Some(SummaryMiss {
             participants,
-            inputs,
+            actual_inputs,
+            summary_inputs,
         }) = summary_miss
         {
             // A new miss may only extend the current exploration nesting path.
@@ -2717,7 +2816,7 @@ impl Must {
                 "a summary miss attempted to replace an active exploration frame"
             );
 
-            let EntryAction::ExecuteBody(handle) = &action else {
+            let EntryAction::ExecuteBody { handle, .. } = &action else {
                 unreachable!("a missing summary must execute the body");
             };
 
@@ -2725,7 +2824,8 @@ impl Must {
                 call: handle.call.clone(),
                 function: handle.call.function.clone(),
                 participants,
-                inputs,
+                actual_inputs,
+                summary_inputs,
                 active_this_execution: true,
                 entry_graph: self.current.graph.clone(),
                 caller_rqueue: std::mem::take(&mut self.current.rqueue),
@@ -2737,14 +2837,64 @@ impl Must {
         (action, wake)
     }
 
-    pub(crate) fn select_summary_outcome(
+    pub(crate) fn prepare_summary_outcomes(
         &mut self,
         handle: &SummarizableCallHandle,
+        consumer_owner: Option<&SummarizableCallId>,
+    ) -> usize {
+        let candidates = self.summarization.summary_outcomes(handle);
+        let feasible = candidates
+            .into_iter()
+            .filter(|outcome| {
+                self.summary_condition_is_feasible(&outcome.condition, consumer_owner)
+            })
+            .collect::<Vec<_>>();
+        let count = feasible.len();
+        self.summarization
+            .replace_summary_outcomes(handle, feasible);
+        count
+    }
+
+    fn summary_condition_is_feasible(
+        &self,
+        condition: &SummaryCondition,
+        consumer_owner: Option<&SummarizableCallId>,
+    ) -> bool {
+        #[cfg(not(feature = "symbolic"))]
+        let _ = consumer_owner;
+        match condition {
+            SummaryCondition::Always => true,
+            #[cfg(feature = "symbolic")]
+            SummaryCondition::Symbolic { guard, .. } => {
+                if let Some(owner) =
+                    consumer_owner.filter(|owner| self.summary_frame_is_active(owner))
+                {
+                    self.symbolic_solver_for_owner(&self.current.graph, Some(owner))
+                        .sat_with(guard)
+                } else {
+                    self.symbolic_solver.sat_with(guard)
+                }
+            }
+        }
+    }
+
+    pub(crate) fn selected_summary_outcome_template(
+        &self,
+        handle: &SummarizableCallHandle,
         index: usize,
+    ) -> (Vec<ThreadId>, SummaryOutcome) {
+        self.summarization
+            .selected_summary_outcome_template(handle, index)
+    }
+
+    pub(crate) fn commit_summary_selection(
+        &mut self,
+        handle: &SummarizableCallHandle,
+        outcome: SummaryOutcome,
         choice: Event,
     ) -> Vec<ThreadId> {
         self.summarization
-            .select_summary_outcome(handle, index, choice)
+            .commit_summary_selection(handle, outcome, choice)
     }
 
     pub(crate) fn selected_summary_outcome(
@@ -2772,6 +2922,108 @@ impl Must {
         self.stop();
     }
 
+    pub(crate) fn prune_summary_application(&mut self, pos: Event) {
+        self.handle_block(Block::new(pos, BlockType::Assume));
+        self.stop();
+    }
+
+    #[cfg(feature = "symbolic")]
+    fn symbolic_guard_for_frame(&self, frame: &SummaryExplorationFrame) -> SymExpr {
+        let mut constraints = self
+            .current
+            .graph
+            .threads
+            .iter()
+            .flat_map(|thread| thread.labels.iter())
+            .filter_map(|label| {
+                let LabelEnum::ConstraintEval(constraint) = label else {
+                    return None;
+                };
+                if constraint.owner() != Some(&frame.call)
+                    || frame.entry_graph.label_opt(constraint.pos()).is_some()
+                {
+                    return None;
+                }
+                Some(constraint)
+            })
+            .collect::<Vec<_>>();
+        constraints.sort_by_key(|constraint| constraint.stamp());
+        constraints
+            .into_iter()
+            .map(|constraint| {
+                if constraint.branch_taken() {
+                    constraint.expr().clone()
+                } else {
+                    constraint.expr().clone().not()
+                }
+            })
+            .reduce(|left, right| left.and(right))
+            .unwrap_or_else(|| symbolic::bool_val(true))
+    }
+
+    #[cfg(feature = "symbolic")]
+    fn symbolic_locals_for_frame(
+        &self,
+        frame: &SummaryExplorationFrame,
+    ) -> Vec<(SymVarId, SymSort)> {
+        let mut locals = self
+            .current
+            .graph
+            .threads
+            .iter()
+            .flat_map(|thread| thread.labels.iter())
+            .filter_map(|label| {
+                let LabelEnum::SymbolicVar(variable) = label else {
+                    return None;
+                };
+                if variable.owner() != Some(&frame.call)
+                    || frame.entry_graph.label_opt(variable.pos()).is_some()
+                {
+                    return None;
+                }
+                Some((variable.stamp(), variable.id(), variable.sort().clone()))
+            })
+            .collect::<Vec<_>>();
+        locals.sort_by_key(|(stamp, _, _)| *stamp);
+        locals.into_iter().map(|(_, id, sort)| (id, sort)).collect()
+    }
+
+    #[cfg(feature = "symbolic")]
+    fn symbolic_summary_outcome(
+        &self,
+        frame: &SummaryExplorationFrame,
+        result: SummaryResult,
+    ) -> SummaryOutcome {
+        let guard = self.symbolic_guard_for_frame(frame);
+        let locals = self.symbolic_locals_for_frame(frame);
+        let local_map = locals
+            .iter()
+            .enumerate()
+            .map(|(index, (execution_id, sort))| {
+                (
+                    execution_id.clone(),
+                    SymExpr::summary_local(index, sort.clone()),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        let normalization = OutputNormalization::new(local_map);
+        let guard = normalization.normalize_symbolic(&guard);
+        let result = match result {
+            SummaryResult::Returned(values) => {
+                SummaryResult::Returned(values.normalize_summary_output(&normalization))
+            }
+            SummaryResult::Blocked => SummaryResult::Blocked,
+            SummaryResult::AssumptionFailed => SummaryResult::AssumptionFailed,
+        };
+        SummaryOutcome {
+            condition: SummaryCondition::Symbolic {
+                guard,
+                local_sorts: locals.into_iter().map(|(_, sort)| sort).collect(),
+            },
+            result,
+        }
+    }
+
     fn complete_summary_body_execution(&mut self) -> bool {
         let call = self
             .summary_explorations
@@ -2780,17 +3032,15 @@ impl Must {
             .call
             .clone();
 
-        let outcome = if let Some(returns) = self.summarization.completed_body_returns(&call) {
-            SummaryOutcome::Returned(returns)
+        let result = if let Some(returns) = self.summarization.completed_body_returns(&call) {
+            SummaryResult::Returned(returns)
         } else {
             match self.check_blocked() {
                 Some(BlockType::Value(_, _))
                 | Some(BlockType::Join(_))
-                | Some(BlockType::SummaryOutcome(_)) => SummaryOutcome::Blocked,
+                | Some(BlockType::SummaryOutcome(_)) => SummaryResult::Blocked,
 
-                Some(BlockType::Assume) => {
-                    panic!("traceforge::assume is not supported inside #[summarizable]");
-                }
+                Some(BlockType::Assume) => SummaryResult::AssumptionFailed,
 
                 Some(BlockType::Assert) => {
                     panic!(
@@ -2806,6 +3056,20 @@ impl Must {
             }
         };
 
+        #[cfg(feature = "symbolic")]
+        let frame = self
+            .summary_explorations
+            .last()
+            .expect("summary exploration stack became empty while building an outcome");
+        #[cfg(feature = "symbolic")]
+        let outcome = if self.config.symbolic {
+            self.symbolic_summary_outcome(frame, result)
+        } else {
+            SummaryOutcome::ordinary(result)
+        };
+        #[cfg(not(feature = "symbolic"))]
+        let outcome = SummaryOutcome::ordinary(result);
+
         let frame = self
             .summary_explorations
             .last_mut()
@@ -2816,9 +3080,7 @@ impl Must {
             "summary outcome was attributed to the wrong nesting depth"
         );
 
-        if !frame.outcomes.contains(&outcome) {
-            frame.outcomes.push(outcome);
-        }
+        insert_summary_outcome(&mut frame.outcomes, outcome);
 
         self.unstop();
 
@@ -2843,7 +3105,7 @@ impl Must {
         self.summarization.store_summary_case(
             frame.function,
             frame.participants,
-            frame.inputs,
+            frame.summary_inputs,
             frame.outcomes,
         );
 

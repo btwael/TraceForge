@@ -1,8 +1,13 @@
+#[cfg(feature = "symbolic")]
+use super::symmetry::OutputNormalization;
 use super::symmetry::{
-    ErasedSummarizableVal, ParticipantBijection, SummarizableArguments, SummarizableVal,
+    ErasedSummarizableVal, InputAbstraction, InstantiationContext, MatchContext,
+    ParticipantBijection, SummarizableArguments, SummarizableVal,
 };
 use crate::event::Event;
 use crate::event_label::{Choice, MonitorSends, RecvMsg, SendMsg};
+#[cfg(feature = "symbolic")]
+use crate::event_label::{ConstraintEval, ConstraintKind};
 use crate::loc::{CommunicationModel, Loc, RecvLoc, SendLoc};
 use crate::msg::Message;
 use crate::predicate::PredicateType;
@@ -15,6 +20,9 @@ use serde::{Deserialize, Serialize};
 use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
+
+#[cfg(feature = "symbolic")]
+use crate::symbolic::{self, SymExpr, SymSort, SymVarId};
 
 /// Stable identity of a function annotated with `#[summarizable]`.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -184,7 +192,10 @@ pub struct SummarizableCallHandle {
 
 /// Tells the generated wrapper whether to execute the body or apply a summary.
 pub enum SummaryDispatch {
-    ExecuteBody(SummarizableCallHandle),
+    ExecuteBody {
+        handle: SummarizableCallHandle,
+        arguments: SummarizableArguments,
+    },
     ApplySummary(SummarizableCallHandle),
 }
 
@@ -213,68 +224,179 @@ pub(crate) type ParticipantArguments = ParticipantValues<SummarizableArguments>;
 pub(crate) type ParticipantReturns = ParticipantValues<ErasedSummarizableVal>;
 
 impl ParticipantValues<SummarizableArguments> {
-    fn equivalent_to_representative(
-        &self,
-        representative: &Self,
-        bijection: &ParticipantBijection,
-    ) -> bool {
-        if self.0.len() != representative.0.len() {
+    fn abstract_inputs(&self) -> Self {
+        let mut context = InputAbstraction::default();
+        Self(
+            self.0
+                .iter()
+                .map(|(participant, arguments)| {
+                    (*participant, arguments.abstract_input(&mut context))
+                })
+                .collect(),
+        )
+    }
+
+    fn matches_stored_inputs(&self, stored: &Self, context: &mut MatchContext) -> bool {
+        if self.0.len() != stored.0.len() {
             return false;
         }
 
         self.0.iter().all(|(actual_tid, actual_arguments)| {
-            let Some(representative_tid) = bijection.representative_for(*actual_tid) else {
+            let Some(representative_tid) = context.participants().representative_for(*actual_tid)
+            else {
                 return false;
             };
-            representative
+            stored
                 .value_for(representative_tid)
                 .is_some_and(|stored_arguments| {
-                    actual_arguments.equivalent_to_representative(&stored_arguments, bijection)
+                    actual_arguments.matches_stored_input(&stored_arguments, context)
                 })
         })
     }
 }
 
 impl ParticipantValues<ErasedSummarizableVal> {
-    fn instantiate(&self, bijection: &ParticipantBijection) -> Self {
+    fn instantiate(&self, context: &InstantiationContext) -> Self {
         let mut actual = BTreeMap::new();
         for (representative_tid, value) in &self.0 {
-            let actual_tid = bijection.instantiate_id(*representative_tid);
+            let actual_tid = context.participants().instantiate_id(*representative_tid);
             assert!(
                 actual
-                    .insert(actual_tid, value.instantiate(bijection))
+                    .insert(actual_tid, value.instantiate(context))
                     .is_none(),
                 "summary instantiation mapped two returns to one participant"
             );
         }
         Self::from_map(&actual)
     }
+
+    #[cfg(feature = "symbolic")]
+    pub(crate) fn normalize_summary_output(&self, context: &OutputNormalization) -> Self {
+        Self(
+            self.0
+                .iter()
+                .map(|(participant, value)| (*participant, value.normalize_summary_output(context)))
+                .collect(),
+        )
+    }
 }
 
-/// One globally observable outcome of a summarizable function call.
-#[derive(Clone, Debug)]
-pub(crate) enum SummaryOutcome {
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum SummaryCondition {
+    Always,
+    #[cfg(feature = "symbolic")]
+    Symbolic {
+        guard: SymExpr,
+        local_sorts: Vec<SymSort>,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum SummaryResult {
     Returned(ParticipantReturns),
     Blocked,
+    AssumptionFailed,
 }
 
-impl PartialEq for SummaryOutcome {
-    fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Self::Returned(left), Self::Returned(right)) => left == right,
-            (Self::Blocked, Self::Blocked) => true,
-            _ => false,
-        }
-    }
+/// One globally observable, optionally guarded outcome of a summarizable call.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct SummaryOutcome {
+    pub(crate) condition: SummaryCondition,
+    pub(crate) result: SummaryResult,
 }
 
 impl SummaryOutcome {
-    fn instantiate(&self, bijection: &ParticipantBijection) -> Self {
-        match self {
-            Self::Returned(values) => Self::Returned(values.instantiate(bijection)),
-            Self::Blocked => Self::Blocked,
+    pub(crate) fn ordinary(result: SummaryResult) -> Self {
+        Self {
+            condition: SummaryCondition::Always,
+            result,
         }
     }
+
+    fn instantiate(&self, context: &InstantiationContext) -> Self {
+        let condition = match &self.condition {
+            SummaryCondition::Always => SummaryCondition::Always,
+            #[cfg(feature = "symbolic")]
+            SummaryCondition::Symbolic { guard, local_sorts } => SummaryCondition::Symbolic {
+                guard: context.instantiate_symbolic(guard),
+                local_sorts: local_sorts.clone(),
+            },
+        };
+        let result = match &self.result {
+            SummaryResult::Returned(values) => SummaryResult::Returned(values.instantiate(context)),
+            SummaryResult::Blocked => SummaryResult::Blocked,
+            SummaryResult::AssumptionFailed => SummaryResult::AssumptionFailed,
+        };
+        Self { condition, result }
+    }
+
+    #[cfg(feature = "symbolic")]
+    pub(crate) fn materialize(self, participants: &[ThreadId], allow_parent_inputs: bool) -> Self {
+        let local_sorts = match &self.condition {
+            SummaryCondition::Always => return self,
+            SummaryCondition::Symbolic { local_sorts, .. } => local_sorts.clone(),
+        };
+        let values = local_sorts.iter().enumerate().map(|(index, sort)| {
+            (
+                SymVarId::summary_local(index),
+                symbolic::fresh(sort.clone()),
+            )
+        });
+        let context =
+            InstantiationContext::for_materialization(participants, values, allow_parent_inputs);
+        self.instantiate(&context)
+    }
+
+    #[cfg(not(feature = "symbolic"))]
+    pub(crate) fn materialize(self, _: &[ThreadId], _: bool) -> Self {
+        self
+    }
+
+    pub(crate) fn is_assumption_failed(&self) -> bool {
+        matches!(self.result, SummaryResult::AssumptionFailed)
+    }
+
+    #[cfg(feature = "symbolic")]
+    pub(crate) fn guard(&self) -> Option<&SymExpr> {
+        match &self.condition {
+            SummaryCondition::Always => None,
+            SummaryCondition::Symbolic { guard, .. } => Some(guard),
+        }
+    }
+}
+
+pub(crate) fn insert_summary_outcome(outcomes: &mut Vec<SummaryOutcome>, incoming: SummaryOutcome) {
+    for existing in outcomes.iter_mut() {
+        if existing.result != incoming.result {
+            continue;
+        }
+        #[cfg(not(feature = "symbolic"))]
+        return;
+
+        #[cfg(feature = "symbolic")]
+        match (&mut existing.condition, &incoming.condition) {
+            (SummaryCondition::Always, _) => return,
+            (condition, SummaryCondition::Always) => {
+                *condition = SummaryCondition::Always;
+                return;
+            }
+            (
+                SummaryCondition::Symbolic {
+                    guard: existing_guard,
+                    local_sorts: existing_locals,
+                },
+                SummaryCondition::Symbolic {
+                    guard: incoming_guard,
+                    local_sorts: incoming_locals,
+                },
+            ) if existing_locals == incoming_locals => {
+                *existing_guard = existing_guard.clone().or(incoming_guard.clone());
+                return;
+            }
+            _ => {}
+        }
+    }
+    outcomes.push(incoming);
 }
 
 #[derive(Clone, Debug)]
@@ -289,17 +411,30 @@ impl SummaryCase {
         &self,
         actual_participants: &[ThreadId],
         actual_inputs: &ParticipantArguments,
+        symmetry: bool,
     ) -> Option<Vec<SummaryOutcome>> {
         let mut outcomes = Vec::new();
-        for bijection in participant_bijections(actual_participants, &self.participants) {
-            if !actual_inputs.equivalent_to_representative(&self.inputs, &bijection) {
+        let bijections = if symmetry {
+            participant_bijections(actual_participants, &self.participants)
+        } else if actual_participants == self.participants {
+            vec![ParticipantBijection::from_pairs(
+                actual_participants
+                    .iter()
+                    .copied()
+                    .zip(self.participants.iter().copied()),
+            )]
+        } else {
+            Vec::new()
+        };
+        for bijection in bijections {
+            let mut context = MatchContext::new(bijection);
+            if !actual_inputs.matches_stored_inputs(&self.inputs, &mut context) {
                 continue;
             }
+            let context = context.into_instantiation();
             for outcome in &self.outcomes {
-                let instantiated = outcome.instantiate(&bijection);
-                if !outcomes.contains(&instantiated) {
-                    outcomes.push(instantiated);
-                }
+                let instantiated = outcome.instantiate(&context);
+                insert_summary_outcome(&mut outcomes, instantiated);
             }
         }
         (!outcomes.is_empty()).then_some(outcomes)
@@ -311,7 +446,7 @@ enum CallMode {
     ExploringBody,
     ApplyingSummary {
         outcomes: Vec<SummaryOutcome>,
-        selection: Option<(usize, Event)>,
+        selection: Option<(SummaryOutcome, Event)>,
     },
 }
 
@@ -323,6 +458,7 @@ struct SummarizableCallState {
     arrived_participants: Vec<ThreadId>,
     waiting_participants: Vec<ThreadId>,
     returns_by_participant: BTreeMap<ThreadId, ErasedSummarizableVal>,
+    body_arguments: Option<ParticipantArguments>,
     mode: Option<CallMode>,
 }
 
@@ -339,6 +475,7 @@ impl SummarizableCallState {
             arrived_participants: Vec::new(),
             waiting_participants: Vec::new(),
             returns_by_participant: BTreeMap::new(),
+            body_arguments: None,
             mode: None,
         }
     }
@@ -351,10 +488,12 @@ impl SummarizableCallState {
 #[derive(Debug)]
 pub(crate) enum EntryAction {
     WaitForParticipants,
-    ExecuteBody(SummarizableCallHandle),
+    ExecuteBody {
+        handle: SummarizableCallHandle,
+        arguments: SummarizableArguments,
+    },
     SelectSummaryOutcome {
         handle: SummarizableCallHandle,
-        outcome_count: usize,
     },
     ApplySummary(SummarizableCallHandle),
 }
@@ -362,7 +501,8 @@ pub(crate) enum EntryAction {
 #[derive(Clone, Debug)]
 pub(crate) struct SummaryMiss {
     pub(crate) participants: Vec<ThreadId>,
-    pub(crate) inputs: ParticipantArguments,
+    pub(crate) actual_inputs: ParticipantArguments,
+    pub(crate) summary_inputs: ParticipantArguments,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -539,20 +679,9 @@ impl SummarizationRuntime {
         inputs: &ParticipantArguments,
     ) -> Option<Vec<SummaryOutcome>> {
         let cases = self.summaries.get(function)?;
-        if !self.options.symmetry() {
-            let result = cases
-                .iter()
-                .find(|case| case.participants == participants && case.inputs == *inputs)
-                .map(|case| case.outcomes.clone());
-            #[cfg(test)]
-            if result.is_some() {
-                self.summary_hits.set(self.summary_hits.get() + 1);
-            }
-            return result;
-        }
         let result = cases
             .iter()
-            .find_map(|case| case.instantiate_for(participants, inputs));
+            .find_map(|case| case.instantiate_for(participants, inputs, self.options.symmetry()));
         #[cfg(test)]
         if result.is_some() {
             self.summary_hits.set(self.summary_hits.get() + 1);
@@ -569,14 +698,10 @@ impl SummarizationRuntime {
         let Some(cases) = self.summaries.get(function) else {
             return false;
         };
-        if !self.options.symmetry() {
-            return cases
-                .iter()
-                .any(|case| case.participants == participants && case.inputs == *inputs);
-        }
-        cases
-            .iter()
-            .any(|case| case.instantiate_for(participants, inputs).is_some())
+        cases.iter().any(|case| {
+            case.instantiate_for(participants, inputs, self.options.symmetry())
+                .is_some()
+        })
     }
 
     pub(crate) fn store_summary_case(
@@ -645,7 +770,12 @@ impl SummarizationRuntime {
         tid: ThreadId,
         call: SummarizableCallId,
         arguments: SummarizableArguments,
-        expected_exploration: Option<(&SummarizableCallId, &[ThreadId], &ParticipantArguments)>,
+        expected_exploration: Option<(
+            &SummarizableCallId,
+            &[ThreadId],
+            &ParticipantArguments,
+            &ParticipantArguments,
+        )>,
     ) -> (EntryAction, Vec<ThreadId>, Option<SummaryMiss>) {
         let call_state = self
             .call_states
@@ -674,15 +804,20 @@ impl SummarizationRuntime {
         if entry_is_complete {
             let participants = call_state.participants.clone();
             let inputs = call_state.arguments.clone();
+            let mut body_arguments = None;
             let mode = match expected_exploration {
-                Some((expected_call, expected_participants, expected_inputs))
-                    if expected_call == &call =>
-                {
+                Some((
+                    expected_call,
+                    expected_participants,
+                    expected_inputs,
+                    expected_summary_inputs,
+                )) if expected_call == &call => {
                     assert_eq!(expected_participants, participants);
                     assert_eq!(expected_inputs, &inputs);
+                    body_arguments = Some(expected_summary_inputs.clone());
                     CallMode::ExploringBody
                 }
-                Some((expected_call, _, _)) => {
+                Some((expected_call, _, _, _)) => {
                     let outcomes = self
                         .lookup_summary_outcomes(&call.function, &participants, &inputs)
                         .unwrap_or_else(|| {
@@ -705,15 +840,19 @@ impl SummarizationRuntime {
                             selection: None,
                         }
                     } else {
+                        let summary_inputs = inputs.abstract_inputs();
+                        body_arguments = Some(summary_inputs.clone());
                         miss = Some(SummaryMiss {
                             participants,
-                            inputs,
+                            actual_inputs: inputs,
+                            summary_inputs,
                         });
                         CallMode::ExploringBody
                     }
                 }
             };
             let call_state = self.call_states.get_mut(&call).unwrap();
+            call_state.body_arguments = body_arguments;
             call_state.mode = Some(mode);
             wake.append(&mut call_state.waiting_participants);
         }
@@ -726,19 +865,21 @@ impl SummarizationRuntime {
                 }
                 EntryAction::WaitForParticipants
             }
-            Some(CallMode::ExploringBody) => {
-                EntryAction::ExecuteBody(SummarizableCallHandle { call })
-            }
-            Some(CallMode::ApplyingSummary {
-                outcomes,
-                selection,
-            }) => {
+            Some(CallMode::ExploringBody) => EntryAction::ExecuteBody {
+                arguments: call_state
+                    .body_arguments
+                    .as_ref()
+                    .expect("summary body arguments were not initialized")
+                    .value_for(tid)
+                    .expect("summary body arguments are missing for participant"),
+                handle: SummarizableCallHandle { call },
+            },
+            Some(CallMode::ApplyingSummary { selection, .. }) => {
                 if selection.is_some() {
                     EntryAction::ApplySummary(SummarizableCallHandle { call })
                 } else if tid == call_state.selector {
                     EntryAction::SelectSummaryOutcome {
                         handle: SummarizableCallHandle { call },
-                        outcome_count: outcomes.len(),
                     }
                 } else {
                     if !call_state.waiting_participants.contains(&tid) {
@@ -751,12 +892,26 @@ impl SummarizationRuntime {
         (action, wake, miss)
     }
 
-    pub(crate) fn select_summary_outcome(
+    pub(crate) fn summary_outcomes(&self, handle: &SummarizableCallHandle) -> Vec<SummaryOutcome> {
+        let call_state = self
+            .call_states
+            .get(&handle.call)
+            .expect("missing summarizable call state");
+        let CallMode::ApplyingSummary { outcomes, .. } = call_state
+            .mode
+            .as_ref()
+            .expect("summarizable entry barrier is incomplete")
+        else {
+            panic!("cannot inspect summary outcomes while exploring the body");
+        };
+        outcomes.clone()
+    }
+
+    pub(crate) fn replace_summary_outcomes(
         &mut self,
         handle: &SummarizableCallHandle,
-        index: usize,
-        choice: Event,
-    ) -> Vec<ThreadId> {
+        replacement: Vec<SummaryOutcome>,
+    ) {
         let call_state = self
             .call_states
             .get_mut(&handle.call)
@@ -769,17 +924,17 @@ impl SummarizationRuntime {
             .as_mut()
             .expect("summarizable entry barrier is incomplete")
         else {
-            panic!("cannot select a summary outcome while exploring the body");
+            panic!("cannot replace summary outcomes while exploring the body");
         };
-        assert!(index < outcomes.len());
-        *selection = Some((index, choice));
-        std::mem::take(&mut call_state.waiting_participants)
+        assert!(selection.is_none(), "summary outcome was already selected");
+        *outcomes = replacement;
     }
 
-    pub(crate) fn selected_summary_outcome(
+    pub(crate) fn selected_summary_outcome_template(
         &self,
         handle: &SummarizableCallHandle,
-    ) -> (SummaryOutcome, Event) {
+        index: usize,
+    ) -> (Vec<ThreadId>, SummaryOutcome) {
         let call_state = self
             .call_states
             .get(&handle.call)
@@ -792,10 +947,56 @@ impl SummarizationRuntime {
             .as_ref()
             .expect("summarizable entry barrier is incomplete")
         else {
+            panic!("cannot select a summary outcome while exploring the body");
+        };
+        assert!(selection.is_none(), "summary outcome was already selected");
+        let outcome = outcomes
+            .get(index)
+            .unwrap_or_else(|| panic!("summary outcome index {index} is out of bounds"))
+            .clone();
+        (call_state.participants.clone(), outcome)
+    }
+
+    pub(crate) fn commit_summary_selection(
+        &mut self,
+        handle: &SummarizableCallHandle,
+        outcome: SummaryOutcome,
+        choice: Event,
+    ) -> Vec<ThreadId> {
+        let call_state = self
+            .call_states
+            .get_mut(&handle.call)
+            .expect("missing summarizable call state");
+        let CallMode::ApplyingSummary { selection, .. } = call_state
+            .mode
+            .as_mut()
+            .expect("summarizable entry barrier is incomplete")
+        else {
+            panic!("cannot commit a summary outcome while exploring the body");
+        };
+        assert!(selection.is_none(), "summary outcome was already selected");
+        *selection = Some((outcome, choice));
+        std::mem::take(&mut call_state.waiting_participants)
+    }
+
+    pub(crate) fn selected_summary_outcome(
+        &self,
+        handle: &SummarizableCallHandle,
+    ) -> (SummaryOutcome, Event) {
+        let call_state = self
+            .call_states
+            .get(&handle.call)
+            .expect("missing summarizable call state");
+        let CallMode::ApplyingSummary { selection, .. } = call_state
+            .mode
+            .as_ref()
+            .expect("summarizable entry barrier is incomplete")
+        else {
             panic!("the call is not applying a summary");
         };
-        let (index, choice) = selection.expect("summary outcome has not been selected");
-        (outcomes[index].clone(), choice)
+        selection
+            .clone()
+            .expect("summary outcome has not been selected")
     }
 
     pub(crate) fn record_body_return(
@@ -1127,39 +1328,86 @@ fn enter_resolved_call(
             wake_participants(state, wake);
             match &action {
                 EntryAction::WaitForParticipants => state.current_mut().stuck(),
-                EntryAction::ExecuteBody(handle) | EntryAction::ApplySummary(handle) => state
-                    .current_mut()
-                    .enter_summarizable_call(handle.call.clone()),
+                EntryAction::ExecuteBody { handle, .. } | EntryAction::ApplySummary(handle) => {
+                    state
+                        .current_mut()
+                        .enter_summarizable_call(handle.call.clone())
+                }
                 EntryAction::SelectSummaryOutcome { .. } => {}
             }
             action
         });
         match action {
             EntryAction::WaitForParticipants => continue,
-            EntryAction::ExecuteBody(handle) => return SummaryDispatch::ExecuteBody(handle),
+            EntryAction::ExecuteBody { handle, arguments } => {
+                return SummaryDispatch::ExecuteBody { handle, arguments };
+            }
             EntryAction::ApplySummary(handle) => return SummaryDispatch::ApplySummary(handle),
-            EntryAction::SelectSummaryOutcome {
-                handle,
-                outcome_count,
-            } => {
-                assert!(outcome_count > 0, "a complete summary has no outcomes");
+            EntryAction::SelectSummaryOutcome { handle } => {
                 switch();
-                ExecutionState::with(|state| {
+                let selected = ExecutionState::with(|state| {
+                    let consumer_owner = state.current().summarizable_call().cloned();
+                    let outcome_count = state
+                        .must
+                        .borrow_mut()
+                        .prepare_summary_outcomes(&handle, consumer_owner.as_ref());
+                    if outcome_count == 0 {
+                        let pos = state.next_pos();
+                        state.must.borrow_mut().prune_summary_application(pos);
+                        return None;
+                    }
+
                     let pos = state.next_pos();
                     let mut range = 0..=(outcome_count - 1);
                     let selected = state
                         .must
                         .borrow_mut()
                         .handle_choice(Choice::new(pos, &mut range));
+                    let (participants, outcome) = state
+                        .must
+                        .borrow()
+                        .selected_summary_outcome_template(&handle, selected);
+                    Some((participants, outcome, pos, consumer_owner.is_some()))
+                });
+
+                let Some((participants, outcome, choice, allow_parent_inputs)) = selected else {
+                    continue;
+                };
+                let outcome = outcome.materialize(&participants, allow_parent_inputs);
+
+                #[cfg(feature = "symbolic")]
+                if let Some(guard) = outcome.guard() {
+                    assume_selected_summary_guard(guard.clone());
+                }
+
+                if outcome.is_assumption_failed() {
+                    ExecutionState::with(|state| {
+                        let pos = state.next_pos();
+                        state.must.borrow_mut().prune_summary_application(pos);
+                    });
+                    continue;
+                }
+
+                ExecutionState::with(|state| {
                     let wake = state
                         .must
                         .borrow_mut()
-                        .select_summary_outcome(&handle, selected, pos);
+                        .commit_summary_selection(&handle, outcome, choice);
                     wake_participants(state, wake);
                 });
             }
         }
     }
+}
+
+#[cfg(feature = "symbolic")]
+fn assume_selected_summary_guard(expr: SymExpr) {
+    ExecutionState::with(|state| {
+        let pos = state.next_pos();
+        let owner = state.current().summarizable_call().cloned();
+        let label = ConstraintEval::new(pos, expr, true, ConstraintKind::FixedAssumption, owner);
+        state.must.borrow_mut().handle_fixed_constraint(label);
+    });
 }
 
 /// Enter a selectively-participated invocation. Used by generated code.
@@ -1256,8 +1504,8 @@ where
     let tid = ExecutionState::with(|state| state.must.borrow().to_thread_id(state.current().id()));
     let (outcome, _choice_event) =
         ExecutionState::with(|state| state.must.borrow().selected_summary_outcome(&handle));
-    match outcome {
-        SummaryOutcome::Returned(values) => {
+    match outcome.result {
+        SummaryResult::Returned(values) => {
             let value = values
                 .value_for(tid)
                 .unwrap_or_else(|| panic!("summary has no return value for thread {}", tid));
@@ -1266,7 +1514,7 @@ where
             });
             value.into_typed::<T>()
         }
-        SummaryOutcome::Blocked => {
+        SummaryResult::Blocked => {
             ExecutionState::with(|state| {
                 state.current_mut().leave_summarizable_call(&handle.call);
                 let pos = state.next_pos();
@@ -1278,6 +1526,9 @@ where
             loop {
                 switch();
             }
+        }
+        SummaryResult::AssumptionFailed => {
+            unreachable!("assumption failure is handled collectively by the selector")
         }
     }
 }

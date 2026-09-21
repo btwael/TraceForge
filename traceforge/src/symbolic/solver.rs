@@ -77,17 +77,17 @@ impl SymbolicSolver {
             SymExpr::Var {
                 id,
                 sort: SymSort::Bool,
-            } => Dynamic::from_ast(&Bool::new_const(format!("sym_b_{}", id.suffix()))),
+            } => Dynamic::from_ast(&Bool::new_const(format!("sym_b_{}", id.solver_name()))),
             SymExpr::Var {
                 id,
                 sort: SymSort::Int,
-            } => Dynamic::from_ast(&Int::new_const(format!("sym_i_{}", id.suffix()))),
+            } => Dynamic::from_ast(&Int::new_const(format!("sym_i_{}", id.solver_name()))),
             SymExpr::Var {
                 id,
                 sort: sort @ SymSort::Uninterpreted(_),
             } => {
                 let sort = self.compile_sort(sort);
-                Dynamic::new_const(format!("sym_u_{}", id.suffix()), &sort)
+                Dynamic::new_const(format!("sym_u_{}", id.solver_name()), &sort)
             }
             SymExpr::BoundVar { id, .. } => self.lookup_bound(env, id),
             SymExpr::Bool(value) => Dynamic::from_ast(&Bool::from_bool(*value)),
@@ -170,34 +170,6 @@ impl SymbolicSolver {
         }
     }
 
-    fn expr_sort(&self, expr: &SymExpr) -> SymSort {
-        match expr {
-            SymExpr::Var { sort, .. } | SymExpr::BoundVar { sort, .. } => sort.clone(),
-            SymExpr::Bool(_)
-            | SymExpr::Not(_)
-            | SymExpr::And(_, _)
-            | SymExpr::Or(_, _)
-            | SymExpr::Implies(_, _)
-            | SymExpr::Forall { .. }
-            | SymExpr::Exists { .. }
-            | SymExpr::Eq(_, _)
-            | SymExpr::Gt(_, _)
-            | SymExpr::Ge(_, _)
-            | SymExpr::Lt(_, _)
-            | SymExpr::Le(_, _) => SymSort::Bool,
-            SymExpr::Int(_)
-            | SymExpr::Add(_, _)
-            | SymExpr::Sub(_, _)
-            | SymExpr::Mul(_, _)
-            | SymExpr::Div(_, _)
-            | SymExpr::Rem(_, _) => SymSort::Int,
-            SymExpr::App { func, args } => {
-                self.validate_app(func, args);
-                func.range().clone()
-            }
-        }
-    }
-
     fn compile_sort(&self, sort: &SymSort) -> Sort {
         match sort {
             SymSort::Bool => Sort::bool(),
@@ -238,7 +210,7 @@ impl SymbolicSolver {
         body: &SymExpr,
         env: &mut BoundEnv,
     ) -> Dynamic {
-        let body_sort = self.expr_sort(body);
+        let body_sort = body.sort();
         if body_sort != SymSort::Bool {
             panic!("quantifier body must be Bool, got {:?}", body_sort);
         }
@@ -293,7 +265,7 @@ impl SymbolicSolver {
         }
 
         for (index, (expected, actual)) in func.domain().iter().zip(args).enumerate() {
-            let actual = self.expr_sort(actual);
+            let actual = actual.sort();
             if expected != &actual {
                 panic!(
                     "uninterpreted function `{}` argument {} expected sort {:?}, got {:?}",
@@ -307,8 +279,8 @@ impl SymbolicSolver {
     }
 
     fn expect_same_sort(&self, lhs: &SymExpr, rhs: &SymExpr, op: &str) {
-        let lhs_sort = self.expr_sort(lhs);
-        let rhs_sort = self.expr_sort(rhs);
+        let lhs_sort = lhs.sort();
+        let rhs_sort = rhs.sort();
         if lhs_sort != rhs_sort {
             panic!(
                 "{} expected matching sorts, got {:?} and {:?}",
@@ -318,8 +290,8 @@ impl SymbolicSolver {
     }
 
     fn expect_int_operands(&self, lhs: &SymExpr, rhs: &SymExpr, op: &str) {
-        let lhs_sort = self.expr_sort(lhs);
-        let rhs_sort = self.expr_sort(rhs);
+        let lhs_sort = lhs.sort();
+        let rhs_sort = rhs.sort();
         if lhs_sort != SymSort::Int || rhs_sort != SymSort::Int {
             panic!(
                 "{} expected Int operands, got {:?} and {:?}",

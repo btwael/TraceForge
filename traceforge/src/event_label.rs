@@ -287,7 +287,7 @@ impl LabelEnum {
             #[cfg(feature = "symbolic")]
             LabelEnum::SymbolicVar(s) => {
                 if let LabelEnum::SymbolicVar(o) = other {
-                    if s.id != o.id || s.sort != o.sort {
+                    if s.id != o.id || s.sort != o.sort || s.owner != o.owner {
                         return Err("symbolic variable mismatch".into());
                     }
                     return Ok(());
@@ -296,7 +296,7 @@ impl LabelEnum {
             #[cfg(feature = "symbolic")]
             LabelEnum::ConstraintEval(s) => {
                 if let LabelEnum::ConstraintEval(o) = other {
-                    if s.expr != o.expr {
+                    if s.expr != o.expr || s.owner != o.owner || s.kind != o.kind {
                         return Err("symbolic constraint mismatch".into());
                     }
                     return Ok(());
@@ -1444,20 +1444,34 @@ impl fmt::Display for Inbox {
 }
 
 #[cfg(feature = "symbolic")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum ConstraintKind {
+    Branch,
+    FixedAssumption,
+}
+
+#[cfg(feature = "symbolic")]
 #[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct SymbolicVar {
     label: EventLabel,
     id: SymVarId,
     sort: SymSort,
+    owner: Option<SummarizableCallId>,
 }
 
 #[cfg(feature = "symbolic")]
 impl SymbolicVar {
-    pub(crate) fn new(pos: Event, id: SymVarId, sort: SymSort) -> Self {
+    pub(crate) fn new(
+        pos: Event,
+        id: SymVarId,
+        sort: SymSort,
+        owner: Option<SummarizableCallId>,
+    ) -> Self {
         Self {
             label: EventLabel::new(pos),
             id,
             sort,
+            owner,
         }
     }
 
@@ -1466,6 +1480,10 @@ impl SymbolicVar {
     }
     pub(crate) fn sort(&self) -> &SymSort {
         &self.sort
+    }
+
+    pub(crate) fn owner(&self) -> Option<&SummarizableCallId> {
+        self.owner.as_ref()
     }
 }
 
@@ -1491,15 +1509,25 @@ pub(crate) struct ConstraintEval {
     label: EventLabel,
     expr: SymExpr,
     branch_taken: bool,
+    kind: ConstraintKind,
+    owner: Option<SummarizableCallId>,
 }
 
 #[cfg(feature = "symbolic")]
 impl ConstraintEval {
-    pub(crate) fn new(pos: Event, expr: SymExpr, branch_taken: bool) -> Self {
+    pub(crate) fn new(
+        pos: Event,
+        expr: SymExpr,
+        branch_taken: bool,
+        kind: ConstraintKind,
+        owner: Option<SummarizableCallId>,
+    ) -> Self {
         Self {
             label: EventLabel::new(pos),
             expr,
             branch_taken,
+            kind,
+            owner,
         }
     }
 
@@ -1513,6 +1541,14 @@ impl ConstraintEval {
 
     pub(crate) fn set_branch_taken(&mut self, b: bool) {
         self.branch_taken = b;
+    }
+
+    pub(crate) fn kind(&self) -> ConstraintKind {
+        self.kind
+    }
+
+    pub(crate) fn owner(&self) -> Option<&SummarizableCallId> {
+        self.owner.as_ref()
     }
 }
 

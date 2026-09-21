@@ -159,7 +159,14 @@ pub fn derive_summarizable_val(input: proc_macro::TokenStream) -> proc_macro::To
 fn symmetric_fields(
     constructor: TokenStream,
     fields: &syn::Fields,
-) -> (TokenStream, TokenStream, TokenStream, TokenStream) {
+) -> (
+    TokenStream,
+    TokenStream,
+    TokenStream,
+    TokenStream,
+    TokenStream,
+    TokenStream,
+) {
     match fields {
         syn::Fields::Named(fields) => {
             let field_names = fields
@@ -182,19 +189,42 @@ fn symmetric_fields(
             let stored_pattern = quote! {
                 #constructor { #(#field_names: #stored),* }
             };
-            let equivalent = quote! {
+            let abstracted = quote! {
+                #constructor { #(
+                    #field_names:
+                        ::traceforge::summarizable::SummarizableVal::abstract_input(
+                            #actual, context,
+                        )
+                ),* }
+            };
+            let matched = quote! {
                 true #(&& ::traceforge::summarizable::SummarizableVal::
-                    equivalent_to_representative(#actual, #stored, bijection))*
+                    matches_stored_input(#actual, #stored, context))*
             };
             let instantiated = quote! {
                 #constructor { #(
                     #field_names:
                         ::traceforge::summarizable::SummarizableVal::instantiate(
-                            #actual, bijection,
+                            #actual, context,
                         )
                 ),* }
             };
-            (actual_pattern, stored_pattern, equivalent, instantiated)
+            let normalized = quote! {
+                #constructor { #(
+                    #field_names:
+                        ::traceforge::summarizable::SummarizableVal::normalize_summary_output(
+                            #actual, context,
+                        )
+                ),* }
+            };
+            (
+                actual_pattern,
+                stored_pattern,
+                abstracted,
+                matched,
+                instantiated,
+                normalized,
+            )
         }
         syn::Fields::Unnamed(fields) => {
             let actual = (0..fields.unnamed.len())
@@ -206,23 +236,46 @@ fn symmetric_fields(
 
             let actual_pattern = quote! { #constructor(#(#actual),*) };
             let stored_pattern = quote! { #constructor(#(#stored),*) };
-            let equivalent = quote! {
+            let abstracted = quote! {
+                #constructor(#(
+                    ::traceforge::summarizable::SummarizableVal::abstract_input(
+                        #actual, context,
+                    )
+                ),*)
+            };
+            let matched = quote! {
                 true #(&& ::traceforge::summarizable::SummarizableVal::
-                    equivalent_to_representative(#actual, #stored, bijection))*
+                    matches_stored_input(#actual, #stored, context))*
             };
             let instantiated = quote! {
                 #constructor(#(
                     ::traceforge::summarizable::SummarizableVal::instantiate(
-                        #actual, bijection,
+                        #actual, context,
                     )
                 ),*)
             };
-            (actual_pattern, stored_pattern, equivalent, instantiated)
+            let normalized = quote! {
+                #constructor(#(
+                    ::traceforge::summarizable::SummarizableVal::normalize_summary_output(
+                        #actual, context,
+                    )
+                ),*)
+            };
+            (
+                actual_pattern,
+                stored_pattern,
+                abstracted,
+                matched,
+                instantiated,
+                normalized,
+            )
         }
         syn::Fields::Unit => (
             constructor.clone(),
             constructor.clone(),
+            constructor.clone(),
             quote! { true },
+            constructor.clone(),
             constructor,
         ),
     }
@@ -238,19 +291,29 @@ fn expand_summarizable_val(input: syn::DeriveInput) -> syn::Result<TokenStream> 
     }
     let (impl_generics, type_generics, where_clause) = generics.split_for_impl();
 
-    let (equivalent_body, instantiate_body) = match input.data {
+    let (abstract_body, match_body, instantiate_body, normalize_body) = match input.data {
         syn::Data::Struct(data) => {
-            let (actual, stored, equivalent, instantiated) =
+            let (actual, stored, abstracted, matched, instantiated, normalized) =
                 symmetric_fields(quote! { Self }, &data.fields);
             (
                 quote! {
-                    match (self, representative) {
-                        (#actual, #stored) => #equivalent,
+                    match self {
+                        #actual => #abstracted,
+                    }
+                },
+                quote! {
+                    match (self, stored) {
+                        (#actual, #stored) => #matched,
                     }
                 },
                 quote! {
                     match self {
                         #actual => #instantiated,
+                    }
+                },
+                quote! {
+                    match self {
+                        #actual => #normalized,
                     }
                 },
             )
@@ -264,22 +327,38 @@ fn expand_summarizable_val(input: syn::DeriveInput) -> syn::Result<TokenStream> 
                     symmetric_fields(quote! { Self::#variant_name }, &variant.fields)
                 })
                 .collect::<Vec<_>>();
-            let equivalent_arms = generated.iter().map(|(actual, stored, equivalent, _)| {
-                quote! { (#actual, #stored) => #equivalent }
+            let abstract_arms = generated.iter().map(|(actual, _, abstracted, _, _, _)| {
+                quote! { #actual => #abstracted }
             });
-            let instantiate_arms = generated.iter().map(|(actual, _, _, instantiated)| {
+            let match_arms = generated.iter().map(|(actual, stored, _, matched, _, _)| {
+                quote! { (#actual, #stored) => #matched }
+            });
+            let instantiate_arms = generated.iter().map(|(actual, _, _, _, instantiated, _)| {
                 quote! { #actual => #instantiated }
+            });
+            let normalize_arms = generated.iter().map(|(actual, _, _, _, _, normalized)| {
+                quote! { #actual => #normalized }
             });
             (
                 quote! {
-                    match (self, representative) {
-                        #(#equivalent_arms,)*
+                    match self {
+                        #(#abstract_arms,)*
+                    }
+                },
+                quote! {
+                    match (self, stored) {
+                        #(#match_arms,)*
                         _ => false,
                     }
                 },
                 quote! {
                     match self {
                         #(#instantiate_arms,)*
+                    }
+                },
+                quote! {
+                    match self {
+                        #(#normalize_arms,)*
                     }
                 },
             )
@@ -296,19 +375,33 @@ fn expand_summarizable_val(input: syn::DeriveInput) -> syn::Result<TokenStream> 
         impl #impl_generics ::traceforge::summarizable::SummarizableVal
             for #name #type_generics #where_clause
         {
-            fn equivalent_to_representative(
+            fn abstract_input(
                 &self,
-                representative: &Self,
-                bijection: &::traceforge::summarizable::ParticipantBijection,
+                context: &mut ::traceforge::summarizable::InputAbstraction,
+            ) -> Self {
+                #abstract_body
+            }
+
+            fn matches_stored_input(
+                &self,
+                stored: &Self,
+                context: &mut ::traceforge::summarizable::MatchContext,
             ) -> bool {
-                #equivalent_body
+                #match_body
             }
 
             fn instantiate(
                 &self,
-                bijection: &::traceforge::summarizable::ParticipantBijection,
+                context: &::traceforge::summarizable::InstantiationContext,
             ) -> Self {
                 #instantiate_body
+            }
+
+            fn normalize_summary_output(
+                &self,
+                context: &::traceforge::summarizable::OutputNormalization,
+            ) -> Self {
+                #normalize_body
             }
         }
     })
@@ -367,8 +460,17 @@ fn expand_summarizable(function: ItemFn) -> syn::Result<TokenStream> {
             ));
         }
 
-        arguments.push(identifier.ident.clone());
+        arguments.push((identifier.ident.clone(), (*argument.ty).clone()));
     }
+
+    let argument_names = arguments
+        .iter()
+        .map(|(name, _)| name.clone())
+        .collect::<Vec<_>>();
+    let argument_types = arguments
+        .iter()
+        .map(|(_, ty)| ty.clone())
+        .collect::<Vec<_>>();
 
     let function_name = &sig.ident;
     let body_name = syn::Ident::new(
@@ -410,13 +512,13 @@ fn expand_summarizable(function: ItemFn) -> syn::Result<TokenStream> {
                             module_path!(),
                         );
 
-                    // Clone only for the summary key. The originals are still
-                    // moved into the body on a summary miss.
+                    // The runtime uses these values both for summary lookup
+                    // and to build formal arguments on a cache miss.
                     let __traceforge_arguments =
                         ::traceforge::summarizable::SummarizableArguments::new(vec![
                             #(
                                 ::traceforge::summarizable::ErasedSummarizableVal::new(
-                                    #arguments.clone()
+                                    #argument_names.clone()
                                 ),
                             )*
                         ]);
@@ -426,11 +528,21 @@ fn expand_summarizable(function: ItemFn) -> syn::Result<TokenStream> {
                         self.participants,
                         __traceforge_arguments,
                     ) {
-                        ::traceforge::summarizable::SummaryDispatch::ExecuteBody(
-                            __traceforge_call,
-                        ) => {
+                        ::traceforge::summarizable::SummaryDispatch::ExecuteBody {
+                            handle: __traceforge_call,
+                            arguments: __traceforge_body_arguments,
+                        } => {
+                            let mut __traceforge_body_arguments =
+                                __traceforge_body_arguments.into_cursor();
+
+                            #(
+                                let #argument_names: #argument_types =
+                                    __traceforge_body_arguments.next::<#argument_types>();
+                            )*
+
+                            __traceforge_body_arguments.finish();
                             let __traceforge_return_value = super::#body_name(
-                                #(#arguments),*
+                                #(#argument_names),*
                             );
 
                             ::traceforge::summarizable::__complete_body(

@@ -5,15 +5,48 @@ use std::ops::{Add, Div, Mul, Rem, Sub};
 use std::rc::Rc;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct SymVarId(Event);
+enum SymVarKind {
+    Execution(Event),
+    SummaryInput(usize),
+    SummaryLocal(usize),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct SymVarId(SymVarKind);
 
 impl SymVarId {
     pub(crate) fn from_event(pos: Event) -> Self {
-        Self(pos)
+        Self(SymVarKind::Execution(pos))
     }
 
-    pub(crate) fn suffix(&self) -> String {
-        format!("{}_{}", self.0.thread, self.0.index)
+    pub(crate) fn summary_input(index: usize) -> Self {
+        Self(SymVarKind::SummaryInput(index))
+    }
+
+    pub(crate) fn summary_local(index: usize) -> Self {
+        Self(SymVarKind::SummaryLocal(index))
+    }
+
+    pub(crate) fn input_index(&self) -> Option<usize> {
+        match &self.0 {
+            SymVarKind::SummaryInput(index) => Some(*index),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn local_index(&self) -> Option<usize> {
+        match &self.0 {
+            SymVarKind::SummaryLocal(index) => Some(*index),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn solver_name(&self) -> String {
+        match &self.0 {
+            SymVarKind::Execution(event) => format!("exec_{}_{}", event.thread, event.index),
+            SymVarKind::SummaryInput(index) => format!("input_{index}"),
+            SymVarKind::SummaryLocal(index) => format!("local_{index}"),
+        }
     }
 }
 
@@ -182,6 +215,96 @@ pub enum SymExpr {
 }
 
 impl SymExpr {
+    pub(crate) fn sort(&self) -> SymSort {
+        match self {
+            Self::Var { sort, .. } | Self::BoundVar { sort, .. } => sort.clone(),
+            Self::Bool(_)
+            | Self::Not(_)
+            | Self::And(_, _)
+            | Self::Or(_, _)
+            | Self::Implies(_, _)
+            | Self::Forall { .. }
+            | Self::Exists { .. }
+            | Self::Eq(_, _)
+            | Self::Gt(_, _)
+            | Self::Ge(_, _)
+            | Self::Lt(_, _)
+            | Self::Le(_, _) => SymSort::Bool,
+            Self::Int(_)
+            | Self::Add(_, _)
+            | Self::Sub(_, _)
+            | Self::Mul(_, _)
+            | Self::Div(_, _)
+            | Self::Rem(_, _) => SymSort::Int,
+            Self::App { func, .. } => func.range().clone(),
+        }
+    }
+
+    pub(crate) fn rewrite_vars(
+        &self,
+        rewrite: &mut impl FnMut(&SymVarId, &SymSort) -> SymExpr,
+    ) -> SymExpr {
+        fn binary(
+            left: &SymExpr,
+            right: &SymExpr,
+            rewrite: &mut impl FnMut(&SymVarId, &SymSort) -> SymExpr,
+            make: impl FnOnce(Box<SymExpr>, Box<SymExpr>) -> SymExpr,
+        ) -> SymExpr {
+            make(
+                Box::new(left.rewrite_vars(rewrite)),
+                Box::new(right.rewrite_vars(rewrite)),
+            )
+        }
+
+        match self {
+            Self::Var { id, sort } => rewrite(id, sort),
+            Self::BoundVar { .. } | Self::Bool(_) | Self::Int(_) => self.clone(),
+            Self::App { func, args } => Self::App {
+                func: func.clone(),
+                args: args
+                    .iter()
+                    .map(|argument| argument.rewrite_vars(rewrite))
+                    .collect(),
+            },
+            Self::Forall { vars, body } => Self::Forall {
+                vars: vars.clone(),
+                body: Box::new(body.rewrite_vars(rewrite)),
+            },
+            Self::Exists { vars, body } => Self::Exists {
+                vars: vars.clone(),
+                body: Box::new(body.rewrite_vars(rewrite)),
+            },
+            Self::Not(inner) => Self::Not(Box::new(inner.rewrite_vars(rewrite))),
+            Self::And(left, right) => binary(left, right, rewrite, Self::And),
+            Self::Or(left, right) => binary(left, right, rewrite, Self::Or),
+            Self::Implies(left, right) => binary(left, right, rewrite, Self::Implies),
+            Self::Eq(left, right) => binary(left, right, rewrite, Self::Eq),
+            Self::Gt(left, right) => binary(left, right, rewrite, Self::Gt),
+            Self::Ge(left, right) => binary(left, right, rewrite, Self::Ge),
+            Self::Lt(left, right) => binary(left, right, rewrite, Self::Lt),
+            Self::Le(left, right) => binary(left, right, rewrite, Self::Le),
+            Self::Add(left, right) => binary(left, right, rewrite, Self::Add),
+            Self::Sub(left, right) => binary(left, right, rewrite, Self::Sub),
+            Self::Mul(left, right) => binary(left, right, rewrite, Self::Mul),
+            Self::Div(left, right) => binary(left, right, rewrite, Self::Div),
+            Self::Rem(left, right) => binary(left, right, rewrite, Self::Rem),
+        }
+    }
+
+    pub(crate) fn summary_input(index: usize, sort: SymSort) -> Self {
+        Self::Var {
+            id: SymVarId::summary_input(index),
+            sort,
+        }
+    }
+
+    pub(crate) fn summary_local(index: usize, sort: SymSort) -> Self {
+        Self::Var {
+            id: SymVarId::summary_local(index),
+            sort,
+        }
+    }
+
     pub fn not(self) -> Self {
         SymExpr::Not(Box::new(self))
     }
