@@ -694,6 +694,20 @@ impl ExecutionGraph {
         v
     }
 
+    /// Events inserted through `affected`, plus the strict PORF predecessors of the send that
+    /// triggered a backward revisit. Unlike `revisit_view`, this excludes the triggering send
+    /// itself: it is the graph in which the old read choice must have been canonical.
+    pub(crate) fn previous_view(&self, affected: Event, trigger: Event) -> VectorClock {
+        debug_assert!(self.label(affected).stamp() < self.label(trigger).stamp());
+        debug_assert!(trigger.index > 0);
+        let mut view = self.revisit_view(&Revisit::new(affected, trigger));
+        // A send's cached PORF includes the send. Its strict predecessors have
+        // the same clock in all other threads and end at its previous event in
+        // the send's own thread.
+        view.set(trigger.prev());
+        view
+    }
+
     /// Return a view with all the events up to the stamp (inclusive)
     pub(crate) fn view_from_stamp(&self, s: usize) -> VectorClock {
         let mut v = VectorClock::new();

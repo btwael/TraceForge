@@ -1,7 +1,7 @@
 //! Revisiting utilities
 
-use std::fmt;
 use serde::{Deserialize, Serialize};
+use std::fmt;
 
 use crate::event::Event;
 use std::fmt::Debug;
@@ -20,15 +20,13 @@ impl RevisitEnum {
         RevisitEnum::ForwardRevisit(Revisit {
             pos,
             rev: RevisitPlacement::Default(placement),
+            trigger: None,
         })
     }
 
     /// backward revisit of recv by send
     pub(crate) fn new_backward(recv: Event, send: Event) -> Self {
-        RevisitEnum::BackwardRevisit(Revisit {
-            pos: recv,
-            rev: RevisitPlacement::Default(send),
-        })
+        RevisitEnum::BackwardRevisit(Revisit::new(recv, send))
     }
 
     /// Forward revisit for an inbox event, replacing its chosen send set.
@@ -36,6 +34,7 @@ impl RevisitEnum {
         RevisitEnum::ForwardRevisit(Revisit {
             pos,
             rev: RevisitPlacement::Inbox(placements),
+            trigger: None,
         })
     }
 
@@ -87,6 +86,10 @@ pub(crate) struct Revisit {
     pub(crate) pos: Event,
     /// the placement (rf or co choice)
     pub(crate) rev: RevisitPlacement,
+    /// The newly inserted send that initiated a backward revisit. This is
+    /// distinct from the full set an inbox will read after that revisit.
+    #[serde(default)]
+    pub(crate) trigger: Option<Event>,
 }
 
 impl Revisit {
@@ -94,13 +97,25 @@ impl Revisit {
         Self {
             pos,
             rev: RevisitPlacement::Default(rev),
+            trigger: Some(rev),
         }
     }
 
-    pub(crate) fn new_inbox(pos: Event, rev: Vec<Event>) -> Self {
+    pub(crate) fn new_inbox(pos: Event, trigger: Event, rev: Vec<Event>) -> Self {
+        assert!(rev.contains(&trigger));
         Self {
             pos,
             rev: RevisitPlacement::Inbox(rev),
+            trigger: Some(trigger),
         }
+    }
+
+    pub(crate) fn trigger(&self) -> Event {
+        self.trigger
+            .or_else(|| match &self.rev {
+                RevisitPlacement::Default(send) => Some(*send),
+                RevisitPlacement::Inbox(_) => None,
+            })
+            .expect("backward inbox revisit must record its triggering send")
     }
 }
