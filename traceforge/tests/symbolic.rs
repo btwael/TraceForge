@@ -48,6 +48,111 @@ fn symbolic_backward_revisit_for_right_side_send_is_optimal() {
 }
 
 #[test]
+fn symbolic_backward_revisit_uses_prior_deleted_constraints() {
+    let observed = Arc::new(Mutex::new(HashSet::new()));
+    let observed_in_verify = observed.clone();
+
+    let stats = verify(symbolic_ltr_config(), move || {
+        let main_id = thread::current_id();
+        let branches = Arc::new(Mutex::new(None));
+        let branches_in_worker = branches.clone();
+
+        let symbolic_worker = thread::spawn(move || {
+            let x = symbolic::fresh_int();
+            let positive = symbolic::eval(x.clone().gt(0));
+            let negative = symbolic::eval(x.lt(0));
+            *branches_in_worker.lock().unwrap() = Some((positive, negative));
+        });
+
+        let sender = thread::spawn(move || {
+            send_msg(main_id, 1_i32);
+        });
+
+        let received = recv_msg::<i32>().is_some();
+        symbolic_worker.join().unwrap();
+        sender.join().unwrap();
+
+        let (positive, negative) = (*branches.lock().unwrap()).unwrap();
+        observed_in_verify
+            .lock()
+            .unwrap()
+            .insert((positive, negative, received));
+    });
+
+    // x > 0 followed by x < 0 has three feasible branch paths. The
+    // independent receive can either time out or read the later send.
+    // Both receive outcomes must be explored for each symbolic path.
+    assert_eq!(
+        *observed.lock().unwrap(),
+        HashSet::from([
+            (true, false, false),
+            (false, true, false),
+            (false, false, false),
+            (true, false, true),
+            (false, true, true),
+            (false, false, true),
+        ])
+    );
+    assert_eq!((stats.execs, stats.block), (6, 0));
+}
+
+#[test]
+fn symbolic_backward_revisit_respects_retained_constraints() {
+    let observed = Arc::new(Mutex::new(HashSet::new()));
+    let observed_in_verify = observed.clone();
+
+    let stats = verify(symbolic_ltr_config(), move || {
+        let main_id = thread::current_id();
+        let x = symbolic::fresh_int();
+
+        let deleted_branches = Arc::new(Mutex::new(None));
+        let deleted_in_worker = deleted_branches.clone();
+        let worker = thread::spawn({
+            let x = x.clone();
+            move || {
+                let positive = symbolic::eval(x.clone().gt(0));
+                let negative = symbolic::eval(x.lt(0));
+                *deleted_in_worker.lock().unwrap() = Some((positive, negative));
+            }
+        });
+
+        let retained_branch = Arc::new(Mutex::new(None));
+        let retained_in_sender = retained_branch.clone();
+        let sender = thread::spawn(move || {
+            let non_positive = symbolic::eval(x.le(0));
+            *retained_in_sender.lock().unwrap() = Some(non_positive);
+            send_msg(main_id, 1_i32);
+        });
+
+        let received = recv_msg::<i32>().is_some();
+        worker.join().unwrap();
+        sender.join().unwrap();
+
+        let (positive, negative) = (*deleted_branches.lock().unwrap()).unwrap();
+        let non_positive = (*retained_branch.lock().unwrap()).unwrap();
+        observed_in_verify
+            .lock()
+            .unwrap()
+            .insert((positive, negative, non_positive, received));
+    });
+
+    // The sender's constraint remains in the revisited graph. Its branch
+    // must constrain newly added evaluations even if it replays later.
+    assert_eq!(
+        *observed.lock().unwrap(),
+        HashSet::from([
+            (true, false, false, false),
+            (true, false, false, true),
+            (false, true, true, false),
+            (false, true, true, true),
+            (false, false, true, false),
+            (false, false, true, true),
+        ])
+    );
+    assert_eq!((stats.execs, stats.block), (6, 0));
+}
+
+#[test]
 fn symbolic_forall_reflexive_equality_is_valid() {
     let stats = verify(symbolic_config(), || {
         let node = symbolic::uninterpreted_sort("Node");

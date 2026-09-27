@@ -2,9 +2,9 @@ use crate::cons::Consistency;
 use crate::event::Event;
 use crate::exec_graph::{ExecutionGraph, RecvLike};
 use crate::exec_pool::ExecutionPool;
-use crate::revisit::{Revisit, RevisitEnum, RevisitPlacement};
 use crate::future::PollerMsg;
 use crate::loc::{Loc, WakeMsg};
+use crate::revisit::{Revisit, RevisitEnum, RevisitPlacement};
 use crate::runtime::failure::init_panic_hook;
 use crate::runtime::task::TaskId;
 use crate::telemetry::{Recorder, Telemetry};
@@ -231,7 +231,11 @@ impl Must {
     pub(crate) fn begin_execution(must: &Rc<RefCell<Must>>) {
         let mut must = must.borrow_mut();
         #[cfg(feature = "symbolic")]
-        must.symbolic_solver.reset();
+        {
+            // A revisit can retain constraints from events that replay after newly
+            // added events. Those constraints must still restrict every new branch.
+            must.symbolic_solver = must.symbolic_solver_for_graph(&must.current.graph);
+        }
         must.current.graph.initialize_for_execution();
         must.telemetry.coverage.new_eid();
 
@@ -655,12 +659,20 @@ impl Must {
 
     /// Returns the filtered_origination_vec for the given thread.
     pub(crate) fn thread_filtered_origination_vec_from_tid(&self, tid: ThreadId) -> Vec<u32> {
-        self.current.graph.get_thread_tclab(tid).filtered_origination_vec()
+        self.current
+            .graph
+            .get_thread_tclab(tid)
+            .filtered_origination_vec()
     }
 
     /// Counts the number of TCreate events in the given thread up to and including
     /// the specified event index, excluding those whose names contain the filter pattern.
-    fn count_filtered_tcreate_events(&self, thread: ThreadId, up_to_index: u32, filter_pattern: &str) -> u32 {
+    fn count_filtered_tcreate_events(
+        &self,
+        thread: ThreadId,
+        up_to_index: u32,
+        filter_pattern: &str,
+    ) -> u32 {
         let mut count = 0;
         let thread_size = self.current.graph.thread_size(thread) as u32;
 
@@ -706,11 +718,19 @@ impl Must {
         let filtered_count = self.count_filtered_tcreate_events(
             pos.thread,
             pos.index,
-            crate::FILTERED_THREAD_NAME_PATTERN
+            crate::FILTERED_THREAD_NAME_PATTERN,
         );
         filtered_origination_vec.push(filtered_count);
 
-        let tclab = TCreate::new(pos, tid, name, is_daemon, sym_cid, origination_vec, filtered_origination_vec);
+        let tclab = TCreate::new(
+            pos,
+            tid,
+            name,
+            is_daemon,
+            sym_cid,
+            origination_vec,
+            filtered_origination_vec,
+        );
 
         if self.is_replay(pos) {
             info!("| Replay Mode for {}", tclab);
@@ -1043,39 +1063,27 @@ impl Must {
         solver
     }
 
-    // TODO: This code is never run. Change it in the future.
     #[cfg(feature = "symbolic")]
-    fn symbolic_backward_revisit_is_sat(&self, rev: &Revisit) -> bool {
-        if !self.config.symbolic {
-            return true;
+    fn is_maximal_constraint(c: &ConstraintEval, solver: &mut SymbolicSolver) -> bool {
+        // prefer the true branch when both outcomes are feasible
+        let canonical = if solver.sat_with(c.expr()) {
+            true
+        } else if solver.sat_with_not(c.expr()) {
+            false
+        } else {
+            return false;
+        };
+
+        if c.branch_taken() != canonical {
+            return false;
         }
 
-        let view = self.current.graph.revisit_view(rev);
-        let mut g = self.current.graph.copy_to_view(&view);
-        g.change_rf_placement(rev.pos, &rev.rev);
-
-        self.symbolic_solver_for_graph(&g).is_sat()
-    }
-
-    #[cfg(feature = "symbolic")]
-    fn is_maximal_constraint(&self, c: &ConstraintEval, rev: &Revisit) -> bool {
-        let view = self.current.graph.revisit_view(rev);
-        let mut g = self.current.graph.copy_to_view(&view);
-        g.change_rf_placement(rev.pos, &rev.rev);
-
-        let solver = self.symbolic_solver_for_graph(&g);
-
-        let true_sat = solver.sat_with(c.expr());
-        if true_sat {
-            return c.branch_taken();
+        if canonical {
+            solver.assert(c.expr());
+        } else {
+            solver.assert_not(c.expr());
         }
-
-        let false_sat = solver.sat_with_not(c.expr());
-        if false_sat {
-            return !c.branch_taken();
-        }
-
-        false
+        true
     }
 
     // this checks if the current graph is consistent
@@ -1272,7 +1280,13 @@ impl Must {
         if maybe_block.is_some() {
             if self.is_consistent() {
                 self.telemetry.counter(BLOCKED.to_owned()); // increment BLOCKED
-                let event_count: usize = self.current.graph.threads.iter().map(|t| t.labels.len()).sum();
+                let event_count: usize = self
+                    .current
+                    .graph
+                    .threads
+                    .iter()
+                    .map(|t| t.labels.len())
+                    .sum();
                 if event_count > self.max_graph_events {
                     self.max_graph_events = event_count;
                 }
@@ -1284,7 +1298,13 @@ impl Must {
             }
         } else if self.is_consistent() {
             self.telemetry.counter(EXECS.to_owned()); // increment EXECS
-            let event_count: usize = self.current.graph.threads.iter().map(|t| t.labels.len()).sum();
+            let event_count: usize = self
+                .current
+                .graph
+                .threads
+                .iter()
+                .map(|t| t.labels.len())
+                .sum();
             if event_count > self.max_graph_events {
                 self.max_graph_events = event_count;
             }
@@ -1582,17 +1602,42 @@ impl Must {
         }
 
         // Any receive/inbox outside this protected prefix must remain maximal.
+        #[cfg(feature = "symbolic")]
+        let mut deleted_constraints = Vec::new();
         for thread in g.threads.iter() {
             let i = thread
                 .labels
                 .partition_point(|lab| lab.stamp() <= recv_stamp || prefix.contains(lab.pos()));
-            if thread.labels[i..]
-                .iter()
-                .any(|lab| !self.is_maximal(lab, rev))
-            {
-                return false;
+            for lab in &thread.labels[i..] {
+                #[cfg(feature = "symbolic")]
+                if let LabelEnum::ConstraintEval(c) = lab {
+                    deleted_constraints.push(c);
+                    continue;
+                }
+
+                if !self.is_maximal(lab, rev) {
+                    return false;
+                }
             }
         }
+
+        #[cfg(feature = "symbolic")]
+        if !deleted_constraints.is_empty() {
+            // ST in ConDpor uses the path condition accumulated from earlier deleted events,
+            // in global insertion order
+            deleted_constraints.sort_by_key(|c| c.stamp());
+            let view = g.revisit_view(rev);
+            let mut revisited = g.copy_to_view(&view);
+            revisited.change_rf_placement(rev.pos, &rev.rev);
+            let mut solver = self.symbolic_solver_for_graph(&revisited);
+
+            for c in deleted_constraints {
+                if !Self::is_maximal_constraint(c, &mut solver) {
+                    return false;
+                }
+            }
+        }
+
         true
     }
 
@@ -1824,7 +1869,9 @@ impl Must {
             LabelEnum::SendMsg(slab) => !slab.is_dropped(),
             LabelEnum::Choice(chlab) => chlab.result() == *chlab.range().end(),
             #[cfg(feature = "symbolic")]
-            LabelEnum::ConstraintEval(c) => self.is_maximal_constraint(c, rev),
+            LabelEnum::ConstraintEval(_) => {
+                unreachable!("symbolic maximality is checked in insertion order")
+            }
             #[cfg(feature = "symbolic")]
             LabelEnum::SymbolicVar(_) => true,
             _ => true,
@@ -1955,7 +2002,10 @@ impl Must {
 
     pub(crate) fn try_revisit(&mut self) -> bool {
         loop {
-            debug!("Finished execution with current rqueue {:?}", self.current.rqueue.clone());
+            debug!(
+                "Finished execution with current rqueue {:?}",
+                self.current.rqueue.clone()
+            );
             if self.current.rqueue.is_empty() {
                 if self.try_pop_state() {
                     continue;
