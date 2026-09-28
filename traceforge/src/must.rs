@@ -2865,14 +2865,17 @@ impl Must {
         match condition {
             SummaryCondition::Always => true,
             #[cfg(feature = "symbolic")]
-            SummaryCondition::Symbolic { guard, .. } => {
+            condition @ SummaryCondition::Symbolic { .. } => {
+                let guard = condition
+                    .guard_expr()
+                    .expect("symbolic summary outcome has no guard");
                 if let Some(owner) =
                     consumer_owner.filter(|owner| self.summary_frame_is_active(owner))
                 {
                     self.symbolic_solver_for_owner(&self.current.graph, Some(owner))
-                        .sat_with(guard)
+                        .sat_with(&guard)
                 } else {
-                    self.symbolic_solver.sat_with(guard)
+                    self.symbolic_solver.sat_with(&guard)
                 }
             }
         }
@@ -3017,7 +3020,7 @@ impl Must {
         };
         SummaryOutcome {
             condition: SummaryCondition::Symbolic {
-                guard,
+                guards: vec![guard],
                 local_sorts: locals.into_iter().map(|(_, sort)| sort).collect(),
             },
             result,

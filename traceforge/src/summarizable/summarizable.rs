@@ -286,9 +286,35 @@ pub(crate) enum SummaryCondition {
     Always,
     #[cfg(feature = "symbolic")]
     Symbolic {
-        guard: SymExpr,
+        guards: Vec<SymExpr>,
         local_sorts: Vec<SymSort>,
     },
+}
+
+impl SummaryCondition {
+    #[cfg(feature = "symbolic")]
+    pub(crate) fn guard_expr(&self) -> Option<SymExpr> {
+        let Self::Symbolic { guards, .. } = self else {
+            return None;
+        };
+        assert!(!guards.is_empty(), "a symbolic outcome must have a guard");
+
+        // Keep the disjunction balanced: expression rewriting and Z3 compilation
+        // both walk the tree recursively.
+        let mut level = guards.clone();
+        while level.len() > 1 {
+            let mut next = Vec::with_capacity((level.len() + 1) / 2);
+            let mut pairs = level.into_iter();
+            while let Some(left) = pairs.next() {
+                next.push(match pairs.next() {
+                    Some(right) => left.or(right),
+                    None => left,
+                });
+            }
+            level = next;
+        }
+        level.pop()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -317,8 +343,14 @@ impl SummaryOutcome {
         let condition = match &self.condition {
             SummaryCondition::Always => SummaryCondition::Always,
             #[cfg(feature = "symbolic")]
-            SummaryCondition::Symbolic { guard, local_sorts } => SummaryCondition::Symbolic {
-                guard: context.instantiate_symbolic(guard),
+            SummaryCondition::Symbolic {
+                guards,
+                local_sorts,
+            } => SummaryCondition::Symbolic {
+                guards: guards
+                    .iter()
+                    .map(|guard| context.instantiate_symbolic(guard))
+                    .collect(),
                 local_sorts: local_sorts.clone(),
             },
         };
@@ -357,11 +389,8 @@ impl SummaryOutcome {
     }
 
     #[cfg(feature = "symbolic")]
-    pub(crate) fn guard(&self) -> Option<&SymExpr> {
-        match &self.condition {
-            SummaryCondition::Always => None,
-            SummaryCondition::Symbolic { guard, .. } => Some(guard),
-        }
+    pub(crate) fn guard_expr(&self) -> Option<SymExpr> {
+        self.condition.guard_expr()
     }
 }
 
@@ -382,15 +411,15 @@ pub(crate) fn insert_summary_outcome(outcomes: &mut Vec<SummaryOutcome>, incomin
             }
             (
                 SummaryCondition::Symbolic {
-                    guard: existing_guard,
+                    guards: existing_guards,
                     local_sorts: existing_locals,
                 },
                 SummaryCondition::Symbolic {
-                    guard: incoming_guard,
+                    guards: incoming_guards,
                     local_sorts: incoming_locals,
                 },
             ) if existing_locals == incoming_locals => {
-                *existing_guard = existing_guard.clone().or(incoming_guard.clone());
+                existing_guards.extend(incoming_guards.iter().cloned());
                 return;
             }
             _ => {}
@@ -1376,8 +1405,8 @@ fn enter_resolved_call(
                 let outcome = outcome.materialize(&participants, allow_parent_inputs);
 
                 #[cfg(feature = "symbolic")]
-                if let Some(guard) = outcome.guard() {
-                    assume_selected_summary_guard(guard.clone());
+                if let Some(guard) = outcome.guard_expr() {
+                    assume_selected_summary_guard(guard);
                 }
 
                 if outcome.is_assumption_failed() {
@@ -1532,3 +1561,4 @@ where
         }
     }
 }
+
