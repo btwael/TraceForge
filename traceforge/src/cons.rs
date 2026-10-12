@@ -21,14 +21,21 @@ pub(crate) struct Consistency {}
 
 impl Consistency {
     // Checks if there is a TotalOrder relation between the two sends slab1 and slab2
-    fn send_before(&self, g: &ExecutionGraph, slab1: Event, slab2: Event) -> bool {
+    fn send_before(
+        &self,
+        g: &ExecutionGraph,
+        sends: &[&SendMsg],
+        slab1: Event,
+        slab2: Event,
+    ) -> bool {
         // Apart from slab1, also do not query send_before(slab2, slab2)
-        Self::aux_send_before(g, slab1, slab2, &mut vec![slab1, slab2])
+        Self::aux_send_before(g, sends, slab1, slab2, &mut vec![slab1, slab2])
     }
 
     // send_before = (porf U induced_send_before)^+
     fn aux_send_before(
         g: &ExecutionGraph,
+        sends: &[&SendMsg],
         slab1: Event,
         // Every recursive call uses the same slab2
         slab2: Event,
@@ -43,7 +50,7 @@ impl Consistency {
         }
 
         // Transitivity: [slab1];send_before;[slab];send_before <= send_before
-        for slab in g.all_store_iter() {
+        for &slab in sends {
             // Only use TotalOrder sends as transitive steps
             if slab.comm() != CommunicationModel::TotalOrder {
                 continue;
@@ -57,7 +64,7 @@ impl Consistency {
             // Check if [slab1];porf;[slab];send_before;[slab2]
             if slab.porf().contains(slab1) {
                 seen.push(slab.pos());
-                if Self::aux_send_before(g, slab.pos(), slab2, seen) {
+                if Self::aux_send_before(g, sends, slab.pos(), slab2, seen) {
                     return true;
                 }
             }
@@ -69,7 +76,7 @@ impl Consistency {
 
             // Check if [slab1];induced_send_before;[slab];send_before;[slab2]
             // where (s1, s2) in induced_send_before iff s1 is read by a r1 that also matches s2 and
-            // s2 is not read by an earlier receive r2.
+            // s2 is not read by the same or an earlier receive r2.
             // Since there are no concurrent receives, "later" means porf.
 
             // slab1 is read
@@ -83,10 +90,13 @@ impl Consistency {
                 continue;
             }
 
-            // slab is not read, or is read by rlab s.t. (rlab1, rlab) in porf
-            if slab.reader().is_none_or(|rlab| g.in_porf(rlab1, rlab)) {
+            // slab is unread, or read by a strictly later receive (not the same inbox).
+            if slab
+                .reader()
+                .is_none_or(|rlab| rlab != rlab1 && g.in_porf(rlab1, rlab))
+            {
                 seen.push(slab.pos());
-                if Self::aux_send_before(g, slab.pos(), slab2, seen) {
+                if Self::aux_send_before(g, sends, slab.pos(), slab2, seen) {
                     return true;
                 }
             }
@@ -412,8 +422,8 @@ impl Consistency {
 
     // An inbox may take ordered sends together; otherwise each matching
     // predecessor must have been received earlier or lost.
-    fn predecessor_order_consistent(&self, g: &ExecutionGraph) -> bool {
-        for later in g.all_store_iter() {
+    fn predecessor_order_consistent(&self, g: &ExecutionGraph, sends: &[&SendMsg]) -> bool {
+        for &later in sends {
             if !matches!(
                 later.comm(),
                 CommunicationModel::LocalOrder | CommunicationModel::CausalOrder
@@ -424,7 +434,7 @@ impl Consistency {
                 continue;
             };
 
-            for earlier in g.all_store_iter() {
+            for &earlier in sends {
                 if earlier.pos() == later.pos()
                     || earlier.is_dropped()
                     || !later.sb().contains(earlier.pos())
@@ -451,15 +461,17 @@ impl Consistency {
     }
 
     pub(crate) fn is_consistent(&self, g: &ExecutionGraph) -> bool {
-        if !self.predecessor_order_consistent(g) {
+        // Reuse the complete send list, in graph order, throughout this check.
+        let sends: Vec<&SendMsg> = g.all_store_iter().collect();
+        if !self.predecessor_order_consistent(g, &sends) {
             return false;
         }
 
-        for slab1 in g.all_store_iter() {
+        for &slab1 in &sends {
             if slab1.comm() != CommunicationModel::TotalOrder || slab1.is_dropped() {
                 continue;
             }
-            for slab2 in g.all_store_iter() {
+            for &slab2 in &sends {
                 if slab2.comm() != CommunicationModel::TotalOrder || slab2.is_dropped() {
                     continue;
                 }
@@ -492,7 +504,7 @@ impl Consistency {
                 }
 
                 // and s1 is causally_before s2,
-                if self.send_before(g, s1, s2) {
+                if self.send_before(g, &sends, s1, s2) {
                     // then the execution is inconsistent
                     return false;
                     // because s1 is ordered both
@@ -557,9 +569,9 @@ impl Consistency {
         }
 
         let candidates = self.inbox_candidates_in_view(g, Some((&view, None)), ilab, false);
-        let mut source = g.clone();
-        source.change_inbox_rfs(ilab.pos(), None);
-        let mut prefix = source.copy_to_view(&view);
+        let mut prefix = g.clone();
+        prefix.change_inbox_rfs(ilab.pos(), None);
+        prefix.cut_to_view(&view);
         prefix.pop_fallback_readers(ilab.pos());
 
         self.canonical_inbox_read(&prefix, ilab.pos(), &candidates)
@@ -632,10 +644,13 @@ impl Consistency {
     fn well_formed_inbox_placement(
         &self,
         g: &ExecutionGraph,
-        inbox: &Inbox,
+        inbox_pos: Event,
         sends: &[Event],
         require_min: bool,
     ) -> bool {
+        let Some(inbox) = g.inbox_label(inbox_pos) else {
+            return false;
+        };
         let mut unique = sends.to_vec();
         Self::normalize_event_set(&mut unique);
         if unique.len() != sends.len() {
@@ -665,7 +680,7 @@ impl Consistency {
                 return false;
             }
         }
-        true
+        !sends.iter().any(|&s| g.in_porf(inbox_pos, s))
     }
 
     fn inbox_placement_consistent(
@@ -675,20 +690,38 @@ impl Consistency {
         sends: &[Event],
         require_min: bool,
     ) -> bool {
-        let Some(inbox) = g.inbox_label(inbox_pos) else {
-            return false;
-        };
-        if !self.well_formed_inbox_placement(g, inbox, sends, require_min)
-            || sends.iter().any(|&s| g.in_porf(inbox_pos, s))
-        {
+        if !self.well_formed_inbox_placement(g, inbox_pos, sends, require_min) {
             return false;
         }
 
+        let mut trial = g.clone();
+        self.apply_inbox_placement(&mut trial, inbox_pos, sends)
+    }
+
+    // Apply a well-formed placement to a disposable graph; rejection leaves it changed.
+    fn apply_inbox_placement(
+        &self,
+        g: &mut ExecutionGraph,
+        inbox_pos: Event,
+        sends: &[Event],
+    ) -> bool {
         let mut chosen = sends.to_vec();
         Self::normalize_event_set(&mut chosen);
-        let mut trial = g.clone();
-        trial.change_rf_placement(inbox_pos, &RevisitPlacement::Inbox(chosen));
-        self.is_consistent(&trial)
+        g.change_rf_placement(inbox_pos, &RevisitPlacement::Inbox(chosen));
+        self.is_consistent(g)
+    }
+
+    pub(crate) fn checked_inbox_placement(
+        &self,
+        mut g: ExecutionGraph,
+        inbox_pos: Event,
+        sends: &[Event],
+    ) -> Option<ExecutionGraph> {
+        if !self.well_formed_inbox_placement(&g, inbox_pos, sends, true) {
+            return None;
+        }
+        self.apply_inbox_placement(&mut g, inbox_pos, sends)
+            .then_some(g)
     }
 
     pub(crate) fn is_inbox_placement_consistent(

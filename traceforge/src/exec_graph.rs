@@ -1050,7 +1050,7 @@ impl ExecutionGraph {
         self.dropped_sends -= count;
     }
 
-    fn cut_to_view(&mut self, v: &VectorClock) {
+    pub(crate) fn cut_to_view(&mut self, v: &VectorClock) {
         // println!("Enter cut to view");
 
         let mut deleted: HashSet<Event> = HashSet::new();

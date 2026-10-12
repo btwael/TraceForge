@@ -1577,18 +1577,11 @@ impl Must {
         }
 
         // Clear the old batch before cutting: some of its sends may be deleted.
-        let mut source = g.clone();
-        source.change_inbox_rfs(rev.pos, None);
-        let mut target = source.copy_to_view(&view);
+        let mut target = g.clone();
+        target.change_inbox_rfs(rev.pos, None);
+        target.cut_to_view(&view);
         target.pop_fallback_readers(rev.pos);
-        if !self
-            .checker
-            .is_inbox_placement_consistent(&target, rev.pos, sends)
-        {
-            return None;
-        }
-        target.change_rf_placement(rev.pos, &rev.rev);
-        self.checker.is_consistent(&target).then_some(target)
+        self.checker.checked_inbox_placement(target, rev.pos, sends)
     }
 
     // computing the set of backward revisits for the send at position "pos"
@@ -1641,6 +1634,9 @@ impl Must {
                     }
                 }
                 RecvLike::Inbox(i) => {
+                    if !i.is_revisitable() {
+                        continue;
+                    }
                     // Check each complete batch, including the newly inserted send.
                     let mut cands: Vec<Event> = g
                         .matching_stores(i.recv_loc())
@@ -1987,9 +1983,9 @@ impl Must {
                 {
                     return false;
                 }
-                let mut source = self.current.graph.clone();
-                source.change_inbox_rfs(pos, None);
-                let prefix = source.copy_to_view(&view);
+                let mut prefix = self.current.graph.clone();
+                prefix.change_inbox_rfs(pos, None);
+                prefix.cut_to_view(&view);
                 if !self
                     .checker
                     .is_inbox_placement_consistent(&prefix, pos, sends)
@@ -2052,18 +2048,19 @@ impl Must {
         true
     }
 
-    // Mark events in the porf-prefix as non revisitable
-    fn mark_prefix_non_revisitable(&mut self, revisit_placement: RevisitPlacement) {
+    // Only insertion-later selected sends protect their causal prefixes.
+    fn mark_prefix_non_revisitable(&mut self, rev: &Revisit) {
+        let recv_stamp = self.current.graph.label(rev.pos).stamp();
+        let sends = match &rev.rev {
+            RevisitPlacement::Default(send) => std::slice::from_ref(send),
+            RevisitPlacement::Inbox(sends) => sends.as_slice(),
+        };
         let mut prefix = VectorClock::new();
-        match revisit_placement {
-            RevisitPlacement::Default(send) => {
-                prefix.update(self.current.graph.send_label(send).unwrap().porf());
-            }
-            RevisitPlacement::Inbox(sends) => {
-                // Inbox revisit prefix is the union of porf-prefixes of all chosen sends.
-                for s in sends {
-                    prefix.update(self.current.graph.send_label(s).unwrap().porf());
-                }
+        for &send in sends {
+            let slab = self.current.graph.send_label(send).unwrap();
+            // Earlier batch members may be deleted by a later revisit.
+            if slab.stamp() > recv_stamp {
+                prefix.update(slab.porf());
             }
         }
 
@@ -2104,7 +2101,7 @@ impl Must {
         self.push_state();
         self.current.graph = ng;
 
-        self.mark_prefix_non_revisitable(rev.rev.clone());
+        self.mark_prefix_non_revisitable(rev);
         if needs_change {
             self.change_rf(rev);
         }
