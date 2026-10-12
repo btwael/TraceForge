@@ -1338,10 +1338,6 @@ impl Inbox {
         self.rfs = rfs
     }
 
-    pub(crate) fn is_non_blocking(&self) -> bool {
-        self.min == 0
-    }
-
     pub(crate) fn min(&self) -> usize {
         self.min
     }

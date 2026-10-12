@@ -1512,30 +1512,25 @@ impl Must {
 
     fn visit_inbox_rfs(&mut self, pos: Event) -> Vec<Option<Val>> {
         let ilab = self.current.graph.inbox_label(pos).unwrap().clone();
-        let rfs = self.checker.inbox_rfs(&self.current.graph, &ilab);
+        let candidates = self.checker.inbox_candidates(&self.current.graph, &ilab);
 
         let min = ilab.min();
         let max = ilab.max();
 
-        // If even the maximum feasible size cannot satisfy `min`, this inbox blocks.
-        let upper = max.map_or(rfs.len(), |m| m.min(rfs.len()));
-        if min > upper {
+        let mut combinations = Consistency::inbox_possible_subsets(&candidates, min, max, None);
+        combinations.retain(|subset| {
+            self.checker
+                .is_inbox_placement_consistent(&self.current.graph, pos, subset)
+        });
+        let Some(canonical) =
+            self.checker
+                .canonical_inbox_read(&self.current.graph, pos, &candidates)
+        else {
             self.add_to_graph(LabelEnum::Block(Block::new(
                 pos,
                 BlockType::Value(ilab.recv_loc().clone(), min),
             )));
             return Vec::new();
-        }
-
-        let mut combinations = compute_inbox_possible_subsets_from_rfs(&rfs, min, max, None);
-
-        // Canonical inbox read used by the base execution:
-        // non-blocking inbox reads {}, otherwise read the first `min` coherent sends.
-        // All other feasible subsets are explored through forward revisits.
-        let canonical = if ilab.is_non_blocking() {
-            Vec::new()
-        } else {
-            rfs.iter().take(min).cloned().collect::<Vec<_>>()
         };
 
         combinations.retain(|subset| *subset != canonical);
@@ -1549,13 +1544,9 @@ impl Must {
             );
         }
 
-        if canonical.is_empty() {
-            self.current.graph.change_inbox_rfs(pos, None);
-        } else {
-            self.current
-                .graph
-                .change_inbox_rfs(pos, Some(canonical.clone()));
-        }
+        self.current
+            .graph
+            .change_rf_placement(pos, &RevisitPlacement::Inbox(canonical));
 
         self.inbox_vals_copy(pos)
     }
@@ -1570,30 +1561,35 @@ impl Must {
     fn is_maximal_extension(&self, rev: &Revisit) -> bool {
         let g = &self.current.graph;
         let recv_stamp = g.label(rev.pos).stamp();
+        let target = g.revisit_view(rev);
+        g.threads.iter().flat_map(|thr| &thr.labels).all(|lab| {
+            lab.stamp() <= recv_stamp || target.contains(lab.pos()) || self.is_maximal(lab, rev)
+        })
+    }
 
-        let mut prefix = VectorClock::new();
-        match &rev.rev {
-            RevisitPlacement::Default(s) => prefix.update(g.send_label(*s).unwrap().porf()),
-            RevisitPlacement::Inbox(sends) => {
-                for &s in sends {
-                    prefix.update(g.send_label(s).unwrap().porf());
-                }
-            }
+    fn checked_inbox_revisit_graph(&self, rev: &Revisit) -> Option<ExecutionGraph> {
+        let RevisitPlacement::Inbox(sends) = &rev.rev else {
+            return None;
+        };
+        let g = &self.current.graph;
+        let view = g.revisit_view(rev);
+        if !g.view_is_porf_closed_except(&view, Some(rev.pos)) {
+            return None;
         }
 
-        // Any receive/inbox outside this protected prefix must remain maximal.
-        for thread in g.threads.iter() {
-            let i = thread
-                .labels
-                .partition_point(|lab| lab.stamp() <= recv_stamp || prefix.contains(lab.pos()));
-            if thread.labels[i..]
-                .iter()
-                .any(|lab| !self.is_maximal(lab, rev))
-            {
-                return false;
-            }
+        // Clear the old batch before cutting: some of its sends may be deleted.
+        let mut source = g.clone();
+        source.change_inbox_rfs(rev.pos, None);
+        let mut target = source.copy_to_view(&view);
+        target.pop_fallback_readers(rev.pos);
+        if !self
+            .checker
+            .is_inbox_placement_consistent(&target, rev.pos, sends)
+        {
+            return None;
         }
-        true
+        target.change_rf_placement(rev.pos, &rev.rev);
+        self.checker.is_consistent(&target).then_some(target)
     }
 
     // computing the set of backward revisits for the send at position "pos"
@@ -1635,7 +1631,7 @@ impl Must {
                 RecvLike::RecvMsg(r) => {
                     let rev = Revisit::new(r.pos(), pos);
                     if !self.is_maximal_recv(r, &rev) {
-                        break;
+                        continue;
                     }
                     if self
                         .checker
@@ -1646,13 +1642,7 @@ impl Must {
                     }
                 }
                 RecvLike::Inbox(i) => {
-                    let seed_rev = Revisit::new_inbox(i.pos(), vec![pos]);
-                    // Backward revisits are generated only from maximal inbox events.
-                    if !self.is_maximal_inbox(i, &seed_rev) {
-                        break;
-                    }
-
-                    // collect candidate sends (including this new send), dedup
+                    // Check each complete batch, including the newly inserted send.
                     let mut cands: Vec<Event> = g
                         .matching_stores(i.recv_loc())
                         .map(|s| s.pos())
@@ -1666,23 +1656,16 @@ impl Must {
 
                     // Enumerate only subsets that include the freshly added send.
                     for mut subset in
-                        compute_inbox_possible_subsets_from_rfs(&cands, i.min(), i.max(), Some(pos))
+                        Consistency::inbox_possible_subsets(&cands, i.min(), i.max(), Some(pos))
                     {
                         Consistency::normalize_event_set(&mut subset);
-                        // Only generate the subset when the freshly added send
-                        // is the owner (newest send in the subset).
-                        if Consistency::inbox_owner(&self.current.graph, &subset) != Some(pos) {
-                            continue;
-                        }
                         info!(
                             "  [revisit/backward] inbox {} subset {}",
                             i.pos(),
                             self.fmt_event_set(&subset)
                         );
                         let rev_inbox = Revisit::new_inbox(i.pos(), subset.clone());
-                        // Paper-style inbox revisit condition:
-                        // keep only subsets that are consistent and preserve maximality.
-                        if self.checker.is_revisit_consistent_inbox(g, i, &subset)
+                        if self.checked_inbox_revisit_graph(&rev_inbox).is_some()
                             && self.is_maximal_inbox(i, &rev_inbox)
                             && self.is_maximal_extension(&rev_inbox)
                         {
@@ -1819,9 +1802,16 @@ impl Must {
             LabelEnum::CToss(ctlab) => {
                 ctlab.is_predetermined() || ctlab.result() == ctlab.maximal()
             }
-            // Instead of checking if a send is read by a stamp-earlier receive,
-            // we handle this via the revisitable flag on the corresponding receive.
-            LabelEnum::SendMsg(slab) => !slab.is_dropped(),
+            LabelEnum::SendMsg(slab) => {
+                !slab.is_dropped()
+                    && slab.reader().is_none_or(|reader| {
+                        !self
+                            .current
+                            .graph
+                            .previous_view(slab.pos(), rev)
+                            .contains(reader)
+                    })
+            }
             LabelEnum::Choice(chlab) => chlab.result() == *chlab.range().end(),
             #[cfg(feature = "symbolic")]
             LabelEnum::ConstraintEval(c) => self.is_maximal_constraint(c, rev),
@@ -1990,16 +1980,20 @@ impl Must {
 
         if matches!(self.current.graph.label(pos), LabelEnum::Inbox(_)) {
             if let RevisitPlacement::Inbox(sends) = &rev.rev {
-                // For inbox forward revisits, validate the chosen subset in the
-                // prefix first; if invalid, skip before mutating the current graph.
                 let view = self.current.graph.view_from_stamp(stamp);
-                let prefix = self.current.graph.copy_to_view(&view);
-                let Some(inbox) = prefix.inbox_label(pos) else {
+                if !self
+                    .current
+                    .graph
+                    .view_is_porf_closed_except(&view, Some(pos))
+                {
                     return false;
-                };
+                }
+                let mut source = self.current.graph.clone();
+                source.change_inbox_rfs(pos, None);
+                let prefix = source.copy_to_view(&view);
                 if !self
                     .checker
-                    .is_revisit_consistent_inbox(&prefix, inbox, sends)
+                    .is_inbox_placement_consistent(&prefix, pos, sends)
                 {
                     info!(
                         "  [revisit] skip inbox {} due to inconsistent subset {}",
@@ -2093,22 +2087,28 @@ impl Must {
             "================ begin backward_revisit for {:?} ===================",
             rev
         );
-        let v = self.current.graph.revisit_view(rev);
-        let mut ng = self.current.graph.copy_to_view(&v);
-        // If any send's reader was set to the revisited receive via
-        // cancelled_recv_readers fallback, update it before change_rf.
-        ng.pop_fallback_readers(rev.pos);
+        let (ng, needs_change) = match &rev.rev {
+            RevisitPlacement::Inbox(_) => {
+                let Some(graph) = self.checked_inbox_revisit_graph(rev) else {
+                    return false;
+                };
+                (graph, false)
+            }
+            RevisitPlacement::Default(_) => {
+                let v = self.current.graph.revisit_view(rev);
+                let mut graph = self.current.graph.copy_to_view(&v);
+                graph.pop_fallback_readers(rev.pos);
+                (graph, true)
+            }
+        };
         // Save current state so alternative pending revisits remain explorable.
         self.push_state();
         self.current.graph = ng;
 
         self.mark_prefix_non_revisitable(rev.rev.clone());
-
-        // println!("After marking prefix");
-
-        self.change_rf(rev);
-
-        // println!("After change rf");
+        if needs_change {
+            self.change_rf(rev);
+        }
 
         if self.config.verbose >= 3 {
             println!("After backward revisit graph");
@@ -2538,84 +2538,6 @@ fn pop_worklist(worklist: &mut RQueue, is_arbitrary: bool, rng: &mut Pcg64Mcg) -
         worklist.remove(&stamp);
     }
     rev
-}
-
-fn compute_inbox_possible_subsets_from_rfs(
-    events: &[Event],
-    min: usize,
-    max: Option<usize>,
-    must_include: Option<Event>,
-) -> Vec<Vec<Event>> {
-    fn build(
-        idx: usize,
-        events: &[Event],
-        min: usize,
-        max_len: usize,
-        must_include: Option<Event>,
-        has_must: bool,
-        current: &mut Vec<Event>,
-        out: &mut Vec<Vec<Event>>,
-    ) {
-        if current.len() > max_len {
-            return;
-        }
-        let remaining = events.len() - idx;
-        if current.len() + remaining < min {
-            return;
-        }
-
-        if idx == events.len() {
-            let len = current.len();
-            if len >= min && len <= max_len && must_include.is_none_or(|_| has_must) {
-                out.push(current.clone());
-            }
-            return;
-        }
-
-        // Exclude current event
-        build(
-            idx + 1,
-            events,
-            min,
-            max_len,
-            must_include,
-            has_must,
-            current,
-            out,
-        );
-
-        // Include current event
-        current.push(events[idx]);
-        build(
-            idx + 1,
-            events,
-            min,
-            max_len,
-            must_include,
-            has_must || must_include == Some(events[idx]),
-            current,
-            out,
-        );
-        current.pop();
-    }
-
-    let max_len = max.map_or(events.len(), |m| m.min(events.len()));
-    if min > max_len || must_include.is_some_and(|event| !events.contains(&event)) {
-        return Vec::new();
-    }
-
-    let mut subsets: Vec<Vec<Event>> = Vec::new();
-    build(
-        0,
-        events,
-        min,
-        max_len,
-        must_include,
-        false,
-        &mut Vec::new(),
-        &mut subsets,
-    );
-    subsets
 }
 
 #[cfg(test)]
