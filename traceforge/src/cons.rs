@@ -1,11 +1,11 @@
 use crate::event::Event;
 use crate::event_label::{AsEventLabel, Inbox, LabelEnum, RecvMsg, SendMsg};
-use crate::future::PollerMsg;
 use crate::exec_graph::ExecutionGraph;
+use crate::future::PollerMsg;
 use crate::loc::CommunicationModel;
-use crate::revisit::Revisit;
-use crate::vector_clock::VectorClock;
 use crate::loc::WakeMsg;
+use crate::revisit::{Revisit, RevisitPlacement};
+use crate::vector_clock::VectorClock;
 use log::debug;
 
 // A generic consistency which will, eventually, support arbitrary
@@ -62,6 +62,11 @@ impl Consistency {
                 }
             }
 
+            // Lost sends cannot be pending mailbox competitors.
+            if slab.is_dropped() {
+                continue;
+            }
+
             // Check if [slab1];induced_send_before;[slab];send_before;[slab2]
             // where (s1, s2) in induced_send_before iff s1 is read by a r1 that also matches s2 and
             // s2 is not read by an earlier receive r2.
@@ -69,20 +74,17 @@ impl Consistency {
 
             // slab1 is read
             let rlab1 = match g.send_label(slab1).unwrap().reader() {
-                Some(rlab1) => g.recv_label(rlab1).unwrap(),
+                Some(rlab1) => rlab1,
                 None => continue,
             };
 
             // by a receive rlab1 that could also read slab
-            if !rlab1.matches(slab) {
+            if !Self::reader_matches(g, rlab1, slab) {
                 continue;
             }
 
             // slab is not read, or is read by rlab s.t. (rlab1, rlab) in porf
-            if slab
-                .reader()
-                .is_none_or(|rlab| g.in_porf(rlab1.pos(), rlab))
-            {
+            if slab.reader().is_none_or(|rlab| g.in_porf(rlab1, rlab)) {
                 seen.push(slab.pos());
                 if Self::aux_send_before(g, slab.pos(), slab2, seen) {
                     return true;
@@ -157,7 +159,7 @@ impl Consistency {
                             // receive that was subsequently cancelled.
                             // Exclude internal PollerMsg sends.
                             || slab.val.as_any_ref().downcast_ref::<PollerMsg>().is_none()
-                                && 
+                                &&
                                slab.val.as_any_ref().downcast_ref::<WakeMsg>().is_none()
                                 && {
                                 debug!("Inside cancel looking looking at thread with labels {:?}", g.get_thr(&reader.thread).labels);
@@ -307,7 +309,7 @@ impl Consistency {
         rfs
     }
 
-    fn coherent_inbox_rfs_in_view(
+    fn inbox_candidates_in_view(
         &self,
         g: &ExecutionGraph,
         view: Option<(&VectorClock, Option<Event>)>,
@@ -320,18 +322,12 @@ impl Consistency {
         let rfs =
             Self::filter_available_sends_in_view_for_inbox(g, inbox, sends, view, check_concurrent);
 
-        let mut rfs: Vec<Event> = if inbox.comm() != CommunicationModel::NoOrder {
-            // Respect the channel's delivery model, mirroring recv behavior.
-            Self::retain_sb_minimals(rfs, false)
-                .iter()
-                .map(|lab| lab.pos())
-                .collect()
-        } else {
-            rfs.map(|lab| lab.pos()).collect()
-        };
+        // A batch may contain more than one ordered send; check the whole set later.
+        let mut rfs: Vec<Event> = rfs.map(|lab| lab.pos()).collect();
 
         // Stable ordering for canonical subset derivation.
         rfs.sort();
+        rfs.dedup();
         rfs
     }
 
@@ -414,13 +410,57 @@ impl Consistency {
         g.label_mut(pos).set_posw_cache(posw);
     }
 
+    // An inbox may take ordered sends together; otherwise each matching
+    // predecessor must have been received earlier or lost.
+    fn predecessor_order_consistent(&self, g: &ExecutionGraph) -> bool {
+        for later in g.all_store_iter() {
+            if !matches!(
+                later.comm(),
+                CommunicationModel::LocalOrder | CommunicationModel::CausalOrder
+            ) {
+                continue;
+            }
+            let Some(later_reader) = later.reader() else {
+                continue;
+            };
+
+            for earlier in g.all_store_iter() {
+                if earlier.pos() == later.pos()
+                    || earlier.is_dropped()
+                    || !later.sb().contains(earlier.pos())
+                    || !Self::reader_matches(g, later_reader, earlier)
+                {
+                    continue;
+                }
+
+                let delivered = match g.label(later_reader) {
+                    LabelEnum::RecvMsg(recv) if recv.monitors(earlier) => earlier
+                        .monitor_readers()
+                        .iter()
+                        .any(|&r| r == later_reader || g.in_porf(r, later_reader)),
+                    _ => earlier
+                        .reader()
+                        .is_some_and(|r| r == later_reader || g.in_porf(r, later_reader)),
+                };
+                if !delivered {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
     pub(crate) fn is_consistent(&self, g: &ExecutionGraph) -> bool {
+        if !self.predecessor_order_consistent(g) {
+            return false;
+        }
+
         for slab1 in g.all_store_iter() {
-            if slab1.comm() != CommunicationModel::TotalOrder {
+            if slab1.comm() != CommunicationModel::TotalOrder || slab1.is_dropped() {
                 continue;
             }
             for slab2 in g.all_store_iter() {
-                if slab2.comm() != CommunicationModel::TotalOrder {
+                if slab2.comm() != CommunicationModel::TotalOrder || slab2.is_dropped() {
                     continue;
                 }
 
@@ -439,12 +479,15 @@ impl Consistency {
                     Some(r2) => r2,
                 };
                 // that could have also read s1,
-                if !g.recv_label(r2).unwrap().matches(slab1) {
+                if !Self::reader_matches(g, r2, slab1) {
                     continue;
                 }
 
-                // if s1 is read by a later (wrt r2) receive r1,
-                if slab1.reader().is_some_and(|r1| g.in_porf(r1, r2)) {
+                // Sends read by one inbox have the same atomic reader.
+                if slab1
+                    .reader()
+                    .is_some_and(|r1| r1 == r2 || g.in_porf(r1, r2))
+                {
                     continue;
                 }
 
@@ -474,20 +517,10 @@ impl Consistency {
         rev: &Revisit,
         porf_override: bool,
     ) -> bool {
-        let (view, exclude) = match &rev.rev {
-            crate::revisit::RevisitPlacement::Default(send) => {
-                // rlab is not in the prefix of the revisitor
-                assert!(!g.send_label(*send).unwrap().porf().contains(rlab.pos()));
-                (
-                    g.revisit_view(&Revisit::new(rlab.pos(), *send)),
-                    Some(*send),
-                )
-            }
-            crate::revisit::RevisitPlacement::Inbox(sends) => {
-                let rev_inbox = Revisit::new_inbox(rlab.pos(), sends.clone());
-                (g.revisit_view(&rev_inbox), None)
-            }
-        };
+        let view = g.previous_view(rlab.pos(), rev);
+        if !g.view_is_porf_closed_except(&view, Some(rlab.pos())) {
+            return false;
+        }
         // rlab is stamp greater or equal that revisitee's stamp
         assert!(rlab.stamp() >= g.label(rev.pos).stamp());
 
@@ -499,7 +532,7 @@ impl Consistency {
         // First (non-revisit) is the maximal one.
         // Or this reads from a send currently pointed to a different receive through
         // cancelled-reader fallback during replay.
-        let rfs = self.coherent_rfs_in_view(g, Some((&view, exclude)), rlab, porf_override, false);
+        let rfs = self.coherent_rfs_in_view(g, Some((&view, None)), rlab, porf_override, false);
         if rfs.is_empty() {
             rlab.rf().is_some_and(|rf| {
                 g.send_label(rf)
@@ -516,33 +549,21 @@ impl Consistency {
         ilab: &Inbox,
         rev: &Revisit,
     ) -> bool {
-        // Non-blocking inbox is maximal when it currently takes the empty subset.
-        if ilab.is_non_blocking() {
-            return ilab.rfs().map_or(true, |rfs| rfs.is_empty());
+        let mut current = ilab.rfs().unwrap_or_default();
+        Self::normalize_event_set(&mut current);
+        let view = g.previous_view(ilab.pos(), rev);
+        if !g.view_is_porf_closed_except(&view, Some(ilab.pos())) {
+            return false;
         }
 
-        let Some(current) = ilab.rfs() else {
-            return false;
-        };
+        let candidates = self.inbox_candidates_in_view(g, Some((&view, None)), ilab, false);
+        let mut source = g.clone();
+        source.change_inbox_rfs(ilab.pos(), None);
+        let mut prefix = source.copy_to_view(&view);
+        prefix.pop_fallback_readers(ilab.pos());
 
-        let view = g.revisit_view(rev);
-        let exclude = match &rev.rev {
-            // For recv-style revisit placement, remove the newly inserted send.
-            crate::revisit::RevisitPlacement::Default(ev) => Some(*ev),
-            // Inbox placement already names the whole candidate set in the revisit view.
-            crate::revisit::RevisitPlacement::Inbox(_) => None,
-        };
-
-        let mut cands = self.coherent_inbox_rfs_in_view(g, Some((&view, exclude)), ilab, false);
-
-        Consistency::normalize_event_set(&mut cands);
-
-        // Canonical subset in the revisit view: first `min` coherent sends.
-        // Maximality requires the current inbox read to be exactly this subset.
-        let limit = ilab.min().min(cands.len());
-        let canonical: Vec<Event> = cands.into_iter().take(limit).collect();
-
-        current == canonical
+        self.canonical_inbox_read(&prefix, ilab.pos(), &candidates)
+            .is_some_and(|canonical| current == canonical)
     }
 
     /// Returns the rf options for rlab, with the first being the non-revisit rf step
@@ -555,9 +576,8 @@ impl Consistency {
         self.coherent_rfs_in_view(g, None, rlab, porf_override, true)
     }
 
-    pub(crate) fn inbox_rfs(&self, g: &ExecutionGraph, ilab: &Inbox) -> Vec<Event> {
-        // Deterministic coherent inbox candidates for base execution / canonical subset.
-        self.coherent_inbox_rfs_in_view(g, None, ilab, true)
+    pub(crate) fn inbox_candidates(&self, g: &ExecutionGraph, ilab: &Inbox) -> Vec<Event> {
+        self.inbox_candidates_in_view(g, None, ilab, true)
     }
 
     /// Returns whether the resulting execution would be consistent
@@ -609,25 +629,32 @@ impl Consistency {
         overwritten
     }
 
-    /// Inbox consistency for set semantics: order does not matter.
-    /// True iff the chosen subset satisfies bounds and every send is valid/available.
-    pub(crate) fn is_revisit_consistent_inbox(
+    fn well_formed_inbox_placement(
         &self,
         g: &ExecutionGraph,
         inbox: &Inbox,
-        sends: &Vec<Event>,
+        sends: &[Event],
+        require_min: bool,
     ) -> bool {
+        let mut unique = sends.to_vec();
+        Self::normalize_event_set(&mut unique);
+        if unique.len() != sends.len() {
+            return false;
+        }
         if let Some(max) = inbox.max() {
             if sends.len() > max {
                 return false;
             }
         }
-        if sends.len() < inbox.min() {
+        if require_min && sends.len() < inbox.min() {
             return false;
         }
 
-        // Each chosen send must exist, match, be undropped, and not already read by another receiver.
+        // The old read of this inbox may be replaced; other readers may not.
         for &s in sends {
+            if !g.contains(s) {
+                return false;
+            }
             let Some(slab) = g.send_label(s) else {
                 return false;
             };
@@ -641,14 +668,142 @@ impl Consistency {
         true
     }
 
+    fn inbox_placement_consistent(
+        &self,
+        g: &ExecutionGraph,
+        inbox_pos: Event,
+        sends: &[Event],
+        require_min: bool,
+    ) -> bool {
+        let Some(inbox) = g.inbox_label(inbox_pos) else {
+            return false;
+        };
+        if !self.well_formed_inbox_placement(g, inbox, sends, require_min)
+            || sends.iter().any(|&s| g.in_porf(inbox_pos, s))
+        {
+            return false;
+        }
+
+        let mut chosen = sends.to_vec();
+        Self::normalize_event_set(&mut chosen);
+        let mut trial = g.clone();
+        trial.change_rf_placement(inbox_pos, &RevisitPlacement::Inbox(chosen));
+        self.is_consistent(&trial)
+    }
+
+    pub(crate) fn is_inbox_placement_consistent(
+        &self,
+        g: &ExecutionGraph,
+        inbox_pos: Event,
+        sends: &[Event],
+    ) -> bool {
+        self.inbox_placement_consistent(g, inbox_pos, sends, true)
+    }
+
+    pub(crate) fn canonical_inbox_read(
+        &self,
+        g: &ExecutionGraph,
+        inbox_pos: Event,
+        candidates: &[Event],
+    ) -> Option<Vec<Event>> {
+        let inbox = g.inbox_label(inbox_pos)?;
+        let mut ordered = candidates.to_vec();
+        Self::normalize_event_set(&mut ordered);
+        let mut chosen = Vec::new();
+        while chosen.len() < inbox.min() {
+            let next = ordered.iter().copied().find(|&send| {
+                if chosen.contains(&send) {
+                    return false;
+                }
+                let mut trial = chosen.clone();
+                trial.push(send);
+                self.inbox_placement_consistent(g, inbox_pos, &trial, false)
+            })?;
+            chosen.push(next);
+        }
+        Self::normalize_event_set(&mut chosen);
+        self.is_inbox_placement_consistent(g, inbox_pos, &chosen)
+            .then_some(chosen)
+    }
+
+    pub(crate) fn inbox_possible_subsets(
+        events: &[Event],
+        min: usize,
+        max: Option<usize>,
+        must_include: Option<Event>,
+    ) -> Vec<Vec<Event>> {
+        fn build(
+            idx: usize,
+            events: &[Event],
+            min: usize,
+            max_len: usize,
+            must_include: Option<Event>,
+            has_must: bool,
+            current: &mut Vec<Event>,
+            out: &mut Vec<Vec<Event>>,
+        ) {
+            if current.len() > max_len || current.len() + events.len() - idx < min {
+                return;
+            }
+            if idx == events.len() {
+                if current.len() >= min && must_include.is_none_or(|_| has_must) {
+                    out.push(current.clone());
+                }
+                return;
+            }
+            build(
+                idx + 1,
+                events,
+                min,
+                max_len,
+                must_include,
+                has_must,
+                current,
+                out,
+            );
+            current.push(events[idx]);
+            build(
+                idx + 1,
+                events,
+                min,
+                max_len,
+                must_include,
+                has_must || must_include == Some(events[idx]),
+                current,
+                out,
+            );
+            current.pop();
+        }
+
+        let max_len = max.map_or(events.len(), |m| m.min(events.len()));
+        if min > max_len || must_include.is_some_and(|s| !events.contains(&s)) {
+            return Vec::new();
+        }
+        let mut subsets = Vec::new();
+        build(
+            0,
+            events,
+            min,
+            max_len,
+            must_include,
+            false,
+            &mut Vec::new(),
+            &mut subsets,
+        );
+        subsets
+    }
+
     pub(crate) fn normalize_event_set(events: &mut Vec<Event>) {
         // Canonicalize subset representation before comparisons/ownership checks.
         events.sort();
         events.dedup();
     }
 
-    // the owner of a set of (send) events is the newer one (from which backward revisit are generated)
-    pub(crate) fn inbox_owner(g: &ExecutionGraph, events: &[Event]) -> Option<Event> {
-        events.iter().copied().max_by_key(|e| g.label(*e).stamp())
+    fn reader_matches(g: &ExecutionGraph, reader: Event, send: &SendMsg) -> bool {
+        match g.label(reader) {
+            LabelEnum::RecvMsg(recv) => recv.matches(send),
+            LabelEnum::Inbox(inbox) => inbox.matches(send),
+            _ => false,
+        }
     }
 }

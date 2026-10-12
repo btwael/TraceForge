@@ -679,10 +679,12 @@ impl ExecutionGraph {
             }
         };
 
-        // v.update() may cause more TCreate labs to be visible in the vector clock
-        // Find those TCreate labels and add their corresponding Begin labels to the clock.
-        // This is necessary because the call to v.update() may have made more TCreate events
-        // visible than `view_from_stamp` chose to expose.
+        self.close_created_threads_in_view(&mut v);
+        v
+    }
+
+    fn close_created_threads_in_view(&self, v: &mut VectorClock) {
+        // A PORF update can expose a TCreate whose Begin was outside the stamp prefix.
         for thr in self.threads.iter() {
             if let Some(vc_limit_inclusive) = v.get(thr.tid) {
                 for lab in thr.labels.iter().take(vc_limit_inclusive as usize + 1) {
@@ -694,8 +696,38 @@ impl ExecutionGraph {
                 }
             }
         }
+    }
 
-        v
+    /// The insertion prefix through `affected`, plus strict PORF predecessors
+    /// of every send chosen by the revisit.
+    pub(crate) fn previous_view(&self, affected: Event, rev: &Revisit) -> VectorClock {
+        let mut view = self.view_from_stamp(self.label(affected).stamp());
+        let sends = match &rev.rev {
+            RevisitPlacement::Default(send) => std::slice::from_ref(send),
+            RevisitPlacement::Inbox(sends) => sends.as_slice(),
+        };
+        for &send in sends {
+            let mut predecessors = self.send_label(send).unwrap().porf().clone();
+            predecessors.set(send.prev());
+            view.update(&predecessors);
+        }
+        self.close_created_threads_in_view(&mut view);
+        view
+    }
+
+    pub(crate) fn view_is_porf_closed_except(
+        &self,
+        view: &VectorClock,
+        except: Option<Event>,
+    ) -> bool {
+        self.threads.iter().flat_map(|thr| &thr.labels).all(|lab| {
+            if !view.contains(lab.pos()) || except == Some(lab.pos()) {
+                return true;
+            }
+            self.porf(lab.pos())
+                .entries()
+                .all(|(tid, idx)| view.contains(Event::new(tid, idx)))
+        })
     }
 
     /// Return a view with all the events up to the stamp (inclusive)
